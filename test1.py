@@ -4,3 +4,7 @@ def sum(a: int, b: int, c: int):
 
 def test():
     raise NotImplemented()
+
+
+def test2():
+    raise NotImplemented()
