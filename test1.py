@@ -8,3 +8,7 @@ def test():
 
 def test2():
     raise NotImplemented()
+
+
+def _test():
+    return False
