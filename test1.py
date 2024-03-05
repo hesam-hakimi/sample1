@@ -3,6 +3,7 @@ def sum(a: int, b: int, c: int):
 
 
 def test():
+    "test 1"
     raise NotImplemented()
 
 
@@ -20,4 +21,3 @@ def _test4():
     """
     this is the summery for learning 
     """
-    "test"
