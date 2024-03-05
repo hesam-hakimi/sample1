@@ -21,3 +21,7 @@ def _test4():
     """
     this is the summery for learning 
     """
+
+
+def _test4():
+    raise NotImplemented("thsi is not impleneted")
