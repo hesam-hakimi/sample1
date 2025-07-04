@@ -1,8 +1,6 @@
-import types
 from unittest import mock
 
 import requests
-from bs4 import BeautifulSoup
 
 from website_scraper import WebsiteScraper
 
