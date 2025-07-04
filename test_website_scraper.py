@@ -23,3 +23,16 @@ def test_fetch_title_and_content():
         content, title = scraper.fetch()
         assert title == "Test"
         assert "Hello" in content
+
+
+def test_cnn_content_clean():
+    html = (
+        "<html><head><title>CNN</title></head>"
+        "<body><p>Breaking\n\tNews</p></body></html>"
+    )
+    mock_resp = MockResponse(html)
+    with mock.patch("requests.get", return_value=mock_resp):
+        scraper = WebsiteScraper("https://www.cnn.com")
+        content, _ = scraper.fetch()
+        assert "\n" not in content
+        assert "\t" not in content
