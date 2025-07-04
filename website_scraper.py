@@ -9,20 +9,28 @@ class _TextExtractor(HTMLParser):
         super().__init__()
         self.text_parts = []
         self.in_title = False
+        self.in_p = False
         self.title = ""
 
     def handle_starttag(self, tag, attrs):
-        if tag.lower() == "title":
+        tag = tag.lower()
+        if tag == "title":
             self.in_title = True
+        elif tag == "p":
+            self.in_p = True
 
     def handle_endtag(self, tag):
-        if tag.lower() == "title":
+        tag = tag.lower()
+        if tag == "title":
             self.in_title = False
+        elif tag == "p":
+            self.in_p = False
 
     def handle_data(self, data):
         if self.in_title:
             self.title += data
-        self.text_parts.append(data)
+        if self.in_p:
+            self.text_parts.append(data)
 
     def get_text(self) -> Tuple[str, str]:
         text = " ".join(self.text_parts)
