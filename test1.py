@@ -4,11 +4,11 @@ def sum(a: int, b: int, c: int):
 
 def test():
     "test 1"
-    raise NotImplemented()
+    raise NotImplementedError()
 
 
 def test2():
-    raise NotImplemented()
+    raise NotImplementedError()
 
 
 def _test():
