@@ -1,4 +1,4 @@
-Refactor the ETL VS Code extension to improve readability by splitting the 300-line etlAssistantHandler + extension wiring into smaller modules, while keeping full backward compatibility.
+Refactor the ETL VS Code extension to improve readability by splitting the 300+line etlAssistantHandler + extension wiring into smaller modules, while keeping full backward compatibility.
 
 Hard requirements:
 - Do NOT change command IDs, chat participant ID, settings keys, or user-visible behavior.
