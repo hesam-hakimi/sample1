@@ -1,75 +1,171 @@
-You are working on my VS Code extension “ETL Copilot” (chat participant `etl-extension.etl-copilot` / `@etl_copilot`).
-Problem: In Phase 4, when I ask a framework question like “what is data_sourcing module?”, the assistant answers generically instead of using my ETL framework docs and the active ETL config file context. I need you to fix the handler so responses are grounded in project context.
+# Copilot Prompt: Restore `etlAssistantHandler.ts` behavior + fix `apply:` flow (Phase 4)
 
-Follow the Meta_Testing_Strategy_For_Copilot.md rules for tests.
+Paste this whole message into GitHub Copilot Chat **in the repo**, then let it make changes.
 
-### Step 1 — Identify why the response is generic
-1) Inspect `etlAssistantHandler` and locate the branch that handles non-edit prompts (when intent is false).
-2) Determine what context is being passed into the model (request.prompt only? is it missing file text and reference docs?).
-3) Confirm whether we are using `request.references` and `vscode.ChatContext` properly.
+---
+
+## Context
+
+The recent changes to `src/etlassistanthandler.ts` (or `etlAssistantHandler.ts`) introduced **stub behavior**:
+- `addReferencesToResponse` is a no-op
+- the handler prints **“File edited …”** even when no edit happened
+- `apply:` requests still end up with a useless summary like **“Instruction received …”** and do not reliably modify the active ETL JSON/HOCON file
+- the handler got refactored heavily and lost the earlier behavior (documentation/tutorial routing, keyword-to-doc file loading, etc.)
+
+**Goal:** restore the original behavior and implement Phase-4 correctly **without rewriting this file again**.
+
+Follow `Meta_Testing_Strategy_For_Copilot.md` for the testing strategy.
+
+---
+
+## Step 0 — Get back the last-known-good handler (do this first)
+
+1) Use git to locate a *working* version of the handler:
+- `git log -- src/etlassistanthandler.ts`
+- `git show <GOOD_COMMIT_SHA>:src/etlassistanthandler.ts`
+
+2) Restore that version as the baseline (either full restore or selective revert):
+- Preferred: `git checkout <GOOD_COMMIT_SHA> -- src/etlassistanthandler.ts`
+- Or: `git restore -s <GOOD_COMMIT_SHA> -- src/etlassistanthandler.ts`
+
+✅ Verify Step 0:
+- The handler is back to the earlier structure (no dummy no-op functions, and the older routing logic is visible again).
+
+---
+
+## Step 1 — Make Phase-4 changes *minimal* and non-destructive
+
+**Rule:** After restoring the baseline, only allow *small, surgical* changes to this file:
+- DO NOT reorganize the whole handler
+- DO NOT replace the prompt building strategy with a totally new one
+- DO NOT add “always print File edited” logic
+
+If a new capability is needed, implement it in **new helper modules**, then call them from the handler.
 
 ✅ Verify Step 1:
-- Add temporary logging to OutputChannel “ETL Copilot” to print:
-  - active file path
-  - whether edit intent triggered
-  - how many references were detected/added
-  - whether file content was included
-- Run the extension and ask `@etl_copilot what is data_sourcing module?`
-- Confirm logs show: active file path + references count + whether file content was injected.
+- `git diff src/etlassistanthandler.ts` shows only small deltas (ideally < ~40 lines changed).
 
-### Step 2 — Add grounding context for Q&A
-Implement a “context builder” used for BOTH:
-- edit requests (apply:)
-- informational Q&A requests
+---
 
-Context builder MUST:
-- Read active editor file content (if allowed type: .json/.conf/.hocon)
-- Add framework documentation context from `src/context_files/` (or the folder where our ETL docs live)
-- Include a short “Framework Glossary / Rules” system instruction:
-  - “Answer using the ETL framework docs first; if not found, say you can’t confirm and ask what module version/framework repo is used.”
+## Step 2 — Fix apply intent detection (do NOT rely on `request.intent`)
 
-Also add a setting:
-- `etlCopilot.chat.grounding.enabled` default `true`
-- `etlCopilot.chat.grounding.maxFileChars` default e.g. 12000 (truncate file content safely)
+In the current environment, `request.intent` may not be set the way you expect.
+
+Implement intent detection as:
+
+- `isApply = request.prompt.trim().toLowerCase().startsWith("apply:")`
+- If `etlCopilot.chat.requireApplyKeyword` is true, only edit when `isApply` is true
+- If it is false, you may infer edit intent, but still **never** edit on plain Q&A prompts
+
+Also: strip `apply:` before sending the instruction to the apply command.
 
 ✅ Verify Step 2:
-- Ask: `@etl_copilot what is data_sourcing module?`
-- Expected: answer references the ETL framework docs content (module purpose, expected keys, example snippet) and relates it to current open config file if present.
-- If docs do not contain it, it must say it can’t confirm and suggest where to look (file/module path) instead of guessing.
+- Ask: `@etl_copilot what is data_sourcing module?` → **no file changes**
+- Ask: `@etl_copilot apply: add data_sourcing module ...` → triggers edit pipeline
 
-### Step 3 — Make intent detection prevent accidental edits, but still allow grounded answers
-Keep `requireApplyKeyword` behavior:
-- Only modify files when prompt starts with `apply:` (or configured keyword).
-- For non-apply prompts, NEVER modify file — only read and answer.
+---
+
+## Step 3 — Fix “File edited” reporting (only if edit really happened)
+
+Change behavior:
+- Only print “File edited: …” after the apply command returns `ok:true` **and** the document text changed.
+- If apply fails or does not change text, print “Edit failed” / “No changes applied” and do not claim success.
 
 ✅ Verify Step 3:
-- Ask: `@etl_copilot apply: add data_sourcing ...` => file changes + validation runs.
-- Ask: `@etl_copilot what is data_sourcing module?` => NO file change + grounded answer.
+- Force a failure (no active editor) → no “File edited”
+- Successful apply → shows file edited + meaningful summary
 
-### Step 4 — Add tests so this never regresses
-Create VS Code extension host integration tests that validate grounding behavior:
+---
 
-Test A (Q&A does not edit file):
-- Open a temp `etl_test.json` as active editor
-- Call handler (or command path) with prompt “what is data_sourcing module?”
-- Assert: file content unchanged
+## Step 4 — Fix the apply command path (the real problem)
 
-Test B (Q&A includes framework context):
-- Put a small fake doc in `src/context_files/data_sourcing.md` during test setup (or use an existing doc)
-- Call handler prompt “what is data_sourcing module?”
-- Assert: returned chat output includes a phrase from that doc (or a keyword), proving it used the docs
+Ensure `etlCopilot.applyEtlEditToActiveFile` is **implemented and registered**:
 
-Test C (Apply edits):
-- Existing apply tests should still pass
+1) `package.json` includes it in `contributes.commands`
+2) `activate()` registers it
+3) the command:
+   - reads active document
+   - calls the Python editor / transformer
+   - receives `{ ok, updatedText, summary }`
+   - applies `updatedText` via `WorkspaceEdit` (replace full document)
+   - returns a typed result
+
+Use a shared type:
+
+```ts
+export type ApplyResult = {
+  ok: boolean;
+  filePath: string;
+  summary: string[];
+  changed?: boolean;
+  error?: string;
+};
+```
 
 ✅ Verify Step 4:
-- Run `npm test` (VS Code host test) and ensure all pass.
+- Open `tests/test.json` containing `{"modules":{}}`
+- Run `@etl_copilot apply: add data_sourcing ...`
+- Confirm the file now contains `"data_sourcing"` (or the HOCON equivalent)
+- The summary contains at least 1 meaningful item, e.g. “Added modules.data_sourcing”
 
-### Step 5 — Improve the UX response formatting
-For Q&A responses, format output like:
-- “From ETL Framework Docs:” + bullet points
-- “In your current file:” + mention whether module exists / missing keys
-- “Example config snippet:” (short)
+---
+
+## Step 5 — Validation must run after apply and its output must be displayed
+
+After a successful apply:
+- Call `etlCopilot.validateActiveEtlFile`
+- Show validation output (truncate if needed)
+- If validation fails, still keep the applied changes, but report the failure.
 
 ✅ Verify Step 5:
-- Manual run in VS Code: ask the question again and confirm output has these sections and is not generic.
+- Break the JSON/HOCON on purpose, run apply, confirm validation shows an error message.
+
+---
+
+## Step 6 — Restore real reference injection for Q&A (no more generic answers)
+
+Remove any stub / no-op reference logic.
+
+Make sure Q&A prompts are built using:
+- active file content (if JSON/HOCON)
+- ETL framework docs from `src/context_files/**`
+- keyword-based doc selection (like the earlier KEYWORD_FILE_MAP behavior)
+
+If docs do not contain the answer, the assistant must say it cannot confirm rather than guessing.
+
+✅ Verify Step 6:
+- Ask: `@etl_copilot what is data_sourcing module?`
+- Expected: answer quotes or clearly references your framework docs.
+
+---
+
+## Step 7 — Tests (VS Code Extension Test Host, not plain Mocha)
+
+Add/Update tests using `@vscode/test-electron`:
+
+### Test A — Apply edits change file
+- open temp doc
+- execute apply command
+- assert doc includes `data_sourcing`
+- assert ApplyResult.ok === true and summary.length > 0
+
+### Test B — Q&A does not edit
+- run Q&A path
+- assert file unchanged
+
+### Test C — Command is registered
+- `vscode.commands.getCommands(true)` includes `etlCopilot.applyEtlEditToActiveFile`
+
+✅ Verify Step 7:
+- `npm test` passes in VS Code Extension Test Host.
+
+---
+
+## Deliverables
+
+- Baseline handler restored from a known good commit (minimal edits only)
+- `apply:` actually edits the open ETL JSON/HOCON file
+- Summary shows what changed
+- Validation runs and output is shown
+- Q&A uses framework docs + active file context (no generic answers)
+- VS Code extension host tests cover apply + Q&A behavior
