@@ -1,141 +1,193 @@
-# Copilot prompt — Fix `edit_etl_config.py` “missing args” error (Phase 4)
+# Copilot Prompt — Fix “Python tool failed: Command failed … edit_etl_config.py …” (show real stderr + safe args + tests)
 
-Use this prompt **as-is** in GitHub Copilot Chat (in the repo root). It tells Copilot exactly how to fix the bug and how to prove it’s fixed.
+> Copy/paste this whole prompt into **GitHub Copilot Chat** (in your ETL Copilot extension repo).  
+> Goal: make the “apply:” command reliably invoke `edit_etl_config.py`, preserve `${...}` placeholders, and **surface real Python stderr** so failures are diagnosable. Also add tests so we don’t regress.
 
 ---
 
 ## Context (what’s broken)
 
-When the user runs:
+The chat UI currently shows:
 
-`@etl_copilot apply: add data_sourcing module reading parquet from ${source.srz.path}`
-
-the extension calls the Python CLI `edit_etl_config.py` **without** required flags, so Python prints:
-
-- `error: the following arguments are required: --file, --instruction`
-
-That means the VS Code extension is spawning Python incorrectly (or spawning it even when it failed to resolve the target file/instruction).
+- `Edit failed. Summary: [ERROR] Python tool failed: Python error. Command failed: python ... edit_etl_config.py --file ... --instruction ... --mode apply --preserve-includes true --json`
+- But it **does not show the actual stderr** from Python (traceback / module not found / parse error).
+- On Windows, if the extension uses `exec(..., { shell: true })` or runs through PowerShell, strings like `${source.srz.path}` can be interpreted by the shell. Even if it *looks* fine in logs, it can break in subtle ways.
+- Also, if args are passed as a single string, `--instruction` can be split into multiple args, causing `argparse` failures (you already hit missing `--file/--instruction` earlier).
 
 ---
 
-## Your task
+## Success criteria
 
-### Step 1 — Find where Python is invoked
-1. Search for **all** references to `edit_etl_config.py` and to the function that runs python (e.g. `spawn`, `exec`, `execFile`).
-2. Identify the call path from the command handler (likely `etlAssistantHandler.ts` → `applyEditHandler.ts`) to the Python invocation.
+After the change:
 
-✅ **Verify (Step 1)**  
-Add a temporary debug log (or return in the chat summary) that prints:
-- resolved target file path (if any)
-- resolved instruction (first ~80 chars)
-- the args array passed to Python (sanitized)
-
-Run `npm run compile` and ensure there are **no TypeScript errors**.
+1. The TS side calls Python using **args array** (NOT a single command string), with **shell disabled**.
+2. On failure (non‑zero exit code), the extension returns a chat summary that includes:
+   - exit code
+   - the exact python path + script path (sanitized)
+   - **captured stderr** (first/last N lines)
+3. `${source.srz.path}` stays literal and reaches Python unchanged.
+4. Unit tests assert the arg list and error surfacing behavior.
+5. `npm run compile` and `npm test` pass.
 
 ---
 
-### Step 2 — Enforce a single “args builder” for the Python CLI
-Create a small pure function (new file is OK), e.g.:
+## Step 1 — Locate the Python runner and make invocation “args-array + shell:false”
 
-- `src/core/pythonArgs/buildEditEtlConfigArgs.ts`
+**Task**
+- Find the code that runs Python (likely in `applyEditHandler.ts`, `etlAssistantHandler.ts`, or a helper like `pythonRunner.ts`).
+- Replace any `exec("python ...")` / `spawn("python ...", { shell: true })` usage with `execFile` or `spawn` using an **args array** and **shell: false**.
 
-It must accept:
-- `targetFilePath: string`
-- `instruction: string`
-- options: `{ mode?: string; preserveIncludes?: boolean; asJson?: boolean }`
+**Implementation notes**
+- Prefer `child_process.execFile`:
+  - `execFile(pythonExe, [scriptPath, ...args], { shell: false, cwd, env })`
+- If you use `spawn`, do:
+  - `spawn(pythonExe, [scriptPath, ...args], { shell: false, cwd, env })`
 
-It must return an **array of args** that matches the Python CLI help exactly:
+**Verification**
+- Add a temporary debug log that prints:
+  - `pythonExe`, `scriptPath`, and `args` array (not a joined string)
+- Run `npm run compile` — must pass.
 
-- `--file <targetFilePath>`
-- `--instruction <instruction>`
-- optional:
-  - `--mode <mode>` (ONLY if mode provided)
-  - `--preserve-includes <true|false>` (or the exact format your argparse expects)
-  - `--json` (ONLY if editing JSON or you explicitly want JSON output)
+---
 
-Important:
-- Use `spawn` / `execFile` with an args array. **Do not** build a single shell string.
-- If either `targetFilePath` or `instruction` is empty, throw a typed error (e.g. `MissingArgsError`) so the caller can show a friendly message and **skip** spawning Python.
+## Step 2 — Centralize “buildPythonArgs()” so tests can assert it
 
-✅ **Verify (Step 2)**  
-Add a unit test for the args builder (plain mocha is fine because it’s pure logic):
+**Task**
+Create a function that builds arguments deterministically, e.g.
 
-- `src/test/unit/buildEditEtlConfigArgs.test.ts`
+- `buildEditEtlArgs({ filePath, instruction, mode, preserveIncludes, asJson }): string[]`
 
-Test cases:
-1. JSON file path + instruction → args includes `--file` and `--instruction` with exact values, and includes `--json` when `asJson: true`.
-2. Missing file path → throws `MissingArgsError`
-3. Missing instruction → throws `MissingArgsError`
+It must return something like:
 
-Run:
+- `["--file", "<path>", "--instruction", "<instruction>", "--mode", "apply", "--preserve-includes", "true", "--json"]`
+
+**Important**
+- `instruction` must be a **single element** in the args array (it can contain spaces).
+- Do not join args into a single string anywhere.
+- Do not use `shell: true`.
+
+**Verification**
+- Add a small unit test that checks:
+  - `args.includes("--file")` and the next element is the file path
+  - `args.includes("--instruction")` and the next element equals the full instruction string
+  - `${source.srz.path}` appears exactly in the instruction arg value
+
+---
+
+## Step 3 — Capture stdout/stderr and return a useful error message to the chat UI
+
+**Task**
+Update the Python runner to collect outputs:
+
+- If exit code === 0:
+  - parse stdout as JSON (or treat stdout as the updated file content depending on your contract)
+- Else:
+  - include stderr in the error summary
+
+**Recommended behavior**
+- Capture `stdout` and `stderr` as strings.
+- In the chat response, include:
+  - `exitCode`
+  - `stderr` (truncate: first 60 lines + last 60 lines)
+  - optionally include `stdout` if helpful
+
+**Verification**
+- Unit test:
+  - stub `execFile`/`spawn` to simulate exit code 1 with `stderr="Traceback ..."`
+  - assert the returned summary contains `Traceback` (or at least a substring)
+
+---
+
+## Step 4 — Make Python fail loudly (stderr) and exit non‑zero
+
+**Task**
+Open `src/python_modules/edit_etl_config.py` and ensure:
+
+- All exceptions print a helpful message to **stderr**
+- The process exits with `sys.exit(1)` on failures
+- On success, prints a well‑formed JSON object to stdout (e.g., `{ "ok": true, ... }`)
+
+**Verification**
+- Run the exact command from the UI manually in terminal, but **quote the instruction**:
+  - PowerShell: use single quotes to keep `${...}` literal  
+    `python ... edit_etl_config.py --file ... --instruction 'add ... from ${source.srz.path}' --mode apply --preserve-includes true --json`
+- Confirm:
+  - Success prints JSON to stdout
+  - Failure prints traceback / error details to stderr
+
+---
+
+## Step 5 — Fix the chat “No changes applied” vs “Edit failed” flow
+
+**Task**
+In `applyEditHandler()`:
+- Distinguish between:
+  - Python failure (exit code != 0) => “Edit failed” + stderr excerpt
+  - Python success but no diff => “No changes applied” + reason code (e.g., `NO_MATCH`, `PARSE_OK_NO_OP`)
+  - Python success and changed => “Applied changes” + summary (what changed)
+
+**Verification**
+- Add tests for the three cases (success-changed, success-noop, failure).
+
+---
+
+## Step 6 — Add the right tests (pure logic + extension-host only where needed)
+
+### 6A) Pure TS unit tests (run under mocha without VS Code host)
+Create tests that do NOT import `vscode`.
+
+- `buildEditEtlArgs` tests (arg list correctness)
+- `pythonRunner` tests (stderr surfaced on failure)
+- `shouldApplyEdit` tests if you have logic there
+
+### 6B) VS Code extension tests (only for command registration / editor interaction)
+If you need to test `vscode.commands.executeCommand(...)`, use `@vscode/test-electron`.
+
+- Ensure `npm test` runs in Extension Test Host (not plain mocha).
+- Keep these tests minimal: “command is registered” + “returns friendly error when no active editor”.
+
+**Verification**
 - `npm run compile`
-- `npm test` (unit tests only)
+- `npm test`
+- In Extension Development Host (F5), open `tests/test.json`, run:
+  - `@etl_copilot apply: add data_sourcing module reading parquet from ${source.srz.path}`
+- Confirm:
+  - if python fails, you see stderr in the chat response
 
 ---
 
-### Step 3 — Wire the args builder into the actual handler
-In the handler that currently calls Python (likely `applyEditHandler.ts`):
-1. Ensure you **resolve** the target file first:
-   - prefer active editor text document
-   - else accept a file reference path (if your chat provides one)
-2. Ensure you extract the **instruction** text from the apply prompt (trim, preserve punctuation)
-3. Call `buildEditEtlConfigArgs(...)`
-4. Invoke python using `execFile` or `spawn`:
+## Step 7 — Important dev workflow check (avoid running the installed extension by mistake)
 
-Example shape (don’t copy blindly; fit your codebase):
-- `execFile(pythonExe, [scriptPath, ...args], { cwd: workspaceRoot })`
+Your error screenshot shows Python running from:
 
-5. If you catch `MissingArgsError`, return a user-friendly summary like:
-   - “Open an ETL HOCON/JSON file and re-run apply.”
-   - and include what was missing (file or instruction)
+- `c:\Users\<you>\.vscode\extensions\etlfw-team.etl-copilot-0.1.3\...`
 
-✅ **Verify (Step 3)**  
-Add a **VS Code Extension Host** test (must use `@vscode/test-electron`, not plain mocha):
+That usually means you’re executing the **installed** extension, not your local dev build.
 
-- Open a temp JSON document in the test host
-- Trigger the command that handles `apply`
-- Stub/mock the python runner so it doesn’t really run python
-- Assert the runner was called with args containing `--file <openedDocPath>` and `--instruction <expectedInstruction>`
+**Task**
+- Run the extension via **Extension Development Host** (F5) and confirm logs show:
+  - `Loading development extension at <your repo path>`
 
-Run:
+**Verification**
+- In dev host, the Python script path should be under your repo (or `.vscode-test`), not the installed extension folder.
+
+---
+
+## Deliverables (what I expect you to change)
+
+1. A TS helper that builds python args (testable).
+2. A TS python runner that:
+   - uses `execFile`/`spawn` with args array
+   - captures stdout/stderr
+   - returns structured result `{ ok, stdout, stderr, exitCode }`
+3. `applyEditHandler` updated to:
+   - call python runner with correct args
+   - show meaningful error summaries
+4. Unit tests for args + stderr surfacing.
+5. If needed, minimal VS Code extension-host tests using `@vscode/test-electron`.
+
+When done, run:
 - `npm run compile`
-- `npm test` (extension host tests)
+- `npm test`
 
----
-
-### Step 4 — Add a regression test for the exact failure
-Create an integration-style test that reproduces the current bug:
-- simulate calling apply while no active editor is open (or no target doc resolved)
-- assert:
-  - python runner is NOT invoked
-  - summary returns “Open the ETL HOCON/JSON file to apply edits.”
-
-✅ **Verify (Step 4)**  
-Run `npm test` and confirm the regression test passes.
-
----
-
-### Step 5 — Manual verification (what I will do after your change)
-After tests pass, I will manually:
-1. Open `test.json` in the editor
-2. Run: `@etl_copilot apply: add data_sourcing module reading parquet from ${source.srz.path}`
-3. Expect:
-   - No “missing args” Python usage output
-   - Summary shows either:
-     - changes applied, or
-     - “no changes applied” **with a reason** (e.g., parser couldn’t find insertion point)
-
-If it still fails, your summary must include:
-- resolved file path
-- detected file type (json/hocon)
-- the python args list (sanitized)
-so we can debug fast.
-
----
-
-## Non-negotiables
-- Do **not** call python if file path or instruction is missing.
-- Use `execFile`/`spawn` with args array (no shell string).
-- Add tests (pure unit + extension host) so this never regresses.
-
----
+and paste the results + the updated error output (if any).
