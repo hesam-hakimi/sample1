@@ -1,128 +1,177 @@
-# vector_smoke_test_existing_index.py
-import os
-import time
-from datetime import datetime, timezone
+# Copilot Prompt — Fix apply() missing file, bad result schema, and VS Code not reflecting file updates
 
-from azure.identity import ManagedIdentityCredential
-from azure.search.documents import SearchClient
-from azure.search.documents.indexes import SearchIndexClient
-from azure.search.documents.models import VectorizedQuery
+You are working in the **ETL Copilot VS Code extension**. The `apply:` workflow currently breaks in several ways:
 
+## Symptoms to fix (all are real and must be addressed)
+1. **If the user runs `apply:` without attaching/choosing a file**, the Python tool is invoked with missing args and fails:
+   - `edit_etl_config.py: error: the following arguments are required: --file, --instruction`
+2. **If the user passes an empty JSON `{}`**, the tool may partially update the file on disk, but VS Code does not reflect it (shows “content is newer” / needs reopen), and the extension throws:
+   - `applyResult.summary.join is not a function`
+3. Sometimes the file gets **corrupted** with non‑JSON text like repeated `Edit failed. Summary:` lines, and later errors show:
+   - `JSON parse error: Expecting value: line 1 column 1 (char 0)`
+   - `Error applying edit: Error: An object could not be cloned`
+4. Validation step sometimes fails with:
+   - `command 'etlCopilot.validateActiveEtlFile' not found`
 
-def get_msi_credential() -> ManagedIdentityCredential:
-    """
-    If you have multiple user-assigned identities, set AZURE_CLIENT_ID.
-    Otherwise, system-assigned MI will be used.
-    """
-    client_id = os.getenv("AZURE_CLIENT_ID")
-    if client_id:
-        print(f"Auth: Using User-Assigned Managed Identity (client_id={client_id})")
-        return ManagedIdentityCredential(client_id=client_id)
+Your job: **change the extension + python tool so apply is reliable, never corrupts files, and VS Code always shows the updated content immediately.**
 
-    print("Auth: Using System-Assigned Managed Identity")
-    return ManagedIdentityCredential()
+---
 
+## High-level design (required)
+### A) The extension MUST NOT let the Python script write the target file directly
+- The extension should read the file text and pass it to Python.
+- Python should return a structured result (JSON) including `newText`.
+- The extension should apply edits **through VS Code APIs** (`TextEditorEdit` / `WorkspaceEdit`) so the open editor updates instantly and we avoid “content is newer” conflicts.
 
-def pick_key_and_vector_field(index_def):
-    # Key field
-    key_field = None
-    for f in index_def.fields:
-        if getattr(f, "key", False):
-            key_field = f.name
-            break
-    if not key_field:
-        raise RuntimeError("Could not find key field in index definition.")
+### B) Standardize the tool result schema (no more `summary.join` failures)
+Define a single TypeScript type used end-to-end:
 
-    # Vector field(s)
-    vector_fields = []
-    for f in index_def.fields:
-        dims = getattr(f, "vector_search_dimensions", None)
-        if dims is not None:
-            vector_fields.append((f.name, int(dims)))
+```ts
+export type ApplyEditResult = {
+  ok: boolean;
+  changed: boolean;
+  file?: string;          // absolute path or uri.fsPath
+  format: "json" | "hocon";
+  newText?: string;       // present when ok=true
+  summary: string[];      // ALWAYS array (even if single line)
+  errors?: string[];      // optional
+};
+```
 
-    if not vector_fields:
-        raise RuntimeError(
-            "No vector fields found in this index (no field has vector_search_dimensions). "
-            "Vector search can't run unless the index has a vector field."
-        )
+The extension must normalize any older shape defensively, but the goal is: **Python always returns this schema**.
 
-    # Pick first vector field by default
-    vector_field_name, dims = vector_fields[0]
-    return key_field, vector_field_name, dims, vector_fields
+---
 
+## Implementation tasks (do all)
 
-def main():
-    endpoint = os.environ["AZURE_SEARCH_ENDPOINT"]  # e.g. https://xxxx.search.windows.net
-    index_name = os.getenv("AZURE_SEARCH_INDEX_NAME", "texttosql")
+### 1) Fix target file resolution (no more missing `--file` / `--instruction`)
+In `applyEditHandler.ts` (or equivalent), implement `resolveTargetUri(...)`:
 
-    cred = get_msi_credential()
+**Rules**
+- If request includes a file reference/context → use it.
+- Else, use `vscode.window.activeTextEditor?.document.uri`.
+- Else: **do not call Python**; return a friendly message: “Open an ETL JSON/HOCON file (or attach it) then run apply again.”
 
-    index_client = SearchIndexClient(endpoint=endpoint, credential=cred)
-    search_client = SearchClient(endpoint=endpoint, index_name=index_name, credential=cred)
+Also:
+- If the resolved document is `untitled:` or not saved → ask user to save first.
 
-    # 1) Read index definition (no schema changes)
-    print(f"Reading index definition: {index_name} ...")
-    index_def = index_client.get_index(index_name)
+### 2) Pass file contents to Python via stdin (no disk writes)
+Update Node/TS side:
+- Call `python .../edit_etl_config.py --mode apply --format <json|hocon> --instruction "<...>" --stdin`
+- Send the current file text to stdin.
+- Capture **stdout** and **stderr** separately.
+- Treat **stdout** as **machine JSON only**. Any logs must be in stderr.
 
-    key_field, vector_field, dims, vector_fields = pick_key_and_vector_field(index_def)
+If Python exits non-zero:
+- Show stderr in the chat response.
+- **Do not modify the file.**
 
-    print(f"Key field: {key_field}")
-    print("Vector fields detected:")
-    for name, d in vector_fields:
-        print(f"  - {name} (dims={d})")
+If Python exits zero but stdout is not valid JSON:
+- Show a clear error in chat including a short excerpt of stdout/stderr.
+- **Do not modify the file.**
+- Add tests for this case.
 
-    print(f"Using vector field: {vector_field} (dims={dims})")
+### 3) Update `edit_etl_config.py` to support stdin + return structured JSON
+Modify `src/python_modules/edit_etl_config.py`:
 
-    # 2) Create a deterministic test vector
-    # Use a sparse-ish vector: [1, 0, 0, ...]
-    test_vector = [0.0] * dims
-    test_vector[0] = 1.0
+- Add flag `--stdin` (boolean). When present, read the full config text from stdin instead of `--file`.
+- Keep `--file` supported for CLI/manual use, but the extension will use `--stdin`.
+- Determine format:
+  - If `--format json`: parse JSON; if empty or `{}` and instruction needs modules, create `modules` object.
+  - If `--format hocon`: parse with pyhocon; preserve substitutions like `${...}`; preserve `include` statements (details below).
+- Output ONLY the `ApplyEditResult` JSON to stdout (no extra prints).
+- Send debug/info logs to stderr if needed.
+- On failure: output `{"ok": false, "changed": false, "format": "...", "summary": [...], "errors": [...]}` to stdout and exit non-zero (or exit 0 but ok=false; choose one approach and make TS handle it consistently).
 
-    # 3) Upsert ONE test doc (only key + vector field)
-    test_id = f"vector-smoke-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-    doc = {key_field: test_id, vector_field: test_vector}
+**Important include handling (HOCON)**
+- `include "..."` lines are *not JSON* and are semantically important.
+- Preserve them by:
+  1) Extracting include lines (and their original relative order) before parsing.
+  2) Parse/modify the rest using pyhocon.
+  3) Render back to HOCON.
+  4) Re-insert the include lines near the top exactly once (avoid duplicates).
+- Add a unit test fixture HOCON containing include lines.
 
-    print(f"Upserting test doc id={test_id} ...")
-    upsert_result = search_client.upload_documents([doc])
-    if not all(r.succeeded for r in upsert_result):
-        raise RuntimeError(f"Upload failed: {upsert_result}")
-    print("Upload: OK")
+### 4) Apply edits through VS Code so the open editor updates immediately
+In TypeScript:
+- If `result.ok && result.newText`:
+  - Open the document (or use active editor doc if same URI).
+  - Apply a single full-range replacement using `WorkspaceEdit` or `TextEditorEdit`.
+  - After applying, if command is `apply`, call `await document.save()` (or make this configurable).
+- This prevents:
+  - “content is newer”
+  - having to close/reopen to see changes
+  - file corruption due to external writes
 
-    # Give the service a moment to index
-    time.sleep(2)
+### 5) Fix `applyResult.summary.join is not a function` forever
+- Ensure `ApplyEditResult.summary` is always an array.
+- Add a small helper:
 
-    # 4) Vector query with the SAME vector (should retrieve our doc)
-    print("Running vector query ...")
-    vq = VectorizedQuery(vector=test_vector, k_nearest_neighbors=5, fields=vector_field)
+```ts
+function normalizeSummary(summary: unknown): string[] {
+  if (Array.isArray(summary)) return summary.map(String);
+  if (typeof summary === "string") return summary ? [summary] : [];
+  if (summary == null) return [];
+  return [String(summary)];
+}
+```
 
-    results = list(
-        search_client.search(
-            search_text="",
-            vector_queries=[vq],
-            select=[key_field],
-            top=5,
-        )
-    )
+Use it before rendering to chat, even if Python is updated.
 
-    print("\nTop results:")
-    for r in results:
-        print(f"- {r[key_field]}  score={r.get('@search.score')}")
+### 6) Fix “An object could not be cloned”
+This commonly happens when passing non-serializable objects into places that require cloning.
 
-    if results and results[0][key_field] == test_id:
-        print("\n✅ PASS: Vector search returned the inserted test document as rank #1.")
-    else:
-        print("\n⚠️  PARTIAL: Vector search returned results, but the test doc was not rank #1.")
-        print("This can happen with approximate HNSW on some configs, or if filtering/scoring differs.")
-        print("If you want, I can give you a variant that retries or uses a more distinctive vector.")
+- Do **not** store VS Code objects (Uri, Range, TextDocument, etc.) inside objects that get posted/cloned.
+- If you send any data to webviews or telemetry or serialize results, only send primitives/POJOs.
+- Ensure the returned `ApplyEditResult` you log/emit contains only JSON-safe values.
 
-    # 5) Cleanup: delete the test doc
-    print(f"\nDeleting test doc id={test_id} ...")
-    del_result = search_client.delete_documents([{key_field: test_id}])
-    if not all(r.succeeded for r in del_result):
-        print(f"⚠️  Cleanup warning: delete may have failed: {del_result}")
-    else:
-        print("Cleanup: OK")
+Add a regression test that ensures your result object is JSON-serializable:
+- `JSON.stringify(result)` must not throw.
 
+### 7) Fix `etlCopilot.validateActiveEtlFile not found`
+Do one of these (preferred: #1):
+1. **Remove** the executeCommand call and run validation directly (call a local function).
+2. OR register the command properly:
+   - `package.json` contributes.commands includes `etlCopilot.validateActiveEtlFile`
+   - `activationEvents` includes `onCommand:etlCopilot.validateActiveEtlFile`
+   - `activate()` registers it via `vscode.commands.registerCommand(...)`
 
-if __name__ == "__main__":
-    main()
+Also: if validation is optional, guard it:
+- check `await vscode.commands.getCommands(true)` contains it before calling.
+
+---
+
+## Tests (must add)
+### TypeScript (Jest)
+- `resolveTargetUri`:
+  - returns active editor uri when no file passed
+  - throws/returns user-friendly error when nothing is open
+- `normalizeSummary` handles: array, string, null, object
+- handler behavior when python stdout is invalid JSON:
+  - asserts **no file edits** performed
+
+### Python (pytest)
+- JSON `{}` + instruction “add data_sourcing module reading parquet...” should:
+  - return ok=true
+  - changed=true
+  - include `modules.data_sourcing_read_parquet` (or your decided name)
+- HOCON fixture with include line:
+  - output preserves include line
+  - modifications applied without duplicating include
+- Empty input should return ok=false with helpful errors and changed=false
+
+---
+
+## Acceptance criteria
+- Running `apply:` with no file open/attached does **not** call python; returns a clear message.
+- Running `apply:` on `{}` produces a valid updated JSON file **visible immediately in VS Code** (no reopen, no “content newer”).
+- The extension never writes `Edit failed...` text into config files.
+- `applyResult.summary.join` never throws.
+- No “An object could not be cloned” errors.
+- Validation step does not fail due to missing command.
+
+---
+
+## Notes for the change
+- Prefer minimal invasive refactor: introduce `runPythonEditTool(inputText, instruction, format)` and reuse it.
+- Keep backward compatibility where possible, but prioritize correctness and not corrupting files.
