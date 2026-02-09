@@ -1,46 +1,33 @@
-Implement the core NL→SQL pipeline WITHOUT tool-calling APIs.
+Create a Gradio UI that:
+- lets user chat (natural language)
+- shows proposed SQL (not executed yet)
+- requires explicit confirmation to run
+- displays query result (DataFrame)
 
 Create:
-- app/nl2sql.py
+- app/ui.py:
+  - Gradio Blocks with:
+    - Chatbot
+    - Textbox + Send button
+    - SQL Code panel (read-only display)
+    - “Run SQL” button
+    - Results table (gr.Dataframe)
+    - gr.State to store last proposed SQL + last explanation
+  - send handler:
+    - calls nl2sql.generate_sql(question)
+    - updates chat + SQL panel but does NOT execute
+  - run handler:
+    - executes stored SQL via db.execute_query
+    - shows DataFrame results
+    - handle errors nicely (show error in chat)
 
-Design:
-1) metadata plan step:
-   - Send user question to LLM asking it to output STRICT JSON:
-     {
-       "metadata_queries": [
-          {"purpose": "...", "sql": "SELECT ... FROM meta.... WHERE ..."}
-       ]
-     }
-   - You will parse JSON using extract_json()
-   - For each query:
-     - validate_metadata_sql(query)
-     - execute_query against SQL Server via app.db.execute_query
-   - Collect results into a compact text context for the next step (limit rows per query to 50)
-
-2) final SQL step:
-   - Call LLM again with:
-     - the user question
-     - the metadata results context (tables/columns/relationships/terms)
-   - Ask for STRICT JSON:
-     {
-       "sql": "SELECT ...",
-       "explanation": "...",
-       "assumptions": ["..."],
-       "needs_confirmation": ["..."]
-     }
-   - validate_business_sql(sql)
-   - return a dataclass-like dict {sql, explanation, assumptions, needs_confirmation}
-
-Prompts must be deterministic:
-- temperature=0
-- include clear rules: “Do not invent tables/columns; only use what appears in metadata.”
+Create:
+- app/main.py:
+  - launches the UI (gradio) with sensible defaults
+  - reads config
+  - has `if __name__ == "__main__": main()`
 
 Add tests:
-- tests/test_nl2sql.py
-  - Mock LLMClient.chat to return fixed JSON for plan + final
-  - Mock execute_query to return small DataFrames
-  - Ensure:
-    - metadata queries validated
-    - final SQL validated
-    - output structure correct
-    - invalid LLM SQL triggers ValueError
+- tests/test_ui_logic.py:
+  - Don’t launch Gradio server.
+  - Unit-test the handler functions by calling them directly with mocks (LLM + DB).
