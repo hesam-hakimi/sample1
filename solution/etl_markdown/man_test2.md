@@ -1,21 +1,12 @@
-Add lightweight docs and a smoke runner.
+Fix ModuleNotFoundError: No module named 'app' when running app/main.py directly.
 
-Create:
-- README.md with:
-  - what this POC does
-  - architecture diagram in text (bullet flow)
-  - run instructions:
-    1) run SQL scripts
-    2) set env vars
-    3) python app/main.py
-  - security notes explaining the read-only guardrails and confirmation step
+Do:
+1) Update README.md run instructions to use:
+   cd <repo-root>
+   python -m app.main
+2) Add a repo-root main.py entrypoint that calls app.main.main(), so users can also run `python main.py`.
+3) Add/update VS Code .vscode/launch.json to run the module app.main with cwd = workspaceFolder.
+4) Ensure app/__init__.py exists (do not remove).
+5) Add/adjust a small pytest test that imports app.main successfully (no Azure/SQL calls).
 
-Create:
-- scripts/smoke_test.py:
-  - loads config
-  - runs one NL→SQL request (mockable via env var SMOKE_FAKE_LLM=1)
-  - if SMOKE_FAKE_LLM=1, bypass LLM and return a known safe SQL
-  - otherwise calls the real pipeline
-
-Add:
-- tests/test_smoke_fake_llm.py verifying SMOKE_FAKE_LLM path works without Azure.
+Return the exact file changes with full contents for any new/modified files.
