@@ -1,34 +1,37 @@
-You are working in THIS repo. Create a minimal Python project for a Gradio + Azure OpenAI (MSI) + SQL Server (pyodbc) app.
+Create SQL scripts for a Banking/Finance POC with BOTH:
+(A) business tables (dbo schema) and (B) metadata tables (meta schema) that describe the business tables.
 
-Constraints:
-- Do NOT use OpenAI Runner/Agent/Agents SDK.
-- Use openai.AzureOpenAI client (chat.completions.create) with azure_ad_token_provider from ManagedIdentityCredential.
-- Keep dependencies minimal and explicit.
-- Add pytest tests.
+Create these files exactly:
+- sql/01_create_banking_schema.sql
+- sql/02_create_metadata_schema.sql
+- sql/03_seed_sample_data.sql
 
-Create these files:
-1) requirements.txt with:
-   - gradio
-   - openai
-   - azure-identity
-   - pyodbc
-   - pandas
-   - pytest
-   - python-dotenv (optional but nice)
-2) .env.example with placeholders:
-   AZURE_OPENAI_ENDPOINT=
-   AZURE_OPENAI_API_VERSION=2024-10-21
-   AZURE_OPENAI_DEPLOYMENT=gpt-4.1
-   SQL_SERVER=
-   SQL_DATABASE=
-   SQL_DRIVER=ODBC Driver 18 for SQL Server
-3) app/__init__.py
-4) app/config.py:
-   - reads env vars (use dotenv if present)
-   - validates required settings with clear error messages
-5) tests/test_config.py:
-   - tests missing env vars raise a helpful exception
+Requirements:
+- Scripts should be idempotent (safe to rerun). Use IF OBJECT_ID(...) IS NOT NULL DROP... patterns.
+- Use SQL Server syntax.
+- Keep business domain realistic: Customers, Accounts, Transactions, Merchants, Branches.
+- Metadata must support:
+  1) table definition + field definition
+  2) field datatype + PK/FK
+  3) entity relationships
+  4) business definitions/glossary terms
 
-Acceptance criteria:
-- `pytest -q` runs locally and passes (tests should not require real Azure/SQL connections).
-- Config validation errors are clear and actionable.
+Implement schemas:
+Business tables in dbo:
+- dbo.Customers(CustomerId PK, FirstName, LastName, DateOfBirth, Segment, CreatedAt)
+- dbo.Branches(BranchId PK, BranchName, City, Province)
+- dbo.Accounts(AccountId PK, CustomerId FK->Customers, BranchId FK->Branches, AccountType, OpenDate, Status, Currency, CurrentBalance)
+- dbo.Merchants(MerchantId PK, MerchantName, MCC, Category)
+- dbo.Transactions(TransactionId PK, AccountId FK->Accounts, MerchantId FK->Merchants NULL, TransactionDate, Amount, Direction, Channel, Description)
+
+Metadata schema meta:
+- meta.Tables(TableId PK, SchemaName, TableName, TableDescription, BusinessDomain)
+- meta.Columns(ColumnId PK, TableId FK->meta.Tables, ColumnName, DataType, IsNullable, IsPrimaryKey, IsForeignKey, ReferencesTable, ReferencesColumn, ColumnDescription, BusinessDefinition)
+- meta.Relationships(RelationshipId PK, FromSchema, FromTable, FromColumn, ToSchema, ToTable, ToColumn, Cardinality, RelationshipDescription)
+- meta.BusinessTerms(TermId PK, Term, Definition, Synonyms, RelatedTables, RelatedColumns)
+
+Seed data:
+- Insert ~10 customers, 2-3 branches, ~12 accounts, ~8 merchants, ~80 transactions across accounts.
+- Populate meta.* tables to fully describe dbo.* tables and relationships (including business definitions).
+
+Add a short README comment at top of each SQL file explaining the purpose and run order.
