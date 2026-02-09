@@ -1,33 +1,21 @@
-Create a Gradio UI that:
-- lets user chat (natural language)
-- shows proposed SQL (not executed yet)
-- requires explicit confirmation to run
-- displays query result (DataFrame)
+Add lightweight docs and a smoke runner.
 
 Create:
-- app/ui.py:
-  - Gradio Blocks with:
-    - Chatbot
-    - Textbox + Send button
-    - SQL Code panel (read-only display)
-    - “Run SQL” button
-    - Results table (gr.Dataframe)
-    - gr.State to store last proposed SQL + last explanation
-  - send handler:
-    - calls nl2sql.generate_sql(question)
-    - updates chat + SQL panel but does NOT execute
-  - run handler:
-    - executes stored SQL via db.execute_query
-    - shows DataFrame results
-    - handle errors nicely (show error in chat)
+- README.md with:
+  - what this POC does
+  - architecture diagram in text (bullet flow)
+  - run instructions:
+    1) run SQL scripts
+    2) set env vars
+    3) python app/main.py
+  - security notes explaining the read-only guardrails and confirmation step
 
 Create:
-- app/main.py:
-  - launches the UI (gradio) with sensible defaults
-  - reads config
-  - has `if __name__ == "__main__": main()`
+- scripts/smoke_test.py:
+  - loads config
+  - runs one NL→SQL request (mockable via env var SMOKE_FAKE_LLM=1)
+  - if SMOKE_FAKE_LLM=1, bypass LLM and return a known safe SQL
+  - otherwise calls the real pipeline
 
-Add tests:
-- tests/test_ui_logic.py:
-  - Don’t launch Gradio server.
-  - Unit-test the handler functions by calling them directly with mocks (LLM + DB).
+Add:
+- tests/test_smoke_fake_llm.py verifying SMOKE_FAKE_LLM path works without Azure.
