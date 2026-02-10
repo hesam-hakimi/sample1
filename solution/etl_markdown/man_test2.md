@@ -1,30 +1,10 @@
-# KMAI POC Tracker — README
+# Options Matrix — Strategic vs Tactical
 
-## Goal
-Build a POC where a business user asks a question and the solution:
-1) interprets the request,
-2) generates SQL,
-3) executes it on a database (or equivalent data source),
-4) summarizes results back to the user.
-
-## Guiding principles (from meeting)
-- Move fast: build a working skeleton now; improve model + access in parallel.
-- Track “Strategic” vs “Tactical” (shortcuts) explicitly.
-- Two parallel workstreams:
-  - Connectivity / data access
-  - POC skeleton + prompt/RAG/Text-to-SQL flow
-- Daily morning check-in: update status, blockers, next steps.
-
-## Status colors
-- 🟢 Green: unblocked / in progress
-- 🟡 Yellow: some risk / dependency
-- 🔴 Red: blocked (needs decision/escalation)
-
-## Owners
-List key people + roles (edit as needed):
-- Praveen: overall POC flow & demo readiness
-- Savita: program/coordination, escalation (Lalit)
-- Ankur: architecture/solution + tracker owner
-- Sabita/Samita/Chuck: connectivity exploration
-- Hesam: first draft of steps (tracker seed)
-- Neha: scheduling / coordination
+| Option ID | Option | Description | Strategic/Tactical | Pros | Cons/Risks | Dependencies | Current Recommendation |
+|---|---|---|---|---|---|---|---|
+| A | Connect DevSandbox → Synapse/SRZ/Dev* | Direct query on real dev data | Strategic | Realistic demo, less copying | Access/network approvals may take time | Connectivity, firewall, creds | Explore in parallel |
+| B | Replicate/copy subset of IM/SP/SD dev data into DevSandbox | Curated dataset for POC | Tactical → bridge | Fast if allowed; stable | Data movement approval; freshness | Export process, storage, masking | Fallback if A slips |
+| C | Azure AI Search + OpenAI | Use search index for retrieval + grounding | Tactical/Strategic | Great for docs + schema assist | Index cap (50) reached | Index quota/cleanup | Viable if blocker resolved |
+| D | Azure SQL + LLM (Text-to-SQL) | LLM generates SQL + executes on Azure SQL | Tactical/Strategic | Very direct POC path | SQL user lacks create privileges | DBA grant / alt schema | Viable with privilege fix |
+| E | File-based tables (CSV/Parquet) + SQL engine | Store extracts in files; query via engine | Tactical | Avoid DB permissions | More plumbing; data drift | Storage + query engine | Consider if DB blocked |
+| F | Manual schema prompt pack | Hardcode schema/definitions for POC | Tactical | Very fast to start | Limited coverage; brittle | Someone to curate | Use immediately for skeleton |
