@@ -1,14 +1,8 @@
-# Workplan Tracker (Master)
+# Blockers & Mitigations
 
-| ID | Workstream | Task | Strategic/Tactical | Owner | Start | Due | Status (🟢🟡🔴) | Dependencies | Notes/Deliverable |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 | Planning | Create tracker + populate steps | Tactical | Hesam/Ankur |  |  |  |  | First draft then refine |
-| 2 | Architecture | Finalize POC flow diagram + sequence | Tactical | Praveen/Ankur |  |  |  |  | “simple flow” agreed |
-| 3 | Data Access | Assess DevSandbox → Synapse/SRZ/Dev* connectivity | Strategic | Samita/Chuck |  |  |  |  | Document paths + blockers |
-| 4 | Data Access | If no connectivity: define minimal dataset copy plan (IM/SP/SD) | Tactical | Sabita |  |  |  |  | Define subset size + process |
-| 5 | Retrieval | AI Search index audit + consolidation plan | Tactical | TBD |  |  |  |  | Fix “50 indexes” cap |
-| 6 | SQL Exec | Resolve SQL privileges (create objects / schema) | Tactical | TBD/DBA |  |  |  |  | Fix “no create privileges” |
-| 7 | Prompting | Draft Text-to-SQL system prompt + safety rules | Tactical | Ankur |  |  |  |  | Includes schema injection |
-| 8 | App | Build skeleton API/UI (chat → SQL → results → summary) | Tactical | Praveen |  |  |  |  | Minimum end-to-end demo |
-| 9 | Testing | Create question set + expected outputs | Tactical | TBD |  |  |  |  | 20–30 queries for demo |
-| 10 | Demo | Demo script + screenshots + known limitations | Tactical | Praveen |  |  |  |  | For Lalit checkpoint |
+| Blocker ID | Blocker | Impact | Root Cause | Workaround (Tactical) | Fix (Strategic) | Owner | Status |
+|---|---|---|---|---|---|---|---|
+| B1 | Azure AI Search index count maxed (50) | Cannot create new indexes; limits scaling | Service quota / current design | Consolidate: fewer indexes, reuse fields, multi-tenant index strategy | Request quota increase / redesign indexing strategy | TBD | 🔴 |
+| B2 | SQL user cannot create objects | Cannot create tables/views/staging needed | Missing privileges/role | Use existing schema only; use temp tables if allowed; use file extracts | Request permissions / new schema / DBA-managed objects | TBD | 🔴 |
+| B3 | No Synapse/SRZ access from DevSandbox | Blocks “real dev data” route | Network/identity/access approvals | Copy subset data; use files; demo with smaller dataset | Approve connectivity path + firewall + creds | TBD | 🟡 |
+| B4 | Collibra/Data Compass not ready | Limits metadata-driven automation | Tool readiness | Manual schema prompt pack | Integrate Collibra/Data Compass when ready | TBD | 🟡 |
