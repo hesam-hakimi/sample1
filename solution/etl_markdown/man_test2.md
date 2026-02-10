@@ -1,12 +1,30 @@
-Fix ModuleNotFoundError: No module named 'app' when running app/main.py directly.
+# KMAI POC Tracker — README
 
-Do:
-1) Update README.md run instructions to use:
-   cd <repo-root>
-   python -m app.main
-2) Add a repo-root main.py entrypoint that calls app.main.main(), so users can also run `python main.py`.
-3) Add/update VS Code .vscode/launch.json to run the module app.main with cwd = workspaceFolder.
-4) Ensure app/__init__.py exists (do not remove).
-5) Add/adjust a small pytest test that imports app.main successfully (no Azure/SQL calls).
+## Goal
+Build a POC where a business user asks a question and the solution:
+1) interprets the request,
+2) generates SQL,
+3) executes it on a database (or equivalent data source),
+4) summarizes results back to the user.
 
-Return the exact file changes with full contents for any new/modified files.
+## Guiding principles (from meeting)
+- Move fast: build a working skeleton now; improve model + access in parallel.
+- Track “Strategic” vs “Tactical” (shortcuts) explicitly.
+- Two parallel workstreams:
+  - Connectivity / data access
+  - POC skeleton + prompt/RAG/Text-to-SQL flow
+- Daily morning check-in: update status, blockers, next steps.
+
+## Status colors
+- 🟢 Green: unblocked / in progress
+- 🟡 Yellow: some risk / dependency
+- 🔴 Red: blocked (needs decision/escalation)
+
+## Owners
+List key people + roles (edit as needed):
+- Praveen: overall POC flow & demo readiness
+- Savita: program/coordination, escalation (Lalit)
+- Ankur: architecture/solution + tracker owner
+- Sabita/Samita/Chuck: connectivity exploration
+- Hesam: first draft of steps (tracker seed)
+- Neha: scheduling / coordination
