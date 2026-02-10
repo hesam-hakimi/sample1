@@ -1,10 +1,14 @@
-# Options Matrix — Strategic vs Tactical
+# Workplan Tracker (Master)
 
-| Option ID | Option | Description | Strategic/Tactical | Pros | Cons/Risks | Dependencies | Current Recommendation |
-|---|---|---|---|---|---|---|---|
-| A | Connect DevSandbox → Synapse/SRZ/Dev* | Direct query on real dev data | Strategic | Realistic demo, less copying | Access/network approvals may take time | Connectivity, firewall, creds | Explore in parallel |
-| B | Replicate/copy subset of IM/SP/SD dev data into DevSandbox | Curated dataset for POC | Tactical → bridge | Fast if allowed; stable | Data movement approval; freshness | Export process, storage, masking | Fallback if A slips |
-| C | Azure AI Search + OpenAI | Use search index for retrieval + grounding | Tactical/Strategic | Great for docs + schema assist | Index cap (50) reached | Index quota/cleanup | Viable if blocker resolved |
-| D | Azure SQL + LLM (Text-to-SQL) | LLM generates SQL + executes on Azure SQL | Tactical/Strategic | Very direct POC path | SQL user lacks create privileges | DBA grant / alt schema | Viable with privilege fix |
-| E | File-based tables (CSV/Parquet) + SQL engine | Store extracts in files; query via engine | Tactical | Avoid DB permissions | More plumbing; data drift | Storage + query engine | Consider if DB blocked |
-| F | Manual schema prompt pack | Hardcode schema/definitions for POC | Tactical | Very fast to start | Limited coverage; brittle | Someone to curate | Use immediately for skeleton |
+| ID | Workstream | Task | Strategic/Tactical | Owner | Start | Due | Status (🟢🟡🔴) | Dependencies | Notes/Deliverable |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | Planning | Create tracker + populate steps | Tactical | Hesam/Ankur |  |  |  |  | First draft then refine |
+| 2 | Architecture | Finalize POC flow diagram + sequence | Tactical | Praveen/Ankur |  |  |  |  | “simple flow” agreed |
+| 3 | Data Access | Assess DevSandbox → Synapse/SRZ/Dev* connectivity | Strategic | Samita/Chuck |  |  |  |  | Document paths + blockers |
+| 4 | Data Access | If no connectivity: define minimal dataset copy plan (IM/SP/SD) | Tactical | Sabita |  |  |  |  | Define subset size + process |
+| 5 | Retrieval | AI Search index audit + consolidation plan | Tactical | TBD |  |  |  |  | Fix “50 indexes” cap |
+| 6 | SQL Exec | Resolve SQL privileges (create objects / schema) | Tactical | TBD/DBA |  |  |  |  | Fix “no create privileges” |
+| 7 | Prompting | Draft Text-to-SQL system prompt + safety rules | Tactical | Ankur |  |  |  |  | Includes schema injection |
+| 8 | App | Build skeleton API/UI (chat → SQL → results → summary) | Tactical | Praveen |  |  |  |  | Minimum end-to-end demo |
+| 9 | Testing | Create question set + expected outputs | Tactical | TBD |  |  |  |  | 20–30 queries for demo |
+| 10 | Demo | Demo script + screenshots + known limitations | Tactical | Praveen |  |  |  |  | For Lalit checkpoint |
