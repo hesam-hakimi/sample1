@@ -1,30 +1,30 @@
-# KMAI POC — Tracker (Praveen-ready)
+# KMAI POC — Tracker (Aligned to Diagram Steps 1–11)
 
 ## Executive Snapshot (fill daily)
-| Item | Status (🟢🟡🔴) | Notes |
-|---|---|---|
-| End-to-end demo (any data) |  | RAG flow tested; demo target by Tue |
-| Data for demo (real vs synthetic) |  | Choose option(s) below |
-| Azure AI Search index limit |  | 50 limit reached |
-| Azure SQL privileges |  | Cannot create objects |
-| Approvals for confidential data |  | Needed if using functionalized datasets |
+| Item | Status (🟢🟡🔴) | Diagram Step(s) | Notes |
+|---|---|---|---|
+| End-to-end demo ready |  | 4 → 11 | App can answer questions end-to-end |
+| Data available for demo |  | 1–3 or 9–10 | Synthetic or approved dev extract |
+| AI Search capacity OK |  | 3 | 50 index cap issue |
+| SQL execution path OK |  | 9–10 | SQL privileges / target DB |
+| Approvals cleared (if needed) |  | 1,9 | Confidential data approvals |
 
 ---
 
 ## Master Plan (divide & conquer)
-| ID | Workstream | Task | Owner | Due | Status (🟢🟡🔴) | Depends on | Deliverable |
+| ID | Workstream | Task | Owner | Due | Status (🟢🟡🔴) | Diagram Step(s) | Deliverable |
 |---|---|---|---|---|---|---|---|
-| T1 | Options | Confirm shortlist of options (1–3) + long poles | Saitha + Praveen + Chakrapani |  |  | O1 sheet | Agreed path for demo |
-| T2 | Flow | Create pictorial data-flow and step IDs | Naveen | Tomorrow |  |  | Diagram + Step IDs |
-| T3 | Blockers | Map each blocker to flow step + reach-out + response | Hesam + Naveen | Tomorrow |  | T2 | Updated blockers register |
-| T4 | AI Search | Reduce/merge/delete indexes or request increase | Naveen |  |  | Access | Freed capacity / plan |
-| T5 | SQL | Fix “no create objects” (new schema or DBA objects) | Chakrapani + Naveen (+DBA) |  |  | Approval | Working SQL path |
-| T6 | Data | Pick demo dataset (synthetic or extracted) + load | Naveen + Hesam |  |  | Option chosen | Dataset available |
-| T7 | Demo | Demo script + known limits + next steps | Praveen |  |  | End-to-end | Demo pack |
+| T1 | Options | Finalize option shortlist + long poles | Saitha + Praveen + Chakrapani |  |  | N/A | Selected path |
+| T2 | Flow | Confirm final diagram & legend (1–11) | Naveen |  |  | 1–11 | One-pager diagram |
+| T3 | Blockers | Map each blocker to step # + reach-outs | Hesam + Naveen |  |  | 1–11 | Blocker register updated |
+| T4 | AI Search | Fix index cap (delete/merge/request quota) | Naveen |  |  | 3 | Capacity restored |
+| T5 | SQL | Fix “no create objects” (schema/DBA) | Chakrapani + Naveen (+DBA) |  |  | 9 | Working SQL path |
+| T6 | Data | Prepare dataset (IMSB focus) + load | Naveen + Hesam |  |  | 1–3 / 9–10 | Data ready |
+| T7 | Demo | Demo script + known limits + next steps | Praveen |  |  | 4–11 | Demo pack |
 
 ---
 
 ## Daily Standup Log
-| Date | Owner | Yesterday | Today | Blockers | Help Needed | Notes |
+| Date | Owner | Yesterday | Today | Blockers (with step #) | Help Needed | Notes |
 |---|---|---|---|---|---|---|
 |  |  |  |  |  |  |  |
