@@ -136,4 +136,139 @@ def launch_ui(engine: Engine, search_client: SearchClient):
     # --- Modern CSS (white + green, cards, tabs, spacing) ---
     css = """
     :root{
-      --td-gree
+      --td-green: #0B7E3E;
+      --td-green-dark: #075C2D;
+      --td-border: #E5E7EB;
+      --td-text: #111827;
+      --td-subtext: #4B5563;
+      --td-bg: #FFFFFF;
+      --td-card: #FFFFFF;
+    }
+
+    body, .gradio-container { background: var(--td-bg) !important; }
+    footer { display: none !important; }
+
+    .td-page {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 18px 14px 18px 14px;
+    }
+
+    .td-header {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--td-border);
+      margin-bottom: 18px;
+    }
+    .td-logo img { height: 44px; width: auto; display: block; }
+    .td-title {
+      font-size: 24px;
+      font-weight: 800;
+      margin: 0;
+      color: var(--td-text);
+      line-height: 1.1;
+    }
+    .td-subtitle {
+      margin: 6px 0 0 0;
+      color: var(--td-subtext);
+      font-size: 14px;
+    }
+
+    .td-card {
+      border: 1px solid var(--td-border);
+      border-radius: 16px;
+      background: var(--td-card);
+      padding: 14px;
+      box-shadow: 0 2px 10px rgba(0,0,0,.05);
+    }
+
+    /* Primary button */
+    .gr-button-primary, button.primary {
+      background: var(--td-green) !important;
+      border: none !important;
+      color: white !important;
+      border-radius: 12px !important;
+      font-weight: 800 !important;
+    }
+    .gr-button-primary:hover, button.primary:hover {
+      background: var(--td-green-dark) !important;
+    }
+
+    /* Inputs */
+    textarea, input { border-radius: 12px !important; }
+
+    /* Make tabs cleaner */
+    .gradio-container .tabs { border-radius: 14px; }
+    """
+
+    header_html = f"""
+    <div class="td-page">
+      <div class="td-header">
+        <div class="td-logo">
+          {"<img src='" + logo_src + "' alt='TD Logo' />" if logo_src else "<div style='font-weight:900;color:#0B7E3E;font-size:22px;'>TD</div>"}
+        </div>
+        <div>
+          <h1 class="td-title">AMCB TEXT2SQL</h1>
+          <p class="td-subtitle">
+            Ask a question in natural language. The system generates SQL using metadata search and (optionally) executes it.
+          </p>
+        </div>
+      </div>
+    </div>
+    """
+
+    with gr.Blocks(theme=theme, css=css, title="AMCB TEXT2SQL") as demo:
+        gr.HTML(header_html)
+
+        with gr.Group(elem_classes=["td-page"]):
+            with gr.Row(equal_height=True):
+                # LEFT: input card
+                with gr.Column(scale=4):
+                    with gr.Group(elem_classes=["td-card"]):
+                        question = gr.Textbox(
+                            label="Ask your question",
+                            placeholder="Example: Show top 10 accounts by total balance for last month",
+                            lines=3,
+                        )
+                        do_execute = gr.Checkbox(label="Execute SQL", value=True)
+                        max_rows = gr.Slider(
+                            minimum=50,
+                            maximum=5000,
+                            value=500,
+                            step=50,
+                            label="Max rows (preview)",
+                        )
+
+                        with gr.Row():
+                            run_btn = gr.Button("Run", variant="primary")
+                            clear_btn = gr.Button("Clear", variant="secondary")
+
+                # RIGHT: outputs card with tabs
+                with gr.Column(scale=6):
+                    with gr.Group(elem_classes=["td-card"]):
+                        status_md = gr.Markdown()
+                        with gr.Tabs():
+                            with gr.Tab("Result"):
+                                result_grid = gr.Dataframe(
+                                    label="SQL Result",
+                                    interactive=False,
+                                    wrap=True,
+                                )
+                            with gr.Tab("SQL"):
+                                sql_out = gr.Code(label="Generated SQL", language="sql")
+
+        run_btn.click(
+            fn=lambda q, ex, mr: _run_text2sql(q, ex, int(mr), engine, search_client),
+            inputs=[question, do_execute, max_rows],
+            outputs=[sql_out, result_grid, status_md],
+        )
+
+        clear_btn.click(
+            fn=lambda: ("", pd.DataFrame(), ""),
+            inputs=None,
+            outputs=[question, result_grid, status_md],
+        )
+
+    demo.launch(inbrowser=True, share=True)
