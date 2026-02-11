@@ -1,51 +1,81 @@
-We now get this runtime error in the Gradio chat UI after sending any message (even "hi"):
+We have a Gradio NL→SQL app. Now when user asks: "show me the list of tables in database",
+the app errors with:
 
-Error: ('HYT00', '[HYT00] [Microsoft][ODBC Driver 18 for SQL Server] Login timeout expired (0) (SQLDriverConnect)')
+[Microsoft][ODBC Driver 18 for SQL Server][SQL Server] Invalid object name 'meta.Tables'. (208)
 
 Goal:
-1) The app must NOT try to connect to SQL Server for greetings/smalltalk.
-2) When SQL connectivity really is needed, failures must be handled gracefully with a clear, actionable error message (not a crash).
-3) Add a quick “DB Health Check” path + tests (no real DB required).
+1) App must not crash when metadata tables are missing.
+2) App must show an actionable message and provide a safe setup path.
+3) Add a safe fallback to list tables using system catalog (sys/information_schema) without requiring meta.*.
 
-Please implement the following changes.
+Constraints:
+- Do NOT use OpenAI Runner/Agent.
+- Keep the existing meta schema approach, but detect when it’s not initialized.
+- Never run user-provided DDL. Only run bundled SQL scripts from repo when user clicks an explicit button.
 
-A) Add “greeting / non-data” bypass (no DB call)
-- In app/nl2sql.py (or the send handler in app/ui.py), detect greeting/smalltalk inputs:
-  hi, hello, hey, thanks, good morning, etc. (case-insensitive; trim whitespace).
-- If it’s greeting/smalltalk, return:
-  kind="greeting", sql="", explanation="Hi! Ask me a banking question…", and DO NOT call metadata queries or db.execute_query.
+Implement changes:
 
-B) Improve DB connection robustness + diagnostics
-- In app/db.py, ensure connection is lazy (only connect inside execute_query / ping, not at import time).
-- Normalize SQL_SERVER:
-  - If it looks like Azure SQL (contains ".database.windows.net") ensure server string uses tcp:... and includes port 1433.
-  - Example normalized server: "tcp:<server>.database.windows.net,1433"
-- Add explicit connection timeout:
-  - Add "Connection Timeout=15;" into the ODBC conn string.
-  - Also pass `timeout=15` to pyodbc.connect if supported.
-- Add `ping()` function that tries `SELECT 1` and returns (ok: bool, message: str).
-- Catch pyodbc.Error and map common cases:
-  - HYT00 / timeout -> “Cannot reach SQL Server (network/DNS/firewall/VNet). Check SQL_SERVER, port 1433, and that this host can reach the server.”
-  - 28000 / login failed -> “Auth failed. Verify Managed Identity is available + SQL is configured for AAD + permissions exist.”
-  - Provide the SQL_SERVER value in the message (but NEVER print secrets).
+A) DB capability checks
+- In app/db.py add:
+  - def metadata_ready() -> tuple[bool, list[str]]:
+      checks existence of:
+      schema meta and tables: meta.Tables, meta.Columns, meta.Relationships, meta.BusinessTerms
+      Use OBJECT_ID('meta.Tables') IS NOT NULL etc.
+      Return (True, []) if all exist, else (False, ["meta.Tables", ... missing])
+  - def list_all_tables() -> pandas.DataFrame:
+      read-only query to list tables from sys catalog:
+      SELECT s.name AS schema_name, t.name AS table_name
+      FROM sys.tables t JOIN sys.schemas s ON t.schema_id = s.schema_id
+      ORDER BY s.name, t.name;
 
-C) UI changes (graceful behavior)
+B) Bootstrap / Initialize scripts (safe internal execution)
+- Create app/bootstrap.py:
+  - def run_sql_script_file(path: str) -> None
+    Reads sql/*.sql and executes it via pyodbc.
+    Must support splitting batches on lines containing only "GO" (case-insensitive).
+    Must NOT accept arbitrary SQL from user; only file paths inside repo (whitelist).
+- Add a single function:
+  - def initialize_database() -> None:
+      runs, in order:
+        sql/01_create_banking_schema.sql
+        sql/02_create_metadata_schema.sql
+        sql/03_seed_sample_data.sql
+    (only when user clicks UI button)
+
+C) NL2SQL orchestration behavior
+- In app/nl2sql.py:
+  - Before doing any metadata queries, call db.metadata_ready()
+  - If not ready:
+    - If user question is about listing tables/schemas (“list tables”, “what tables exist”, etc),
+      return kind="system_query" and sql set to the sys catalog query result (or directly return a DataFrame)
+      WITHOUT touching meta.*
+    - Otherwise return kind="error" with explanation:
+      “Metadata tables not initialized in this database (missing: ...). Click ‘Initialize DB’ or run the sql scripts.”
+    - Do not call LLM metadata plan step when meta is missing.
+
+D) UI improvements
 - In app/ui.py:
-  - If nl2sql returns sql="", show explanation in chat and do not attempt DB actions.
-  - Add a small “Test DB Connection” button that calls db.ping() and shows the result in chat/status.
-  - If execute fails, show the friendly mapped message in the chat and keep UI responsive.
+  - Add buttons:
+    1) “Check Metadata” -> calls db.metadata_ready(), displays status in chat
+    2) “Initialize DB” -> calls bootstrap.initialize_database() and reports success/failure in chat
+    3) “List Tables” -> calls db.list_all_tables() and displays in the grid
+  - When nl2sql returns kind="error", show the explanation and do not proceed.
+  - When returning a DataFrame result (table list), show it in the results grid.
 
-D) Tests (no real DB)
-- tests/test_nl2sql.py:
-  - generate_sql("hi") returns kind="greeting" and does NOT call db.execute_query (mock it and assert not called).
-- tests/test_db_errors.py:
-  - Mock pyodbc.connect to raise pyodbc.Error with args containing "HYT00" and assert db.ping() returns ok=False with the friendly timeout message.
-- tests/test_ui_logic.py:
-  - Send handler with "hi" must not call db and must not error.
+E) Tests (no real SQL)
+- tests/test_metadata_ready.py:
+  - Mock execute_query or pyodbc cursor so that OBJECT_ID checks return NULL or 1.
+  - Verify metadata_ready returns missing object names.
+- tests/test_list_tables.py:
+  - Mock DB layer to return DataFrame; verify UI handler renders it.
+- tests/test_nl2sql_meta_missing.py:
+  - Mock metadata_ready() to False and ensure nl2sql.generate_sql does NOT attempt querying meta.* and does NOT call LLM for non-system questions.
+- tests/test_bootstrap_runner.py:
+  - Mock db connection/cursor to ensure run_sql_script_file splits on GO and executes batches.
 
 Acceptance criteria:
-- Typing "hi" never triggers SQL connection attempts.
-- If SQL is unreachable, the user sees an actionable message instead of raw pyodbc stack traces.
-- A “Test DB Connection” button exists and works (with mocked tests).
-- `pytest -q` passes.
-- Return full updated content for any modified files.
+- If meta.* is missing, app does not crash and tells user exactly what’s missing.
+- “List tables” works even when meta.* is missing (uses sys catalog).
+- “Initialize DB” runs bundled scripts only (safe), then meta.* queries work.
+- pytest -q passes.
+- Provide full updated content for any modified/new files.
