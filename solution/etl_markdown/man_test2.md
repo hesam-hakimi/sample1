@@ -1,30 +1,51 @@
-# Blockers / Risks / Decisions Register (Aligned to Diagram Steps 1–11)
+We now get this runtime error in the Gradio chat UI after sending any message (even "hi"):
 
-## Diagram Legend (use these exact meanings)
-| Step # | Meaning |
-|---:|---|
-| 1 | Ingest & chunk source content (metadata/docs/schema or approved data extracts) |
-| 2 | Send chunks to embedding model |
-| 3 | Store embeddings + chunk metadata in Azure AI Search (vector DB) |
-| 4 | User asks a question (UI/chat) |
-| 5 | AI Search returns relevant chunks (top matches) |
-| 6 | App queries AI Search (vector search request) |
-| 7 | App sends augmented prompt to LLM (question + retrieved chunks + guardrails) |
-| 8 | LLM generates output (answer and/or SQL) |
-| 9 | App executes generated SQL on target database (if enabled) |
-| 10 | Database returns results to app |
-| 11 | App returns final response to user (summary + citations + results) |
+Error: ('HYT00', '[HYT00] [Microsoft][ODBC Driver 18 for SQL Server] Login timeout expired (0) (SQLDriverConnect)')
 
----
+Goal:
+1) The app must NOT try to connect to SQL Server for greetings/smalltalk.
+2) When SQL connectivity really is needed, failures must be handled gracefully with a clear, actionable error message (not a crash).
+3) Add a quick “DB Health Check” path + tests (no real DB required).
 
-## Register
-| ID | Type | Related Option(s) | Step # | Issue | Impact | Workaround (tactical) | Strategic Fix | Reach out to | Reached out? (Y/N) | Response / Acknowledged | Owner | Status (🟢🟡🔴) |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| B1 | Blocker | O6 | 3 | AI Search index limit (50) | Can’t create new indexes | Delete/merge unused; reuse existing index | Quota increase + redesign indexing | AI Search platform owner |  |  | Naveen | 🔴 |
-| B2 | Blocker | O7 | 9 | SQL user cannot create objects | Blocks schema/views/staging | Use existing schema only | Dedicated schema / minimal create rights | DBA / platform |  |  | Chakrapani + Naveen | 🔴 |
-| B3 | Risk/Decision | O2/O3 | 1,9 | Confidential identifiers in extracted data | Approval required; delays | IMSB only + mask/remove IDs | Governance-approved pipeline | Data governance / source owner |  |  | Saitha | 🟡 |
-| B4 | Risk | O4 | 9 | No direct connectivity to DevCZ/Synapse | Direct query not possible | Manual export/import (O2) | Enable network/identity | Network/platform team |  |  | Chakrapani + Saitha | 🟡/🔴 |
-| B5 | Risk | O5 | 7–9 | External OpenAI API blocked in TAP env | Architecture constraints | Use internal LLM endpoints | Partner with TAP team | TAP/Layer6 team |  |  | Chakrapani + Saitha | 🟡 |
-| B6 | Clarity Gap | All | 8→9 | Need validation/confirmation before executing SQL | Risk of wrong/unsafe query | Add “SQL validate + user confirm” gate | Governance policy enforcement | App owner |  |  | Naveen | 🟡 |
-| D1 | Decision | All | N/A | Decide demo path (Tue target) | Drives timeline | Start O6+O1 now | Move to O2/O4/O5 as strategic | Praveen + Chakrapani |  |  | Saitha | 🟡 |
-| D2 | Decision | Post-POC | N/A | Provision TAP-supported dev environment | Needed after POC | Start request in parallel | TAP intake + landing zone | Chakrapani + Saitha |  |  | Chakrapani | 🟡 |
+Please implement the following changes.
+
+A) Add “greeting / non-data” bypass (no DB call)
+- In app/nl2sql.py (or the send handler in app/ui.py), detect greeting/smalltalk inputs:
+  hi, hello, hey, thanks, good morning, etc. (case-insensitive; trim whitespace).
+- If it’s greeting/smalltalk, return:
+  kind="greeting", sql="", explanation="Hi! Ask me a banking question…", and DO NOT call metadata queries or db.execute_query.
+
+B) Improve DB connection robustness + diagnostics
+- In app/db.py, ensure connection is lazy (only connect inside execute_query / ping, not at import time).
+- Normalize SQL_SERVER:
+  - If it looks like Azure SQL (contains ".database.windows.net") ensure server string uses tcp:... and includes port 1433.
+  - Example normalized server: "tcp:<server>.database.windows.net,1433"
+- Add explicit connection timeout:
+  - Add "Connection Timeout=15;" into the ODBC conn string.
+  - Also pass `timeout=15` to pyodbc.connect if supported.
+- Add `ping()` function that tries `SELECT 1` and returns (ok: bool, message: str).
+- Catch pyodbc.Error and map common cases:
+  - HYT00 / timeout -> “Cannot reach SQL Server (network/DNS/firewall/VNet). Check SQL_SERVER, port 1433, and that this host can reach the server.”
+  - 28000 / login failed -> “Auth failed. Verify Managed Identity is available + SQL is configured for AAD + permissions exist.”
+  - Provide the SQL_SERVER value in the message (but NEVER print secrets).
+
+C) UI changes (graceful behavior)
+- In app/ui.py:
+  - If nl2sql returns sql="", show explanation in chat and do not attempt DB actions.
+  - Add a small “Test DB Connection” button that calls db.ping() and shows the result in chat/status.
+  - If execute fails, show the friendly mapped message in the chat and keep UI responsive.
+
+D) Tests (no real DB)
+- tests/test_nl2sql.py:
+  - generate_sql("hi") returns kind="greeting" and does NOT call db.execute_query (mock it and assert not called).
+- tests/test_db_errors.py:
+  - Mock pyodbc.connect to raise pyodbc.Error with args containing "HYT00" and assert db.ping() returns ok=False with the friendly timeout message.
+- tests/test_ui_logic.py:
+  - Send handler with "hi" must not call db and must not error.
+
+Acceptance criteria:
+- Typing "hi" never triggers SQL connection attempts.
+- If SQL is unreachable, the user sees an actionable message instead of raw pyodbc stack traces.
+- A “Test DB Connection” button exists and works (with mocked tests).
+- `pytest -q` passes.
+- Return full updated content for any modified files.
