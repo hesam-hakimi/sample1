@@ -1,16 +1,30 @@
-# Options & Long Poles (Aligned to Diagram Steps 1–11)
+# Blockers / Risks / Decisions Register (Aligned to Diagram Steps 1–11)
 
-| Option ID | Option Name | What it is | Uses which steps? | Long Poles (time/risk) | Tactical workaround | Owner(s) |
-|---|---|---|---|---|---|---|
-| O1 | Synthetic dataset in KMAI | Create finance-like tables + 1k–2k rows | 4–11 (and optionally 1–3 if indexing metadata) | Credibility vs real data | Use realistic schema + joins; label synthetic | Naveen + Hesam |
-| O2 | Manual export DevCZ/Synapse → upload | Download allowed dev data (IMSB only) then upload | 1,7,9–11 | Approval risk if confidential | Reduce scope; mask IDs | Saitha + Naveen |
-| O3 | Leverage RW2/OCC/RW feed | Use RW data in account if allowed | 1,7,9–11 (plus semantic layer) | Access clarity + semantic layer | Start IMSB only | Saitha + Chakrapani |
-| O4 | Direct connectivity DevSandbox → DevCZ/Synapse | Query dev sources directly | 4,8,9–11 | Network/identity approvals | Use O2 while waiting | Chakrapani + Saitha |
-| O5 | Use TAP/AI2K2/Azure ML env | Use TAP env with data access | 4–11 | External OpenAI API may be blocked | Use internal endpoints | Chakrapani + Saitha + Naveen |
-| O6 | Azure AI Search RAG | AI Search used for metadata retrieval | 1–8 (plus 11) | Index cap (3) | Delete/merge indexes | Naveen |
-| O7 | Azure SQL + LLM | LLM generates SQL + execute on Azure SQL | 4,7–11 | SQL create privilege (9) | Use existing schema only | Chakrapani + Naveen |
+## Diagram Legend (use these exact meanings)
+| Step # | Meaning |
+|---:|---|
+| 1 | Ingest & chunk source content (metadata/docs/schema or approved data extracts) |
+| 2 | Send chunks to embedding model |
+| 3 | Store embeddings + chunk metadata in Azure AI Search (vector DB) |
+| 4 | User asks a question (UI/chat) |
+| 5 | AI Search returns relevant chunks (top matches) |
+| 6 | App queries AI Search (vector search request) |
+| 7 | App sends augmented prompt to LLM (question + retrieved chunks + guardrails) |
+| 8 | LLM generates output (answer and/or SQL) |
+| 9 | App executes generated SQL on target database (if enabled) |
+| 10 | Database returns results to app |
+| 11 | App returns final response to user (summary + citations + results) |
 
-## Shortlist suggestion (for demo by Tue)
-- Immediate: O6 + O1 (works even without real data)
-- Add “real-ish”: O2 or O3
-- Strategic path after POC: O4 or O5 (+ TAP dev provisioning)
+---
+
+## Register
+| ID | Type | Related Option(s) | Step # | Issue | Impact | Workaround (tactical) | Strategic Fix | Reach out to | Reached out? (Y/N) | Response / Acknowledged | Owner | Status (🟢🟡🔴) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| B1 | Blocker | O6 | 3 | AI Search index limit (50) | Can’t create new indexes | Delete/merge unused; reuse existing index | Quota increase + redesign indexing | AI Search platform owner |  |  | Naveen | 🔴 |
+| B2 | Blocker | O7 | 9 | SQL user cannot create objects | Blocks schema/views/staging | Use existing schema only | Dedicated schema / minimal create rights | DBA / platform |  |  | Chakrapani + Naveen | 🔴 |
+| B3 | Risk/Decision | O2/O3 | 1,9 | Confidential identifiers in extracted data | Approval required; delays | IMSB only + mask/remove IDs | Governance-approved pipeline | Data governance / source owner |  |  | Saitha | 🟡 |
+| B4 | Risk | O4 | 9 | No direct connectivity to DevCZ/Synapse | Direct query not possible | Manual export/import (O2) | Enable network/identity | Network/platform team |  |  | Chakrapani + Saitha | 🟡/🔴 |
+| B5 | Risk | O5 | 7–9 | External OpenAI API blocked in TAP env | Architecture constraints | Use internal LLM endpoints | Partner with TAP team | TAP/Layer6 team |  |  | Chakrapani + Saitha | 🟡 |
+| B6 | Clarity Gap | All | 8→9 | Need validation/confirmation before executing SQL | Risk of wrong/unsafe query | Add “SQL validate + user confirm” gate | Governance policy enforcement | App owner |  |  | Naveen | 🟡 |
+| D1 | Decision | All | N/A | Decide demo path (Tue target) | Drives timeline | Start O6+O1 now | Move to O2/O4/O5 as strategic | Praveen + Chakrapani |  |  | Saitha | 🟡 |
+| D2 | Decision | Post-POC | N/A | Provision TAP-supported dev environment | Needed after POC | Start request in parallel | TAP intake + landing zone | Chakrapani + Saitha |  |  | Chakrapani | 🟡 |
