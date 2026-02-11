@@ -1,81 +1,260 @@
-We have a Gradio NL→SQL app. Now when user asks: "show me the list of tables in database",
-the app errors with:
+You are working in THIS repo. Refactor the Gradio UI into a COMPLETE CHAT experience and update the backend so that:
+1) The entire user experience is chat-only (no separate result grid panel).
+2) When the user asks for data, we execute SQL and render the result INLINE in the chat as a markdown table + a short summary.
+3) The LLM MUST have access to the returned data in subsequent turns (chat memory).
+4) Must remain SAFE: do not execute destructive SQL; enforce validation; require confirmation for dbo.* queries.
+5) Must work even when meta.* schema/tables are missing AND even when CREATE TABLE permission is denied.
 
-[Microsoft][ODBC Driver 18 for SQL Server][SQL Server] Invalid object name 'meta.Tables'. (208)
+Hard constraints:
+- DO NOT use OpenAI Runner/Agent/Agents SDK.
+- Use openai.AzureOpenAI with MSI token provider (ManagedIdentityCredential + get_bearer_token_provider).
+- Tests must run without real SQL Server or Azure OpenAI (use mocks).
+- Keep changes incremental and do not delete core modules (db.py, llm_client.py, sql_safety.py, nl2sql.py). You can refactor them, but keep them present.
 
-Goal:
-1) App must not crash when metadata tables are missing.
-2) App must show an actionable message and provide a safe setup path.
-3) Add a safe fallback to list tables using system catalog (sys/information_schema) without requiring meta.*.
+========================================================
+TARGET UI BEHAVIOR (Chat-only)
+========================================================
+UI contains:
+- One gr.Chatbot that shows the conversation
+- One textbox for user input + Send button
+Optional: a tiny “DB status” message inside chat (as assistant message). No separate Dataframe component.
 
-Constraints:
-- Do NOT use OpenAI Runner/Agent.
-- Keep the existing meta schema approach, but detect when it’s not initialized.
-- Never run user-provided DDL. Only run bundled SQL scripts from repo when user clicks an explicit button.
+Conversation rules:
+- On every user message, append it to conversation state (history).
+- Assistant answers as a normal chat message.
+- When data is retrieved from DB, append a TOOL message (role="tool") to the conversation state containing:
+  - executed SQL (as a code block)
+  - result markdown table (limited rows/cols)
+  - result summary (row count, columns, simple stats if possible)
+  - compact JSON sample (limited rows) for LLM context
 
-Implement changes:
+Then call LLM again to produce the human-friendly explanation that references the tool output.
+The assistant must NEVER hallucinate results not present in tool output.
 
-A) DB capability checks
-- In app/db.py add:
-  - def metadata_ready() -> tuple[bool, list[str]]:
-      checks existence of:
-      schema meta and tables: meta.Tables, meta.Columns, meta.Relationships, meta.BusinessTerms
-      Use OBJECT_ID('meta.Tables') IS NOT NULL etc.
-      Return (True, []) if all exist, else (False, ["meta.Tables", ... missing])
-  - def list_all_tables() -> pandas.DataFrame:
-      read-only query to list tables from sys catalog:
-      SELECT s.name AS schema_name, t.name AS table_name
-      FROM sys.tables t JOIN sys.schemas s ON t.schema_id = s.schema_id
-      ORDER BY s.name, t.name;
+========================================================
+STATE MODEL (must be consistent)
+========================================================
+Create a new module: app/chat_types.py
 
-B) Bootstrap / Initialize scripts (safe internal execution)
-- Create app/bootstrap.py:
-  - def run_sql_script_file(path: str) -> None
-    Reads sql/*.sql and executes it via pyodbc.
-    Must support splitting batches on lines containing only "GO" (case-insensitive).
-    Must NOT accept arbitrary SQL from user; only file paths inside repo (whitelist).
-- Add a single function:
-  - def initialize_database() -> None:
-      runs, in order:
-        sql/01_create_banking_schema.sql
-        sql/02_create_metadata_schema.sql
-        sql/03_seed_sample_data.sql
-    (only when user clicks UI button)
+Define:
+- ChatRole = Literal["user","assistant","tool","system"]
+- @dataclass ChatMessage:
+    role: ChatRole
+    content: str
+    name: Optional[str] = None
 
-C) NL2SQL orchestration behavior
-- In app/nl2sql.py:
-  - Before doing any metadata queries, call db.metadata_ready()
-  - If not ready:
-    - If user question is about listing tables/schemas (“list tables”, “what tables exist”, etc),
-      return kind="system_query" and sql set to the sys catalog query result (or directly return a DataFrame)
-      WITHOUT touching meta.*
-    - Otherwise return kind="error" with explanation:
-      “Metadata tables not initialized in this database (missing: ...). Click ‘Initialize DB’ or run the sql scripts.”
-    - Do not call LLM metadata plan step when meta is missing.
+State stored in gr.State:
+- messages: list[ChatMessage]  # full history
+- pending_sql: str             # "" if none
+- pending_reason: str          # what needs confirmation
+- last_sql: str                # last executed sql (for display/debug)
+- last_result_compact: str     # compact json sample string (for LLM)
+- meta_ready: bool             # computed lazily (optional)
 
-D) UI improvements
-- In app/ui.py:
-  - Add buttons:
-    1) “Check Metadata” -> calls db.metadata_ready(), displays status in chat
-    2) “Initialize DB” -> calls bootstrap.initialize_database() and reports success/failure in chat
-    3) “List Tables” -> calls db.list_all_tables() and displays in the grid
-  - When nl2sql returns kind="error", show the explanation and do not proceed.
-  - When returning a DataFrame result (table list), show it in the results grid.
+DO NOT store DataFrame in state. Store rendered/compact strings only.
 
-E) Tests (no real SQL)
-- tests/test_metadata_ready.py:
-  - Mock execute_query or pyodbc cursor so that OBJECT_ID checks return NULL or 1.
-  - Verify metadata_ready returns missing object names.
-- tests/test_list_tables.py:
-  - Mock DB layer to return DataFrame; verify UI handler renders it.
-- tests/test_nl2sql_meta_missing.py:
-  - Mock metadata_ready() to False and ensure nl2sql.generate_sql does NOT attempt querying meta.* and does NOT call LLM for non-system questions.
-- tests/test_bootstrap_runner.py:
-  - Mock db connection/cursor to ensure run_sql_script_file splits on GO and executes batches.
+========================================================
+FORMATTING RESULTS (inline chat)
+========================================================
+Create new module: app/formatting.py
 
-Acceptance criteria:
-- If meta.* is missing, app does not crash and tells user exactly what’s missing.
-- “List tables” works even when meta.* is missing (uses sys catalog).
-- “Initialize DB” runs bundled scripts only (safe), then meta.* queries work.
-- pytest -q passes.
-- Provide full updated content for any modified/new files.
+Implement:
+1) def df_to_markdown_table(df: pd.DataFrame, max_rows: int = 20, max_cols: int = 12) -> str
+   - truncate to max_rows/max_cols
+   - if empty df -> return "(no rows)"
+   - return markdown table using pandas .to_markdown(index=False) if available,
+     otherwise implement manual markdown generation (no extra deps).
+2) def df_to_compact_json(df: pd.DataFrame, max_rows: int = 50, max_cols: int = 30) -> str
+   - truncate rows/cols and return JSON string with records orientation
+   - ensure it is small (limit)
+3) def summarize_df(df: pd.DataFrame) -> str
+   - include: row count, column list, and for numeric columns basic min/max if feasible
+
+Add tests: tests/test_formatting.py
+- verify row/col limits
+- verify empty df formatting
+- verify compact json row limit
+
+========================================================
+SAFETY & CONFIRMATION (must be strict)
+========================================================
+Update/ensure app/sql_safety.py has:
+- is_read_only_select(sql) -> bool
+- validate_metadata_sql(sql) -> None
+- validate_business_sql(sql) -> None
+
+Enforce:
+- Reject if sql is None/"".
+- Reject if contains ';', '--', '/*', '*/' anywhere.
+- Reject DDL/DML keywords case-insensitive:
+  INSERT UPDATE DELETE DROP ALTER CREATE TRUNCATE MERGE EXEC EXECUTE GRANT REVOKE DENY
+- Allow only SELECT or WITH ... SELECT patterns.
+
+Confirmation policy:
+- ALWAYS require confirmation before executing any SQL referencing dbo.* tables.
+- NO confirmation required for pure system catalog queries (sys.tables, INFORMATION_SCHEMA.*)
+- NO confirmation required for metadata readiness checks (OBJECT_ID queries).
+- Confirmation mechanism:
+  - If SQL requires confirmation and no pending_sql exists:
+    - store pending_sql
+    - assistant asks: "I can run this query. Reply YES to run, or NO to cancel."
+  - If pending_sql exists:
+    - if user says yes -> execute
+    - if user says no -> clear pending_sql and respond "Canceled."
+    - otherwise -> ask again (do not execute)
+
+Create new module app/confirm.py:
+- detect_yes_no(text: str) -> Optional[bool]
+  - accepts: yes/y/ok/sure/run it (true), no/n/cancel (false)
+  - case-insensitive, trimmed
+Add tests: tests/test_confirm.py
+
+========================================================
+DB LAYER updates (avoid crashing)
+========================================================
+Update app/db.py:
+- ensure connect is lazy; do not connect at import time.
+- add:
+  def metadata_ready() -> tuple[bool, list[str]]:
+    checks existence:
+      schema meta and tables meta.Tables, meta.Columns, meta.Relationships, meta.BusinessTerms
+    Use:
+      SELECT CASE WHEN SCHEMA_ID('meta') IS NULL THEN 0 ELSE 1 END AS has_meta_schema
+      SELECT OBJECT_ID('meta.Tables') AS obj
+    Return missing list.
+
+- add:
+  def list_all_tables() -> pd.DataFrame:
+    returns schema_name, table_name from sys.tables/sys.schemas
+- add:
+  def list_columns(schema: str, table: str) -> pd.DataFrame:
+    uses sys.columns/sys.types joins
+- improve error mapping:
+  - login timeout -> "Cannot reach SQL Server... check SQL_SERVER and firewall/VNet"
+  - permission denied create table -> show a helpful message
+Keep execute_query(max_rows enforced) and query timeout.
+
+Add tests with mocks: tests/test_db_errors.py and tests/test_db_meta_ready.py
+
+========================================================
+LLM CLIENT (must accept conversation)
+========================================================
+Update app/llm_client.py:
+- LLMClient.chat must accept messages list:
+  def chat_messages(messages: list[dict], temperature=0, max_tokens=800) -> str
+- Keep extract_json robust.
+
+We will build messages for the API as:
+- system message with rules
+- then conversation history:
+  - user/assistant/tool messages appended in order
+Tool messages are passed as role="user" or role="system"? We do NOT have tool-role support in all clients.
+Do this:
+- In API request, represent tool messages as role="system" with prefix "TOOL_RESULT:"
+or role="user" with prefix "TOOL_RESULT:".
+Choose one consistent approach and document it.
+
+Rules for tool messages:
+- include compact json and summary; MUST be included in the prompt so the model can answer follow-ups.
+
+Add tests: tests/test_llm_client_messages.py verifying we pass messages in correct structure (mock client).
+
+========================================================
+NL2SQL orchestration (2-stage with tool message)
+========================================================
+Update app/nl2sql.py to become chat-context aware.
+
+Create:
+- def handle_user_turn(messages: list[ChatMessage], user_text: str, pending_sql: str) -> tuple[new_messages, pending_sql, last_sql, last_result_compact]
+
+Algorithm:
+1) append user message
+2) if pending_sql is not empty:
+   - run detect_yes_no(user_text)
+   - if yes: execute pending_sql (validate_business_sql first) -> df
+       - create tool message with SQL + markdown + summary + compact json
+       - append tool message
+       - call LLM to explain results using conversation including tool message
+       - append assistant message
+       - clear pending_sql
+       - return
+   - if no: append assistant "Canceled." clear pending_sql return
+   - else: append assistant "Please reply YES or NO." return
+
+3) If no pending_sql:
+   - if greeting/smalltalk: append assistant greeting (NO DB)
+   - else:
+       - call db.metadata_ready()
+         a) if user asks "list tables" or similar:
+             - run db.list_all_tables() and build tool message and assistant response (no LLM required or optionally LLM summary)
+         b) if meta not ready:
+             - append assistant explaining metadata not initialized + suggest using list tables or specify table names; do not crash.
+             - return
+       - If meta ready:
+           Stage A: Ask LLM to output STRICT JSON plan:
+             {"metadata_queries":[{"purpose":"...","sql":"SELECT ... FROM meta...."}]}
+           Validate each query with validate_metadata_sql; execute (max_rows=50 per query).
+           Build a metadata context string from results (markdown + compact json).
+           Stage B: Ask LLM to output STRICT JSON:
+             {"sql":"SELECT ...", "explanation":"...", "assumptions":[...], "needs_confirmation":[...]}
+           Validate business SQL with validate_business_sql.
+           If needs_confirmation not empty OR policy requires confirmation:
+              set pending_sql = sql
+              append assistant message containing explanation + the SQL in code block + ask for YES/NO.
+              return
+           Else (should be rare): execute sql, append tool message, call LLM to explain results, append assistant.
+
+Important:
+- Always enforce limits and never include huge tables in LLM context.
+- Always catch exceptions and present user-friendly error in assistant message.
+
+Add tests: tests/test_nl2sql_chat_flow.py
+- greeting -> no db called
+- list tables -> sys catalog called, tool message appended, no crash
+- meta missing -> assistant explains and no LLM plan queries attempted
+- pending_sql yes -> executes, tool message appended, assistant follow-up appended
+All with mocks.
+
+========================================================
+UI implementation (Gradio)
+========================================================
+Update app/ui.py to use ONLY:
+- Chatbot
+- Textbox
+- Send button
+- gr.State variables for messages + pending_sql + last_sql + last_result_compact
+
+Implementation details:
+- Convert messages list to gr.Chatbot format: list[tuple[str|None, str|None]]
+  Display tool messages as assistant messages with a prefix like:
+  "**[Data]** ..." so user sees it in chat.
+- On send:
+  call nl2sql.handle_user_turn(...)
+  update chatbot + clear textbox
+- Remove old panels (Proposed SQL grid, results dataframe panel, extra buttons).
+Optionally keep a single small button “List Tables” that simply sends a user turn equivalent.
+
+Add tests: tests/test_ui_handlers.py
+- ensure send handler returns expected chatbot entries and state updates.
+
+========================================================
+Documentation
+========================================================
+Update README.md:
+- explain chat-only flow
+- explain YES/NO confirmation
+- explain metadata prerequisite and what happens if meta not ready
+- explain permissions limitation (CREATE TABLE denied) and that app can still list tables and run queries if meta exists
+
+========================================================
+DELIVERABLE
+========================================================
+Make the changes in code. Provide full contents of each modified/new file.
+
+Before finishing, ensure:
+- python -m app.main works
+- pytest -q passes
+- no code path attempts CREATE TABLE automatically
+- results are shown in the chat and then included in the next LLM call via tool message
+
+Do NOT leave TODOs. Implement fully.
