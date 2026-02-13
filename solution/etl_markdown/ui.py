@@ -1,10 +1,10 @@
 # app/ui.py
 from __future__ import annotations
 
+import inspect
+import html
 import os
-import re
-import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import gradio as gr
 
@@ -13,656 +13,708 @@ from app.config import get_config
 from app.ai_search_service import AISearchService
 from app.identity import get_search_credential, IdentityError
 
-try:
-    import pandas as pd  # type: ignore
-except Exception:  # pragma: no cover
-    pd = None  # type: ignore
 
+# -----------------------------
+# TD-like styling (white + green)
+# -----------------------------
+CSS = r"""
+:root{
+  --td-green:#008A00;
+  --td-green-dark:#006B00;
+  --td-bg:#F5F7F6;
+  --td-card:#FFFFFF;
+  --td-border:#E5E7EB;
+  --td-text:#111827;
+  --td-muted:#6B7280;
+  --td-radius:14px;
+  --td-shadow:0 2px 14px rgba(0,0,0,.06);
+}
 
-TD_GREEN = "#008A00"
-TD_GREEN_DARK = "#006D00"
-TD_BG = "#F6F7F9"
-TD_CARD = "#FFFFFF"
-TD_TEXT = "#111827"
-TD_MUTED = "#6B7280"
-TD_BORDER = "#E5E7EB"
-
-CSS = f"""
-:root {{
-  --td-green: {TD_GREEN};
-  --td-green-dark: {TD_GREEN_DARK};
-  --td-bg: {TD_BG};
-  --td-card: {TD_CARD};
-  --td-text: {TD_TEXT};
-  --td-muted: {TD_MUTED};
-  --td-border: {TD_BORDER};
-}}
-
-html, body {{
+body, .gradio-container{
   background: var(--td-bg) !important;
-}}
+  color: var(--td-text) !important;
+}
 
-#td-app {{
-  max-width: 1240px;
-  margin: 0 auto;
-  padding: 18px 14px 28px 14px;
-}}
-
-#td-header {{
+#td-header{
   background: var(--td-card);
   border: 1px solid var(--td-border);
-  border-radius: 14px;
+  border-radius: var(--td-radius);
+  box-shadow: var(--td-shadow);
   padding: 14px 16px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  box-shadow: 0 8px 24px rgba(17, 24, 39, 0.06);
-  margin-bottom: 14px;
-}}
+  margin-bottom: 12px;
+}
 
-#td-brand {{
-  display: flex;
-  gap: 12px;
-  align-items: center;
-}}
+#td-brand{
+  display:flex;
+  align-items:center;
+  gap:10px;
+}
 
-#td-logo {{
-  width: 38px;
-  height: 38px;
-  border-radius: 10px;
+#td-logo{
+  width:34px;height:34px;
+  border-radius:10px;
   background: var(--td-green);
-  color: white;
-  display: grid;
-  place-items: center;
-  font-weight: 800;
-  letter-spacing: 0.5px;
-}}
+  display:flex;align-items:center;justify-content:center;
+  color:#fff;font-weight:800;
+  letter-spacing:.5px;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+}
 
-#td-title {{
-  display: flex;
-  flex-direction: column;
-  line-height: 1.15;
-}}
-#td-title b {{
-  font-size: 15px;
-  color: var(--td-text);
-}}
-#td-title span {{
-  font-size: 12px;
+#td-title{
+  display:flex;
+  flex-direction:column;
+  line-height:1.1;
+}
+#td-title h1{
+  margin:0;
+  font-size:16px;
+  font-weight:800;
+}
+#td-title div{
+  margin-top:2px;
+  font-size:12px;
   color: var(--td-muted);
-}}
+}
 
-#td-status {{
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  font-size: 12px;
-  color: var(--td-muted);
-}}
-.td-pill {{
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
+#td-pills{
+  display:flex;
+  gap:8px;
+  justify-content:flex-end;
+  align-items:center;
+}
+
+.td-pill{
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
   padding: 6px 10px;
   border-radius: 999px;
   border: 1px solid var(--td-border);
   background: #fff;
-}}
-.td-dot {{
-  width: 9px;
-  height: 9px;
-  border-radius: 999px;
-  background: #9CA3AF;
-}}
-.td-dot.ok {{
-  background: var(--td-green);
-}}
+  font-size:12px;
+  color: var(--td-text);
+  white-space:nowrap;
+}
+.td-dot{
+  width:10px;height:10px;border-radius:99px;background:#9CA3AF;
+}
+.td-dot.ok{ background: var(--td-green); }
+.td-dot.bad{ background: #DC2626; }
 
-#td-body {{
-  display: grid;
-  grid-template-columns: 360px 1fr;
-  gap: 14px;
-}}
-
-@media (max-width: 980px) {{
-  #td-body {{
-    grid-template-columns: 1fr;
-  }}
-}}
-
-.td-card {{
+.td-card{
   background: var(--td-card);
   border: 1px solid var(--td-border);
-  border-radius: 14px;
-  padding: 14px;
-  box-shadow: 0 8px 24px rgba(17, 24, 39, 0.06);
-}}
+  border-radius: var(--td-radius);
+  box-shadow: var(--td-shadow);
+  padding: 12px 12px;
+}
 
-.td-card h3 {{
-  margin: 0 0 10px 0;
-  font-size: 13px;
-  color: var(--td-text);
-}}
+.td-section-title{
+  margin:0 0 10px 0;
+  font-size:13px;
+  font-weight:800;
+}
 
-.td-help {{
+.td-help{
+  font-size:12px;
   color: var(--td-muted);
-  font-size: 12px;
-  margin-top: 2px;
-}}
+  margin: 0 0 10px 0;
+}
 
-.td-divider {{
-  height: 1px;
-  background: var(--td-border);
-  margin: 12px 0;
-}}
+#chat-wrap{
+  height: 58vh;
+  overflow: hidden;
+  display:flex;
+  flex-direction:column;
+}
 
-#chatbox_wrap {{
-  min-height: 440px;
-}}
+#chatbot{
+  flex:1;
+  overflow:auto;
+  border: 1px solid var(--td-border);
+  border-radius: var(--td-radius);
+  background: #fff;
+}
 
-#sql_code pre {{
+#results-wrap{
+  height: 26vh;
+  overflow:hidden;
+  display:flex;
+  flex-direction:column;
+}
+
+#results-grid{
+  flex:1;
+  overflow:auto;
+  border: 1px solid var(--td-border);
+  border-radius: var(--td-radius);
+  background:#fff;
+  padding: 8px;
+}
+
+#sql-code pre, #sql-code code{
   border-radius: 12px !important;
-}}
+}
 
-#grid_wrap {{
-  margin-top: 10px;
-}}
-
-#grid_wrap table {{
-  border-radius: 12px !important;
-}}
-
-button.primary, .gr-button-primary {{
+button.primary, #send-btn button, #refresh-btn button{
   background: var(--td-green) !important;
-  border-color: var(--td-green) !important;
-}}
-button.primary:hover, .gr-button-primary:hover {{
+  border: 1px solid var(--td-green) !important;
+  color: #fff !important;
+  font-weight: 800 !important;
+  border-radius: 12px !important;
+}
+button.primary:hover, #send-btn button:hover, #refresh-btn button:hover{
   background: var(--td-green-dark) !important;
   border-color: var(--td-green-dark) !important;
-}}
+}
 
-.gr-button-secondary {{
-  border-color: var(--td-border) !important;
-}}
+#clear-btn button{
+  background: #fff !important;
+  border: 1px solid var(--td-border) !important;
+  color: var(--td-text) !important;
+  font-weight: 800 !important;
+  border-radius: 12px !important;
+}
+#clear-btn button:hover{
+  border-color: #D1D5DB !important;
+}
 
-#tiny_status {{
-  font-size: 12px;
+.td-small{
+  font-size:12px;
   color: var(--td-muted);
-}}
-"""
+}
 
-HEADER_HTML = f"""
-<div id="td-app">
-  <div id="td-header">
-    <div id="td-brand">
-      <div id="td-logo">TD</div>
-      <div id="td-title">
-        <b>NL → SQL Chatbot</b>
-        <span>Azure OpenAI + SQL Server + Azure AI Search metadata</span>
-      </div>
-    </div>
-    <div id="td-status">
-      <span class="td-pill"><span class="td-dot ok"></span>SQL</span>
-      <span class="td-pill"><span class="td-dot ok"></span>AI Search</span>
-    </div>
-  </div>
-</div>
+.td-table{
+  width:100%;
+  border-collapse: collapse;
+  font-size:12px;
+}
+.td-table th{
+  position: sticky;
+  top: 0;
+  background: #F9FAFB;
+  z-index: 1;
+  text-align:left;
+  padding: 8px;
+  border-bottom: 1px solid var(--td-border);
+  color: #374151;
+  font-weight: 800;
+}
+.td-table td{
+  padding: 8px;
+  border-bottom: 1px solid var(--td-border);
+  vertical-align: top;
+}
+.td-table tr:hover td{
+  background: #F9FAFB;
+}
 """
 
 
 def _safe_str(x: Any) -> str:
-    try:
-        return "" if x is None else str(x)
-    except Exception:
-        return ""
+  try:
+    return "" if x is None else str(x)
+  except Exception:
+    return repr(x)
 
 
-def sanitize_index_name(raw: str) -> str:
+def _as_state(d: Any) -> Dict[str, Any]:
+  if isinstance(d, dict):
+    return d
+  return {}
+
+
+def _render_table_html(result: Any, max_rows: int = 250) -> str:
+  """
+  Renders common result shapes into a nice HTML grid:
+    - list[dict]
+    - dict
+    - list[list] / list[tuple]
+    - string (shown as <pre>)
+  """
+  if result is None:
+    return '<div class="td-small">No results yet.</div>'
+
+  # If someone returned a dict with known keys
+  if isinstance(result, dict):
+    # common patterns: {"rows": [...], "columns":[...]} or {"data":[...]}
+    rows = result.get("rows") or result.get("data")
+    cols = result.get("columns") or result.get("cols")
+    if isinstance(rows, list):
+      return _render_table_html({"columns": cols, "rows": rows}, max_rows=max_rows)
+
+    # otherwise show JSON-ish
+    escaped = html.escape(_safe_str(result))
+    return f"<pre style='white-space:pre-wrap;margin:0'>{escaped}</pre>"
+
+  # list of dicts
+  if isinstance(result, list) and result and isinstance(result[0], dict):
+    # union of keys, keep stable order if possible
+    keys: List[str] = []
+    seen = set()
+    for row in result:
+      for k in row.keys():
+        if k not in seen:
+          seen.add(k)
+          keys.append(str(k))
+    keys = keys[:80]  # prevent absurd widths
+
+    body_rows = result[:max_rows]
+    thead = "".join(f"<th>{html.escape(k)}</th>" for k in keys)
+    tbody = []
+    for row in body_rows:
+      tds = "".join(
+        f"<td>{html.escape(_safe_str(row.get(k)))}</td>"
+        for k in keys
+      )
+      tbody.append(f"<tr>{tds}</tr>")
+    more = ""
+    if len(result) > max_rows:
+      more = f"<div class='td-small' style='margin-top:8px'>Showing first {max_rows} rows out of {len(result)}.</div>"
+    return f"""
+      <table class="td-table">
+        <thead><tr>{thead}</tr></thead>
+        <tbody>{''.join(tbody)}</tbody>
+      </table>
+      {more}
     """
-    Azure AI Search index name rules (common):
-    - lowercase letters, digits, hyphens
-    - can't start/end with hyphen
-    - <= 128 chars
+
+  # {"columns": [...], "rows":[...]} shape
+  if isinstance(result, dict) and isinstance(result.get("rows"), list):
+    rows = result.get("rows") or []
+    cols = result.get("columns") or []
+    if not cols and rows and isinstance(rows[0], dict):
+      return _render_table_html(rows, max_rows=max_rows)
+    cols = [str(c) for c in (cols or [])][:80]
+    thead = "".join(f"<th>{html.escape(c)}</th>" for c in cols) if cols else ""
+    body_rows = rows[:max_rows]
+    tbody = []
+    for r in body_rows:
+      if isinstance(r, dict) and cols:
+        cells = [r.get(c) for c in cols]
+      else:
+        cells = list(r) if isinstance(r, (list, tuple)) else [_safe_str(r)]
+      if cols and len(cells) < len(cols):
+        cells += [""] * (len(cols) - len(cells))
+      tds = "".join(f"<td>{html.escape(_safe_str(v))}</td>" for v in cells[: len(cols) or 80])
+      tbody.append(f"<tr>{tds}</tr>")
+    return f"""
+      <table class="td-table">
+        <thead><tr>{thead}</tr></thead>
+        <tbody>{''.join(tbody)}</tbody>
+      </table>
     """
-    s = _safe_str(raw).strip().lower()
-    s = re.sub(r"[\s_]+", "-", s)
-    s = re.sub(r"[^a-z0-9-]", "-", s)
-    s = re.sub(r"-{2,}", "-", s).strip("-")
-    return s[:128]
 
-
-def to_chatbot_messages(app_messages: Any) -> List[Dict[str, str]]:
+  # list of lists / tuples
+  if isinstance(result, list) and result and isinstance(result[0], (list, tuple)):
+    rows = result[:max_rows]
+    width = min(max(len(r) for r in rows), 80)
+    cols = [f"col_{i+1}" for i in range(width)]
+    thead = "".join(f"<th>{c}</th>" for c in cols)
+    tbody = []
+    for r in rows:
+      rr = list(r)[:width] + [""] * max(0, width - len(r))
+      tds = "".join(f"<td>{html.escape(_safe_str(v))}</td>" for v in rr)
+      tbody.append(f"<tr>{tds}</tr>")
+    return f"""
+      <table class="td-table">
+        <thead><tr>{thead}</tr></thead>
+        <tbody>{''.join(tbody)}</tbody>
+      </table>
     """
-    Always return Gradio "messages" format:
-    [{"role":"user|assistant|system|tool","content":"..."}]
-    """
-    out: List[Dict[str, str]] = []
-    if not app_messages:
-        return out
 
-    for m in app_messages:
-        role = getattr(m, "role", None) or (m.get("role") if isinstance(m, dict) else None) or "assistant"
-        content = getattr(m, "content", None) if not isinstance(m, dict) else m.get("content")
-        role_s = _safe_str(role).strip().lower() or "assistant"
-        content_s = _safe_str(content)
+  # string fallback
+  escaped = html.escape(_safe_str(result))
+  return f"<pre style='white-space:pre-wrap;margin:0'>{escaped}</pre>"
 
-        # Normalize roles for display
-        if role_s not in {"user", "assistant", "system", "tool"}:
-            role_s = "assistant"
 
-        # Make "tool/system" readable inside chat
-        if role_s == "tool":
-            content_s = f"[DATA]\n{content_s}"
-            role_s = "assistant"
-        elif role_s == "system":
-            content_s = f"{content_s}"
-            role_s = "assistant"
+def _chatbot_supports_type() -> bool:
+  try:
+    return "type" in inspect.signature(gr.Chatbot.__init__).parameters
+  except Exception:
+    return False
 
-        out.append({"role": role_s, "content": content_s})
+
+def _to_chat_messages(app_messages: Any) -> List[Dict[str, str]]:
+  """
+  Messages format: [{"role":"user|assistant|system", "content":"..."}]
+  Works when gr.Chatbot is in messages mode.
+  """
+  out: List[Dict[str, str]] = []
+  if not isinstance(app_messages, list):
     return out
 
+  for m in app_messages:
+    # supports dataclass-like objects with role/content, or dicts
+    role = getattr(m, "role", None) or (m.get("role") if isinstance(m, dict) else None) or "assistant"
+    content = getattr(m, "content", None) if not isinstance(m, dict) else m.get("content")
+    role = str(role)
+    content = _safe_str(content)
 
-def to_dataframe(value: Any):
-    if pd is None:
-        return value
+    # normalize any internal roles
+    if role == "tool":
+      role = "assistant"
+      content = f"**DATA**\n{content}"
 
-    if value is None:
-        return pd.DataFrame()
+    if role not in ("user", "assistant", "system"):
+      role = "assistant"
 
-    if hasattr(value, "to_dict") and hasattr(value, "columns"):
-        # pandas dataframe-like
-        try:
-            return value
-        except Exception:
-            return pd.DataFrame()
+    out.append({"role": role, "content": content})
+  return out
 
-    if isinstance(value, list):
-        if len(value) == 0:
-            return pd.DataFrame()
-        if isinstance(value[0], dict):
-            return pd.DataFrame(value)
-        if isinstance(value[0], (list, tuple)):
-            return pd.DataFrame(value)
 
-    if isinstance(value, dict):
-        # common shapes: {"columns": [...], "rows": [...]}
-        cols = value.get("columns")
-        rows = value.get("rows")
-        if isinstance(cols, list) and isinstance(rows, list):
-            try:
-                return pd.DataFrame(rows, columns=cols)
-            except Exception:
-                return pd.DataFrame(rows)
-        # single record
-        try:
-            return pd.DataFrame([value])
-        except Exception:
-            return pd.DataFrame()
+def _to_chat_tuples(app_messages: Any) -> List[Tuple[str, str]]:
+  """
+  Tuples format: [(user, assistant), ...]
+  Works in older gr.Chatbot (default tuples mode).
+  """
+  pairs: List[Tuple[str, str]] = []
+  if not isinstance(app_messages, list):
+    return pairs
 
-    # string / scalar
-    return pd.DataFrame()
+  pending_user: str | None = None
+  for m in app_messages:
+    role = getattr(m, "role", None) or (m.get("role") if isinstance(m, dict) else None) or "assistant"
+    content = getattr(m, "content", None) if not isinstance(m, dict) else m.get("content")
+    role = str(role)
+    content = _safe_str(content)
+
+    if role == "user":
+      if pending_user is not None:
+        pairs.append((pending_user, ""))  # orphan user
+      pending_user = content
+    else:
+      if pending_user is None:
+        pending_user = ""  # assistant first
+      if role == "tool":
+        content = f"**DATA**\n{content}"
+      pairs.append((pending_user, content))
+      pending_user = None
+
+  if pending_user is not None:
+    pairs.append((pending_user, ""))
+
+  return pairs
 
 
 def build_ui() -> gr.Blocks:
-    config = get_config()
+  config = get_config()
 
-    ai_service: Optional[AISearchService] = None
-    ai_error: Optional[str] = None
-    try:
-        cred = get_search_credential(config)
-        ai_service = AISearchService(config.ai_search_endpoint, cred)
-    except IdentityError as e:
-        ai_error = f"Azure AI Search identity error: {_safe_str(e)}"
-    except Exception as e:
-        ai_error = f"Azure AI Search initialization failed: {_safe_str(e)}"
+  ai_service = None
+  ai_init_error = None
+  try:
+    cred = get_search_credential(config)
+    ai_service = AISearchService(config.ai_search_endpoint, cred)
+  except Exception as e:
+    ai_service = None
+    ai_init_error = e
 
-    def safe_list_indexes(timeout_s: int = 10) -> Tuple[bool, Any]:
-        """
-        Returns (ok, result). result is either list[str] or error string/exception
-        """
-        if not ai_service:
-            return False, (ai_error or "Azure AI Search is not initialized.")
-        try:
-            fn = getattr(ai_service, "safe_list_indexes", None)
-            if callable(fn):
-                return fn(timeout_s=timeout_s)
-            # fallback
-            return True, ai_service.list_indexes()
-        except Exception as e:
-            return False, e
+  supports_type = _chatbot_supports_type()
 
-    def friendly_err(e: Any) -> str:
-        msg = _safe_str(e)
-        if "multiple user assigned identities exist" in msg.lower():
-            return (
-                "Multiple user-assigned identities exist. Set AI_SEARCH_MANAGED_IDENTITY_CLIENT_ID "
-                "or AZURE_CLIENT_ID."
-            )
-        if "forbidden" in msg.lower() or "unauthorized" in msg.lower():
-            return "Access forbidden/unauthorized. Verify RBAC and identity permissions on the Search service."
-        if "timed out" in msg.lower() or "timeout" in msg.lower():
-            return "Request timed out. Try again or check network connectivity."
-        return msg or "Unknown error"
+  # Create Blocks with CSS (compatible fallback if css arg not supported)
+  blocks_kwargs = {}
+  try:
+    if "css" in inspect.signature(gr.Blocks.__init__).parameters:
+      blocks_kwargs["css"] = CSS
+  except Exception:
+    pass
 
-    def refresh_indexes(current_value: Optional[str], state: Dict[str, Any]):
-        ok, result = safe_list_indexes(timeout_s=10)
-        if not ok:
-            status = f"❌ {friendly_err(result)}"
-            # keep existing choices/value
-            return (
-                gr.update(),
-                gr.update(),
-                gr.update(value=status, visible=True),
-                gr.update(value=status, visible=True),
-                state,
-            )
+  with gr.Blocks(**blocks_kwargs) as demo:
+    # ---------- Header ----------
+    header_html = f"""
+    <div id="td-header">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+        <div id="td-brand">
+          <div id="td-logo">TD</div>
+          <div id="td-title">
+            <h1>NL → SQL Chatbot</h1>
+            <div>Azure OpenAI + SQL Server + Azure AI Search metadata</div>
+          </div>
+        </div>
+        <div id="td-pills">
+          <div class="td-pill"><span class="td-dot ok"></span>SQL</div>
+          <div class="td-pill"><span class="td-dot {'ok' if ai_service else 'bad'}"></span>AI Search</div>
+        </div>
+      </div>
+    </div>
+    """
+    gr.HTML(header_html)
 
-        choices = [c for c in (result or []) if isinstance(c, str)]
-        # Preserve current if still valid, else fallback to config/default
-        candidate = _safe_str(current_value).strip()
-        if candidate and candidate in choices:
-            selected = candidate
-        else:
-            cfg_default = _safe_str(getattr(config, "ai_search_index", "")).strip()
-            env_default = _safe_str(os.getenv("AI_SEARCH_DEFAULT_INDEX", "")).strip()
-            selected = cfg_default if cfg_default in choices else (env_default if env_default in choices else (choices[0] if choices else None))
+    # ---------- Hidden init error ----------
+    if ai_init_error:
+      gr.Markdown(f"**AI Search init error:** `{_safe_str(ai_init_error)}`")
 
-        # update shared state too
-        state = dict(state or {})
-        state["selected_index"] = selected
+    # ---------- Session state ----------
+    state = gr.State({
+      "app_messages": [],          # keep internal history (AppChatMessage or dicts)
+      "pending_sql": "",
+      "last_sql": "",
+      "last_result_compact": None,
+      "selected_index": None,
+    })
 
-        status = f"✅ Refreshed {len(choices)} index(es)." if choices else "⚠️ No indexes found."
+    # ---------- Helpers ----------
+    def _coerce_state(s: Any) -> Dict[str, Any]:
+      s = _as_state(s)
+      if "app_messages" not in s or not isinstance(s.get("app_messages"), list):
+        s["app_messages"] = []
+      if not isinstance(s.get("pending_sql"), str):
+        s["pending_sql"] = ""
+      if not isinstance(s.get("last_sql"), str):
+        s["last_sql"] = ""
+      # selected_index can be None/str
+      return s
+
+    def _do_turn(user_text: str, s: Any, selected_index: str | None):
+      s = _coerce_state(s)
+
+      # Selected index is stored in config for downstream logic
+      try:
+        setattr(config, "selected_index", selected_index)
+      except Exception:
+        pass
+      s["selected_index"] = selected_index
+
+      user_text = _safe_str(user_text).strip()
+      if not user_text:
+        chat_value = _to_chat_messages(s["app_messages"]) if supports_type else _to_chat_tuples(s["app_messages"])
         return (
-            gr.update(choices=choices, value=selected),
-            gr.update(choices=choices, value=selected),
-            gr.update(value=status, visible=True),
-            gr.update(value=status, visible=True),
-            state,
+          chat_value,
+          s,
+          "",
+          gr.update(value=s.get("last_sql", "")),
+          gr.update(value=_render_table_html(s.get("last_result_compact"))),
         )
 
-    def sync_index_from_chat(idx: Optional[str], state: Dict[str, Any]):
-        state = dict(state or {})
-        state["selected_index"] = idx
-        return gr.update(value=idx), state
+      # Defensive: ensure messages is a list (prevents "'str' object has no attribute 'copy'")
+      if not isinstance(s.get("app_messages"), list):
+        s["app_messages"] = []
 
-    def sync_index_from_search(idx: Optional[str], state: Dict[str, Any]):
-        state = dict(state or {})
-        state["selected_index"] = idx
-        return gr.update(value=idx), state
+      try:
+        new_messages, new_pending_sql, last_sql, last_result_compact = handle_user_turn(
+          user_text,
+          s["app_messages"],
+          s["pending_sql"],
+          config,
+        )
+      except Exception as e:
+        # Put the error into the chat (as assistant) without breaking format
+        err_msg = f"ERROR: {_safe_str(e)}"
+        # best-effort append
+        msgs = s.get("app_messages") if isinstance(s.get("app_messages"), list) else []
+        msgs = list(msgs)
+        msgs.append({"role": "assistant", "content": err_msg})
+        new_messages, new_pending_sql, last_sql, last_result_compact = msgs, s.get("pending_sql", ""), s.get("last_sql", ""), s.get("last_result_compact")
 
-    def do_turn(user_text: str, state: Dict[str, Any], selected_index: Optional[str]):
-        state = dict(state or {})
-        messages = state.get("messages") or []
-        pending_sql = state.get("pending_sql") or ""
+      s["app_messages"] = new_messages if isinstance(new_messages, list) else []
+      s["pending_sql"] = new_pending_sql if isinstance(new_pending_sql, str) else ""
+      s["last_sql"] = last_sql if isinstance(last_sql, str) else ""
+      s["last_result_compact"] = last_result_compact
 
-        # store chosen index for downstream retrieval / context
-        try:
-            setattr(config, "selected_index", selected_index)
-        except Exception:
-            pass
+      chat_value = _to_chat_messages(s["app_messages"]) if supports_type else _to_chat_tuples(s["app_messages"])
 
-        try:
-            new_messages, new_pending_sql, last_sql, last_result_compact = handle_user_turn(
-                user_text, messages, pending_sql, config
-            )
-        except TypeError:
-            # fallback if signature differs
-            new_messages, new_pending_sql, last_sql, last_result_compact = handle_user_turn(
-                user_text, messages, pending_sql
-            )
+      return (
+        chat_value,
+        s,
+        "",  # clear textbox
+        gr.update(value=s["last_sql"]),
+        gr.update(value=_render_table_html(s["last_result_compact"])),
+      )
 
-        state["messages"] = new_messages
-        state["pending_sql"] = new_pending_sql
-        state["last_sql"] = last_sql or ""
-        state["last_result_compact"] = last_result_compact
-        state["selected_index"] = selected_index
+    def _clear_all():
+      s = {
+        "app_messages": [],
+        "pending_sql": "",
+        "last_sql": "",
+        "last_result_compact": None,
+        "selected_index": None,
+      }
+      chat_value = []  # empty
+      return (
+        chat_value,
+        s,
+        "",
+        gr.update(value=""),
+        gr.update(value=_render_table_html(None)),
+      )
 
-        chat_val = to_chatbot_messages(new_messages)
-        sql_val = state["last_sql"]
-        df_val = to_dataframe(last_result_compact)
+    def _safe_list_indexes(current_value: str | None):
+      if not ai_service:
+        return gr.update(), gr.update(value="AI Search not available.", visible=True)
+      try:
+        indexes = ai_service.list_indexes()
+        indexes = indexes or []
+        indexes = [str(x) for x in indexes]
+        safe_value = current_value if current_value in indexes else (indexes[0] if indexes else None)
+        status = f"Refreshed {len(indexes)} index(es)." if indexes else "No indexes found."
+        return gr.update(choices=indexes, value=safe_value), gr.update(value=status, visible=True)
+      except Exception as e:
+        return gr.update(), gr.update(value=f"Failed to refresh indexes: {_safe_str(e)}", visible=True)
 
-        return chat_val, state, "", sql_val, df_val
+    # ---------- Tabs ----------
+    with gr.Tabs():
+      # =========================
+      # Chat Tab
+      # =========================
+      with gr.Tab("Chat"):
+        with gr.Row(equal_height=True):
+          # Left: Context + SQL + Results
+          with gr.Column(scale=4, min_width=320):
+            with gr.Group(elem_classes=["td-card"]):
+              gr.Markdown("### Context", elem_classes=["td-section-title"])
+              gr.Markdown(
+                "Choose the Azure AI Search index used as metadata reference.",
+                elem_classes=["td-help"],
+              )
 
-    def list_tables(state: Dict[str, Any], selected_index: Optional[str]):
-        return do_turn("list tables", state, selected_index)
+              refresh_btn = gr.Button("Refresh Index List", elem_id="refresh-btn")
+              index_dropdown = gr.Dropdown(
+                label="Metadata Index (used by Chat)",
+                choices=[],
+                value=None,
+              )
+              refresh_status = gr.Markdown(visible=False)
 
-    def reset_all():
-        fresh = {
-            "messages": [],
-            "pending_sql": "",
-            "last_sql": "",
-            "last_result_compact": None,
-            "selected_index": None,
-        }
-        empty_df = pd.DataFrame() if pd is not None else []
-        return [], fresh, "", "", empty_df
+              list_tables_btn = gr.Button("List Tables")
 
-    # Azure AI Search actions
-    def create_index(new_name: str, state: Dict[str, Any]):
-        if not ai_service:
-            status = f"❌ {ai_error or 'Azure AI Search is not initialized.'}"
-            return gr.update(), gr.update(), status, status, state
+            with gr.Group(elem_classes=["td-card"]):
+              gr.Markdown("### Generated SQL", elem_classes=["td-section-title"])
+              sql_code = gr.Code(value="", language="sql", elem_id="sql-code")
 
-        idx = sanitize_index_name(new_name)
-        if not idx:
-            status = "❌ Invalid index name. Use letters/digits/hyphens (we auto-sanitize)."
-            return gr.update(), gr.update(), status, status, state
+            with gr.Group(elem_classes=["td-card"]):
+              gr.Markdown("### Results (Grid)", elem_classes=["td-section-title"])
+              results_grid = gr.HTML(value=_render_table_html(None), elem_id="results-grid")
 
-        try:
-            fn = getattr(ai_service, "create_metadata_index", None) or getattr(ai_service, "create_index", None)
-            if not callable(fn):
-                raise RuntimeError("AISearchService has no create_metadata_index/create_index method.")
-            ok, msg = fn(idx) if fn.__code__.co_argcount == 2 else fn(index_name=idx)  # type: ignore
-            if not ok:
-                status = f"❌ {friendly_err(msg)}"
-                return gr.update(), gr.update(), status, status, state
-        except Exception as e:
-            status = f"❌ {friendly_err(e)}"
-            return gr.update(), gr.update(), status, status, state
+          # Right: Chat
+          with gr.Column(scale=8, min_width=520):
+            with gr.Group(elem_classes=["td-card"], elem_id="chat-wrap"):
+              if supports_type:
+                chatbot = gr.Chatbot(type="messages", elem_id="chatbot", show_label=False)
+              else:
+                chatbot = gr.Chatbot(elem_id="chatbot", show_label=False)
 
-        # refresh indexes after creation
-        chat_dd, search_dd, chat_status, search_status, state = refresh_indexes(idx, state)
-        created = f"✅ Created index: `{idx}`"
-        return chat_dd, search_dd, created, created, state
+              user_input = gr.Textbox(
+                label="",
+                placeholder="Ask a question about your data…",
+              )
 
-    def upload_metadata(file_obj: Any, selected_index: Optional[str]):
-        if not ai_service:
-            return f"❌ {ai_error or 'Azure AI Search is not initialized.'}", ""
+              with gr.Row():
+                send_btn = gr.Button("Send", elem_id="send-btn")
+                clear_btn = gr.Button("Clear", elem_id="clear-btn")
 
-        idx = _safe_str(selected_index).strip()
-        if not idx:
-            return "❌ Please select an index first.", ""
-
-        # Resolve file path from Gradio File
-        path = None
-        if isinstance(file_obj, str):
-            path = file_obj
-        else:
-            path = getattr(file_obj, "name", None) or getattr(file_obj, "path", None)
-        path = _safe_str(path).strip()
-
-        if not path:
-            return "❌ No file selected.", ""
-
-        try:
-            fn = getattr(ai_service, "ingest_pipe_file", None) or getattr(ai_service, "ingest_file", None)
-            if not callable(fn):
-                raise RuntimeError("AISearchService has no ingest_pipe_file/ingest_file method.")
-            success, fail, msg = fn(idx, path)
-            base = f"✅ Uploaded. Success={success}, Fail={fail}." if (success or fail) else f"✅ Uploaded. {msg}"
-        except Exception as e:
-            return f"❌ {friendly_err(e)}", ""
-
-        # Try stats
-        stats_msg = ""
-        try:
-            stats_fn = getattr(ai_service, "get_index_stats", None)
-            if callable(stats_fn):
-                stats = stats_fn(idx)
-                if isinstance(stats, dict):
-                    doc_count = stats.get("document_count", stats.get("documentCount", "N/A"))
-                    stats_msg = f"📈 Document count: **{doc_count}**"
-        except Exception:
-            stats_msg = ""
-
-        return base, stats_msg
-
-    with gr.Blocks(title="NL→SQL Chatbot") as demo:
-        gr.HTML(f"<style>{CSS}</style>")
-        gr.HTML(HEADER_HTML)
-
-        # shared app state
-        state = gr.State(
-            {
-                "messages": [],
-                "pending_sql": "",
-                "last_sql": "",
-                "last_result_compact": None,
-                "selected_index": None,
-            }
+        # Events (Chat tab)
+        refresh_btn.click(
+          _safe_list_indexes,
+          inputs=[index_dropdown],
+          outputs=[index_dropdown, refresh_status],
         )
 
-        with gr.Row(elem_id="td-body"):
-            # LEFT SIDEBAR
-            with gr.Column(elem_classes=["td-card"]):
-                gr.Markdown("### Context")
-                gr.Markdown("Choose the Azure AI Search index used as metadata reference.", elem_classes=["td-help"])
+        # Keep selected index in state, but do NOT trigger refresh automatically
+        def _on_index_change(idx: str | None, s: Any):
+          s = _coerce_state(s)
+          s["selected_index"] = idx
+          return gr.update(value=idx), s
 
-                chat_refresh_btn = gr.Button("Refresh Index List", variant="primary")
-                chat_refresh_status = gr.Markdown("", elem_id="tiny_status", visible=False)
-
-                chat_index_dd = gr.Dropdown(
-                    label="Metadata Index (used by Chat)",
-                    choices=[],
-                    value=None,
-                )
-
-                list_tables_btn = gr.Button("List Tables", variant="secondary")
-
-                gr.Markdown("### Generated SQL")
-                sql_code = gr.Code(label="SQL", value="", language="sql", elem_id="sql_code")
-
-                gr.Markdown("### Results (Grid)")
-                results_grid = gr.Dataframe(
-                    value=pd.DataFrame() if pd is not None else [],
-                    interactive=False,
-                    elem_id="grid_wrap",
-                    label="Grid view",
-                )
-
-            # RIGHT MAIN AREA
-            with gr.Column():
-                with gr.Tabs():
-                    with gr.Tab("Chat"):
-                        with gr.Column(elem_classes=["td-card"], elem_id="chatbox_wrap"):
-                            chatbot = gr.Chatbot(label="Chat", value=[])
-                            user_input = gr.Textbox(
-                                label="Textbox",
-                                placeholder="Ask a question about your data...",
-                            )
-                            with gr.Row():
-                                send_btn = gr.Button("Send", variant="primary")
-                                clear_btn = gr.Button("Clear", variant="secondary")
-
-                    with gr.Tab("Azure AI Search"):
-                        with gr.Column(elem_classes=["td-card"]):
-                            gr.Markdown("### Connection")
-                            endpoint = _safe_str(getattr(config, "ai_search_endpoint", "")).strip()
-                            gr.Markdown(f"**Endpoint:** {endpoint or '(not set)'}")
-
-                            search_refresh_btn = gr.Button("List Indexes / Refresh", variant="primary")
-                            search_refresh_status = gr.Markdown("", elem_id="tiny_status", visible=False)
-
-                            search_index_dd = gr.Dropdown(
-                                label="Select Index",
-                                choices=[],
-                                value=None,
-                            )
-
-                            gr.Markdown("### Create Index")
-                            new_index_name = gr.Textbox(
-                                label="New Index Name",
-                                placeholder="example: edc-metadata",
-                            )
-                            create_index_btn = gr.Button("Create Index", variant="secondary")
-
-                            gr.Markdown("### Upload metadata (pipe-separated)")
-                            upload_file = gr.File(label="Upload Metadata File (.txt/.psv/.csv)")
-                            upload_btn = gr.Button("Upload to Selected Index", variant="secondary")
-                            upload_status = gr.Markdown("")
-                            upload_stats = gr.Markdown("")
-
-        # --- Wire events (no render(), no duplicate blocks) ---
-
-        # Refresh indexes (updates BOTH dropdowns + BOTH statuses + state)
-        chat_refresh_btn.click(
-            refresh_indexes,
-            inputs=[chat_index_dd, state],
-            outputs=[chat_index_dd, search_index_dd, chat_refresh_status, search_refresh_status, state],
-        )
-        search_refresh_btn.click(
-            refresh_indexes,
-            inputs=[search_index_dd, state],
-            outputs=[chat_index_dd, search_index_dd, chat_refresh_status, search_refresh_status, state],
+        index_dropdown.change(
+          _on_index_change,
+          inputs=[index_dropdown, state],
+          outputs=[index_dropdown, state],
         )
 
-        # Sync dropdown selections across tabs
-        chat_index_dd.change(
-            sync_index_from_chat,
-            inputs=[chat_index_dd, state],
-            outputs=[search_index_dd, state],
-        )
-        search_index_dd.change(
-            sync_index_from_search,
-            inputs=[search_index_dd, state],
-            outputs=[chat_index_dd, state],
-        )
-
-        # Chat turn
         send_btn.click(
-            do_turn,
-            inputs=[user_input, state, chat_index_dd],
-            outputs=[chatbot, state, user_input, sql_code, results_grid],
+          _do_turn,
+          inputs=[user_input, state, index_dropdown],
+          outputs=[chatbot, state, user_input, sql_code, results_grid],
         )
+
         user_input.submit(
-            do_turn,
-            inputs=[user_input, state, chat_index_dd],
-            outputs=[chatbot, state, user_input, sql_code, results_grid],
+          _do_turn,
+          inputs=[user_input, state, index_dropdown],
+          outputs=[chatbot, state, user_input, sql_code, results_grid],
         )
 
-        # List tables shortcut
         list_tables_btn.click(
-            list_tables,
-            inputs=[state, chat_index_dd],
-            outputs=[chatbot, state, user_input, sql_code, results_grid],
+          lambda s, idx: _do_turn("list tables", s, idx),
+          inputs=[state, index_dropdown],
+          outputs=[chatbot, state, user_input, sql_code, results_grid],
         )
 
-        # Clear
         clear_btn.click(
-            reset_all,
-            inputs=[],
-            outputs=[chatbot, state, user_input, sql_code, results_grid],
+          _clear_all,
+          inputs=[],
+          outputs=[chatbot, state, user_input, sql_code, results_grid],
         )
 
-        # Azure AI Search: create index (refreshes both dropdowns + statuses)
-        create_index_btn.click(
-            create_index,
-            inputs=[new_index_name, state],
-            outputs=[chat_index_dd, search_index_dd, chat_refresh_status, search_refresh_status, state],
-        )
+      # =========================
+      # Azure AI Search Tab
+      # =========================
+      with gr.Tab("Azure AI Search"):
+        with gr.Row(equal_height=True):
+          with gr.Column(scale=1):
+            with gr.Group(elem_classes=["td-card"]):
+              gr.Markdown("### Connection", elem_classes=["td-section-title"])
+              gr.Markdown(f"**Endpoint:** `{getattr(config, 'ai_search_endpoint', '')}`")
+              list_btn = gr.Button("List Indexes")
+              idx_dd2 = gr.Dropdown(label="Select Index", choices=[], value=None)
+              status_out = gr.Markdown()
 
-        # Azure AI Search: upload file
-        upload_btn.click(
-            upload_metadata,
-            inputs=[upload_file, search_index_dd],
-            outputs=[upload_status, upload_stats],
-        )
+          with gr.Column(scale=1):
+            with gr.Group(elem_classes=["td-card"]):
+              gr.Markdown("### Create Index", elem_classes=["td-section-title"])
+              new_index_name = gr.Textbox(label="New Index Name", placeholder="example: edc-metadata")
+              create_btn = gr.Button("Create Index")
+              create_out = gr.Markdown()
 
-        # Initial refresh on load (safe)
-        demo.load(
-            refresh_indexes,
-            inputs=[chat_index_dd, state],
-            outputs=[chat_index_dd, search_index_dd, chat_refresh_status, search_refresh_status, state],
-        )
+          with gr.Column(scale=1):
+            with gr.Group(elem_classes=["td-card"]):
+              gr.Markdown("### Upload metadata (pipe-separated)", elem_classes=["td-section-title"])
+              file_upload = gr.File(label="Upload Metadata File (.txt/.psv/.csv)")
+              upload_btn = gr.Button("Upload to Selected Index")
+              upload_out = gr.Markdown()
+              stats_out = gr.Markdown()
 
-    return demo
+        def _list_indexes_tab():
+          if not ai_service:
+            return gr.update(), "AI Search not available."
+          try:
+            choices = ai_service.list_indexes() or []
+            choices = [str(x) for x in choices]
+            return gr.update(choices=choices, value=(choices[0] if choices else None)), f"Found {len(choices)} index(es)."
+          except Exception as e:
+            return gr.update(), f"Failed: {_safe_str(e)}"
+
+        def _create_index(name: str):
+          if not ai_service:
+            return "AI Search not available."
+          name = _safe_str(name).strip()
+          if not name:
+            return "Please enter an index name."
+          try:
+            ok, msg = ai_service.create_metadata_index(name)
+            return f"{'✅' if ok else '❌'} {msg}"
+          except Exception as e:
+            return f"❌ Failed: {_safe_str(e)}"
+
+        def _upload(file_obj: Any, selected_idx: str | None):
+          if not ai_service:
+            return "AI Search not available.", ""
+          if not selected_idx:
+            return "Please select an index first.", ""
+          if not file_obj:
+            return "No file selected.", ""
+          # gr.File can be path-like or object with .name depending on version
+          path = getattr(file_obj, "name", None) or getattr(file_obj, "path", None) or file_obj
+          path = _safe_str(path)
+          try:
+            success, fail, msg = ai_service.ingest_pipe_file(selected_idx, path)
+            stats = ai_service.get_index_stats(selected_idx) or {}
+            doc_count = stats.get("document_count", stats.get("doc_count", "N/A"))
+            return f"✅ {msg} (success={success}, fail={fail})", f"Document count: {doc_count}"
+          except Exception as e:
+            return f"❌ Failed: {_safe_str(e)}", ""
+
+        list_btn.click(_list_indexes_tab, inputs=[], outputs=[idx_dd2, status_out])
+        create_btn.click(_create_index, inputs=[new_index_name], outputs=[create_out])
+        upload_btn.click(_upload, inputs=[file_upload, idx_dd2], outputs=[upload_out, stats_out])
+
+  return demo
