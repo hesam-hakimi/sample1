@@ -1,53 +1,72 @@
-Bug: Clicking "List Index" triggers:
-ManagedIdentityCredential authentication unavailable...
-Token request error: (invalid_request) Multiple user assigned identities exist, please specify the clientId/resourceId.
+Bug:
+When clicking "Refresh Index List" in Gradio, the page becomes stuck and DevTools shows:
+Failed to load resource: net::ERR_INCOMPLETE_CHUNKED_ENCODING
+.../gradio_api/heartbeat/...
 
-Root cause:
-We create ManagedIdentityCredential() without client_id in an environment with multiple user-assigned identities.
+Meaning:
+Backend request crashed or never returned (blocked). We need robust refresh handler:
+- No unhandled exceptions
+- No infinite event recursion
+- Timeouts for Azure calls
+- Disable button while running
+- Always return valid Gradio updates
 
-Fix requirements:
-1) Add config env var:
-   AI_SEARCH_MANAGED_IDENTITY_CLIENT_ID (optional)
-   Also support AZURE_CLIENT_ID as fallback.
+Implement:
 
-2) Create/Update app/identity.py:
-   def get_search_credential(config):
-     if config.AI_SEARCH_USE_MSI:
-        client_id = config.AI_SEARCH_MANAGED_IDENTITY_CLIENT_ID or os.getenv("AZURE_CLIENT_ID")
-        if client_id:
-           return ManagedIdentityCredential(client_id=client_id)
-        else:
-           # still allow system assigned MSI (if only one), but detect ambiguity
-           return ManagedIdentityCredential()
-     else:
-        return AzureCliCredential()
+1) Add a safe wrapper utility (new file app/safe_call.py):
+   - def run_with_timeout(fn, timeout_s) -> (ok, value_or_error_msg)
+   - Use concurrent.futures.ThreadPoolExecutor with future.result(timeout=timeout_s)
+   - Catch Exception and return friendly error (string), do NOT raise.
 
-3) Update app/ai_search_service.py (and metadata_store.py):
-   - NEVER instantiate ManagedIdentityCredential directly.
-   - Always call get_search_credential(config).
+2) In app/ai_search_service.py:
+   - Add method safe_list_indexes(timeout_s=10) -> tuple[bool, list[str] | str]
+     Internally calls list_indexes() via run_with_timeout.
+   - list_indexes() must be pure and not print; raise exceptions normally.
+   - In safe_list_indexes, map exceptions to friendly messages:
+       - "Multiple user assigned identities exist" -> instruct set AI_SEARCH_MANAGED_IDENTITY_CLIENT_ID or AZURE_CLIENT_ID
+       - endpoint missing -> instruct set AI_SEARCH_ENDPOINT
+       - forbidden/unauthorized -> instruct RBAC roles for Search Index Data Reader/Contributor
+     Never leak stack traces to UI.
 
-4) Improve error handling in list_indexes():
-   - Catch azure.core.exceptions.ClientAuthenticationError (and general Exception)
-   - If exception message contains "Multiple user assigned identities exist":
-       return (False, "Multiple managed identities detected. Set AI_SEARCH_MANAGED_IDENTITY_CLIENT_ID (or AZURE_CLIENT_ID) to the correct client id.")
-   - Do not let stack trace crash Gradio event handler.
+3) Fix event wiring in app/ui.py to prevent loops:
+   - The Refresh button click is the ONLY thing that calls refresh_indexes().
+   - Dropdown .change should ONLY set selected_index state, and must NOT call refresh.
+   - Do not use any "every=" timers for refresh.
+   - Ensure refresh handler DOES NOT trigger itself:
+       refresh handler returns dropdown update + status update only.
 
-5) UI (app/ui.py):
-   - The "List Index" button handler must:
-       ok, indexes_or_msg = ai_search_service.safe_list_indexes()
-       if ok: update dropdown choices
-       else: show msg in status area (chat or tab)
-   - No unhandled exceptions must reach Gradio.
+4) Implement refresh handler with re-entrancy guard:
+   - Use gr.State refresh_in_progress (bool) OR a threading.Lock in module scope.
+   - If refresh already running, immediately return:
+       - keep dropdown unchanged
+       - status: "Refresh already in progress…"
+   - While running, disable the Refresh button (interactive=False) and re-enable at end.
 
-6) Tests:
-   - tests/test_identity_client_id.py:
-       When config.AI_SEARCH_USE_MSI=true and client id exists -> ManagedIdentityCredential called with client_id
-   - tests/test_list_indexes_error_message.py:
-       Simulate ClientAuthenticationError with that text -> ensure user-friendly msg returned.
+5) Ensure correct return types:
+   - For dropdown update use gr.update(choices=indexes, value=value_if_present)
+   - For status use a textbox/markdown.
+   - Never return None where Gradio expects updates.
+   - Chatbot remains list[{"role","content"}] only.
+
+6) Add logging (server-side) so we can see why it freezes:
+   - log start/end + elapsed time for refresh handler
+   - log exception messages (not trace) at warning level
+
+7) Tests (no Azure network):
+   - tests/test_refresh_timeout.py:
+       mock ai_search_service.list_indexes to sleep longer than timeout
+       assert safe_list_indexes returns ok=False and a friendly timeout message
+   - tests/test_refresh_identity_error.py:
+       mock list_indexes raising Exception("Multiple user assigned identities exist")
+       assert returned message mentions setting client id
+   - tests/test_ui_no_recursion.py:
+       unit-test that dropdown change handler does not call refresh function (mock and assert not called)
 
 Acceptance criteria:
-- Clicking "List Index" never crashes Gradio.
-- If client id missing, UI shows actionable message telling user to set AI_SEARCH_MANAGED_IDENTITY_CLIENT_ID/AZURE_CLIENT_ID.
-- If client id is set correctly, indexes list loads successfully.
+- Clicking Refresh Index List never freezes the UI.
+- If Azure call blocks, UI shows a timeout message within 10s.
+- Heartbeat error disappears (backend no longer crashes/hangs).
+- No infinite refresh recursion.
 - pytest -q passes.
 Return full updated contents for modified/new files.
+
