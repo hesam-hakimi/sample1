@@ -1,72 +1,58 @@
-Bug:
-When clicking "Refresh Index List" in Gradio, the page becomes stuck and DevTools shows:
-Failed to load resource: net::ERR_INCOMPLETE_CHUNKED_ENCODING
-.../gradio_api/heartbeat/...
+Fix Gradio error:
+WARNING: [UI] Exception in refresh_indexes: 'Button' object has no attribute 'update'
 
-Meaning:
-Backend request crashed or never returned (blocked). We need robust refresh handler:
-- No unhandled exceptions
-- No infinite event recursion
-- Timeouts for Azure calls
-- Disable button while running
-- Always return valid Gradio updates
+Root cause:
+Code is calling <component>.update(...) (e.g., refresh_btn.update(...)).
+In our Gradio version, components do not have .update. We must use gr.update(...) and only return updates for components included in outputs.
 
-Implement:
+Tasks:
+1) Search the codebase for ".update(" usage on Gradio components (Button/Dropdown/Chatbot/etc).
+   Replace any:
+     refresh_btn.update(...)
+     dropdown.update(...)
+     status_box.update(...)
+   with returning gr.update(...) from the handler.
 
-1) Add a safe wrapper utility (new file app/safe_call.py):
-   - def run_with_timeout(fn, timeout_s) -> (ok, value_or_error_msg)
-   - Use concurrent.futures.ThreadPoolExecutor with future.result(timeout=timeout_s)
-   - Catch Exception and return friendly error (string), do NOT raise.
+2) Refactor refresh_indexes handler so it ONLY returns updates for outputs explicitly wired.
+   Example pattern:
 
-2) In app/ai_search_service.py:
-   - Add method safe_list_indexes(timeout_s=10) -> tuple[bool, list[str] | str]
-     Internally calls list_indexes() via run_with_timeout.
-   - list_indexes() must be pure and not print; raise exceptions normally.
-   - In safe_list_indexes, map exceptions to friendly messages:
-       - "Multiple user assigned identities exist" -> instruct set AI_SEARCH_MANAGED_IDENTITY_CLIENT_ID or AZURE_CLIENT_ID
-       - endpoint missing -> instruct set AI_SEARCH_ENDPOINT
-       - forbidden/unauthorized -> instruct RBAC roles for Search Index Data Reader/Contributor
-     Never leak stack traces to UI.
+   def refresh_indexes():
+       try:
+           indexes = ai_search_service.list_indexes()  # or safe_list_indexes()
+           value = indexes[0] if indexes else None
+           return gr.update(choices=indexes, value=value), f"Loaded {len(indexes)} indexes."
+       except Exception as e:
+           return gr.update(), f"Failed to load indexes: {friendly_message(e)}"
 
-3) Fix event wiring in app/ui.py to prevent loops:
-   - The Refresh button click is the ONLY thing that calls refresh_indexes().
-   - Dropdown .change should ONLY set selected_index state, and must NOT call refresh.
-   - Do not use any "every=" timers for refresh.
-   - Ensure refresh handler DOES NOT trigger itself:
-       refresh handler returns dropdown update + status update only.
+3) Fix event wiring:
+   refresh_btn.click(
+       fn=refresh_indexes,
+       inputs=[],
+       outputs=[index_dropdown, status_md],
+       queue=True
+   )
 
-4) Implement refresh handler with re-entrancy guard:
-   - Use gr.State refresh_in_progress (bool) OR a threading.Lock in module scope.
-   - If refresh already running, immediately return:
-       - keep dropdown unchanged
-       - status: "Refresh already in progress…"
-   - While running, disable the Refresh button (interactive=False) and re-enable at end.
+   IMPORTANT:
+   - Do NOT attempt to update the refresh button unless it is included in outputs.
+   - If we want to disable the button while running, include it as an output:
+       outputs=[refresh_btn, index_dropdown, status_md]
+     and return:
+       gr.update(interactive=False), gr.update(...), "Refreshing..."
+     then re-enable at the end.
 
-5) Ensure correct return types:
-   - For dropdown update use gr.update(choices=indexes, value=value_if_present)
-   - For status use a textbox/markdown.
-   - Never return None where Gradio expects updates.
-   - Chatbot remains list[{"role","content"}] only.
+4) Add a helper friendly_message(e) that maps common errors (MSI multi-identity, endpoint missing, forbidden) into readable messages.
 
-6) Add logging (server-side) so we can see why it freezes:
-   - log start/end + elapsed time for refresh handler
-   - log exception messages (not trace) at warning level
-
-7) Tests (no Azure network):
-   - tests/test_refresh_timeout.py:
-       mock ai_search_service.list_indexes to sleep longer than timeout
-       assert safe_list_indexes returns ok=False and a friendly timeout message
-   - tests/test_refresh_identity_error.py:
-       mock list_indexes raising Exception("Multiple user assigned identities exist")
-       assert returned message mentions setting client id
-   - tests/test_ui_no_recursion.py:
-       unit-test that dropdown change handler does not call refresh function (mock and assert not called)
+5) Add tests:
+   - test_refresh_indexes_returns_gr_update():
+       mock ai_search_service.list_indexes to return ["idx1"]
+       assert handler returns (gr.update(...), "Loaded 1...")
+   - test_refresh_indexes_error_returns_gr_update():
+       mock list_indexes raises Exception("Multiple user assigned identities exist")
+       assert status contains instruction to set AI_SEARCH_MANAGED_IDENTITY_CLIENT_ID/AZURE_CLIENT_ID
+   (No network calls in tests.)
 
 Acceptance criteria:
-- Clicking Refresh Index List never freezes the UI.
-- If Azure call blocks, UI shows a timeout message within 10s.
-- Heartbeat error disappears (backend no longer crashes/hangs).
-- No infinite refresh recursion.
-- pytest -q passes.
-Return full updated contents for modified/new files.
-
+- Clicking Refresh Index List no longer throws "'Button' object has no attribute 'update'".
+- No stack traces crash Gradio; UI shows status text.
+- Outputs returned by handlers match exactly the components in outputs=[...].
+Return full modified file contents.
