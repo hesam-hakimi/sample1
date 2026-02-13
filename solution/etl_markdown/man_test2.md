@@ -1,58 +1,68 @@
-Fix Gradio error:
-WARNING: [UI] Exception in refresh_indexes: 'Button' object has no attribute 'update'
+We have a Gradio UI with an "Azure AI Search" tab. Clicking the "List Indexes" / "Refresh Index List" button makes the page appear to loop (spinner / repeated requests), and it does not complete.
 
-Root cause:
-Code is calling <component>.update(...) (e.g., refresh_btn.update(...)).
-In our Gradio version, components do not have .update. We must use gr.update(...) and only return updates for components included in outputs.
+Goal: Fix the infinite loop / repeated execution. Ensure the button triggers exactly ONE backend call per click. No dropdown-change recursion. No crashes that drop the event stream.
 
-Tasks:
-1) Search the codebase for ".update(" usage on Gradio components (Button/Dropdown/Chatbot/etc).
-   Replace any:
-     refresh_btn.update(...)
-     dropdown.update(...)
-     status_box.update(...)
-   with returning gr.update(...) from the handler.
+Step 1 — Instrumentation (do this first):
+- In the handler function used by the button (e.g., refresh_indexes / list_indexes), add logging:
+  - log at function entry with timestamp and incrementing counter (global or stored in gr.State)
+  - log before returning (success path)
+  - log full exception with stack trace (error path)
+- Run with GRADIO_DEBUG=1 and confirm whether the handler is called repeatedly from one click.
 
-2) Refactor refresh_indexes handler so it ONLY returns updates for outputs explicitly wired.
-   Example pattern:
+Step 2 — Find and remove recursion triggers:
+- Search in ui.py (or build_ui) for any of these anti-patterns:
+  A) Dropdown.change(fn=refresh_indexes or list_indexes, ...)  -> remove it
+  B) refresh_btn.click(...) outputs include a component that then triggers the same click/change handler -> break the cycle
+  C) gr.Dropdown(choices=list_indexes())  -> do NOT call list_indexes at UI-build time
+  D) Any component uses "live=True" or "every=..." that calls list_indexes -> disable
 
-   def refresh_indexes():
-       try:
-           indexes = ai_search_service.list_indexes()  # or safe_list_indexes()
-           value = indexes[0] if indexes else None
-           return gr.update(choices=indexes, value=value), f"Loaded {len(indexes)} indexes."
-       except Exception as e:
-           return gr.update(), f"Failed to load indexes: {friendly_message(e)}"
+Step 3 — Correct event wiring:
+- "List Indexes" button should be the ONLY trigger to fetch indexes.
+- Wire:
+  list_btn.click(fn=refresh_indexes, inputs=[], outputs=[index_dropdown, status_md], queue=True or queue=False)
+- Ensure refresh_indexes returns updates ONLY for outputs listed above.
 
-3) Fix event wiring:
-   refresh_btn.click(
-       fn=refresh_indexes,
-       inputs=[],
-       outputs=[index_dropdown, status_md],
-       queue=True
-   )
+Step 4 — Prevent dropdown .change loops:
+- If dropdown has a change handler, it must NOT call refresh_indexes.
+- If we need to persist selection, use:
+  index_dropdown.change(fn=set_selected_index, inputs=[index_dropdown], outputs=[selected_index_state, status_md])
+- set_selected_index must not modify index_dropdown itself.
 
-   IMPORTANT:
-   - Do NOT attempt to update the refresh button unless it is included in outputs.
-   - If we want to disable the button while running, include it as an output:
-       outputs=[refresh_btn, index_dropdown, status_md]
-     and return:
-       gr.update(interactive=False), gr.update(...), "Refreshing..."
-     then re-enable at the end.
+Step 5 — Preserve dropdown value safely (avoid re-trigger):
+- In refresh_indexes:
+  - fetch new_choices = [...]
+  - keep current_value if still in new_choices
+  - only set value if current_value is None or not in choices
+  - return gr.update(choices=new_choices, value=safe_value)
+  - return a human-friendly status message
+- IMPORTANT: do not always force value=new_choices[0] on every refresh if a valid value already exists.
 
-4) Add a helper friendly_message(e) that maps common errors (MSI multi-identity, endpoint missing, forbidden) into readable messages.
+Step 6 — Add a concurrency guard (prevents double-click storms):
+- Add a gr.State boolean like is_refreshing_state
+- At handler start:
+  - if is_refreshing_state is True: return gr.update(), "Refresh already running"
+  - set it True
+- At end (finally): set it False
+(If you want to disable the button while running, include the button as an output and return gr.update(interactive=False/True).)
 
-5) Add tests:
-   - test_refresh_indexes_returns_gr_update():
-       mock ai_search_service.list_indexes to return ["idx1"]
-       assert handler returns (gr.update(...), "Loaded 1...")
-   - test_refresh_indexes_error_returns_gr_update():
-       mock list_indexes raises Exception("Multiple user assigned identities exist")
-       assert status contains instruction to set AI_SEARCH_MANAGED_IDENTITY_CLIENT_ID/AZURE_CLIENT_ID
-   (No network calls in tests.)
+Step 7 — Make the handler crash-proof:
+- Wrap in try/except; NEVER raise to Gradio.
+- Return stable outputs on error:
+  - dropdown update should be gr.update() (no change)
+  - status should be friendly, e.g. "Unable to list indexes. Check endpoint, credential, or permissions."
+- Specifically handle:
+  - ManagedIdentityCredential / multiple identities -> tell user to set AZURE_CLIENT_ID (or managed_identity_client_id)
+  - endpoint missing -> tell user to set AI_SEARCH_ENDPOINT
+
+Step 8 — Tests (no network):
+- Unit test refresh_indexes using mocks:
+  - mock search_client.list_index_names() returning ["a","b"]
+  - verify refresh_indexes returns a gr.update with those choices and correct safe value behavior
+- Unit test loop prevention:
+  - call refresh_indexes twice with is_refreshing_state True in between and ensure second call returns "already running"
 
 Acceptance criteria:
-- Clicking Refresh Index List no longer throws "'Button' object has no attribute 'update'".
-- No stack traces crash Gradio; UI shows status text.
-- Outputs returned by handlers match exactly the components in outputs=[...].
-Return full modified file contents.
+- One click on "List Indexes" results in exactly one backend call (verify by logs).
+- Dropdown updates once; no repeated calls triggered by dropdown.change.
+- No ERR_INCOMPLETE_CHUNKED_ENCODING in browser; no uncaught exceptions in terminal.
+Return the full updated ui.py (and any helper module changes) with clean wiring.
