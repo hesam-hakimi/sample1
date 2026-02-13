@@ -1,11 +1,11 @@
 # app/ui.py
 from __future__ import annotations
 
+import inspect
 import os
 import re
-import inspect
 import traceback
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import gradio as gr
 
@@ -37,7 +37,6 @@ body, .gradio-container{
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji" !important;
 }
 
-/* Remove default wide padding */
 .gradio-container .wrap{ max-width: 1200px !important; }
 
 /* Header */
@@ -98,7 +97,6 @@ body, .gradio-container{
   color: var(--text);
 }
 .hint{ color:var(--muted); font-size:12px; margin-top:6px; }
-.hr{ height:1px; background:var(--border); margin:10px 0; }
 
 /* Buttons */
 .gr-button, button{
@@ -126,9 +124,6 @@ textarea, input, .gr-text-input{
 }
 
 /* Tabs */
-.gr-tabs{
-  border-radius: var(--radius) !important;
-}
 .gr-tabitem{
   border: 1px solid var(--border) !important;
   border-radius: var(--radius) !important;
@@ -142,14 +137,6 @@ textarea, input, .gr-text-input{
   min-height: 520px;
   border-radius: var(--radius);
 }
-#chatbox .bubble-wrap{
-  border-radius: var(--radius) !important;
-}
-#chatbox .wrap{
-  background: #fff !important;
-}
-
-/* SQL + Results */
 #sql_code pre, #sql_code textarea{
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace !important;
   font-size: 12px !important;
@@ -158,11 +145,8 @@ textarea, input, .gr-text-input{
   border-radius: var(--radius);
   overflow:hidden;
 }
-#results_grid table{
-  font-size: 12px !important;
-}
 
-/* Make left column sticky-ish on taller screens */
+/* Sticky-ish left column */
 @media (min-width: 980px){
   #leftcol{
     position: sticky;
@@ -184,12 +168,6 @@ def _safe_str(x: Any) -> str:
 
 
 def _sanitize_index_name(name: str) -> str:
-    """
-    Azure AI Search index naming rules (common):
-      - lowercase letters, digits, dashes
-      - cannot start/end with dash
-      - <= 128 chars
-    """
     name = (name or "").strip().lower()
     name = re.sub(r"[\s_]+", "-", name)
     name = re.sub(r"[^a-z0-9-]", "", name)
@@ -219,10 +197,29 @@ def _make_badge_html(ai_ok: bool, sql_ok: bool) -> str:
 """
 
 
+def _chatbot_supports_type_param() -> bool:
+    try:
+        return "type" in inspect.signature(gr.Chatbot).parameters
+    except Exception:
+        return False
+
+
+def _make_chatbot(label: str, elem_id: str):
+    """
+    Fixes your current Gradio error:
+    - Some Gradio versions default Chatbot to messages format (list[dict]).
+    - We always output tuple format: list[tuple(user, assistant)].
+    - So if supported, force type='tuples'.
+    """
+    kwargs: Dict[str, Any] = {"label": label, "elem_id": elem_id}
+    if _chatbot_supports_type_param():
+        kwargs["type"] = "tuples"
+    return gr.Chatbot(**kwargs)
+
+
 def _to_chat_pairs(app_messages: Any) -> List[Tuple[str, str]]:
     """
-    Gradio Chatbot (legacy/default) expects List[Tuple[user, assistant]].
-    Your internal messages may be AppChatMessage(role, content) or dicts.
+    Convert internal messages -> List[Tuple[user, assistant]]
     """
     pairs: List[Tuple[str, str]] = []
     last_user: Optional[str] = None
@@ -234,7 +231,6 @@ def _to_chat_pairs(app_messages: Any) -> List[Tuple[str, str]]:
         role = None
         content = None
 
-        # AppChatMessage or similar
         if hasattr(m, "role") and hasattr(m, "content"):
             role = getattr(m, "role", None)
             content = getattr(m, "content", None)
@@ -242,7 +238,6 @@ def _to_chat_pairs(app_messages: Any) -> List[Tuple[str, str]]:
             role = m.get("role")
             content = m.get("content")
         else:
-            # fallback
             role = "assistant"
             content = _safe_str(m)
 
@@ -250,22 +245,11 @@ def _to_chat_pairs(app_messages: Any) -> List[Tuple[str, str]]:
         content_s = _safe_str(content)
 
         if role == "user":
-            # flush previous user without assistant
             if last_user is not None:
                 pairs.append((last_user, ""))
             last_user = content_s
-        elif role in ("assistant", "system", "tool"):
-            if last_user is None:
-                pairs.append(("", content_s))
-            else:
-                # attach to last pair
-                if pairs and pairs[-1][0] == last_user and pairs[-1][1] == "":
-                    pairs[-1] = (last_user, content_s)
-                else:
-                    pairs.append((last_user, content_s))
-                last_user = None
         else:
-            # unknown role -> show as assistant
+            # assistant/system/tool/unknown -> show as assistant bubble
             if last_user is None:
                 pairs.append(("", content_s))
             else:
@@ -287,17 +271,10 @@ def _try_import_pandas():
 
 
 def _result_to_grid(result: Any):
-    """
-    Return a value suitable for gr.Dataframe across versions:
-      - pandas.DataFrame if available
-      - else list[dict] or list[list] or []
-    """
     pd = _try_import_pandas()
-
     if result is None:
         return []
 
-    # Already a dataframe-like
     if pd is not None:
         try:
             if isinstance(result, pd.DataFrame):
@@ -305,7 +282,6 @@ def _result_to_grid(result: Any):
         except Exception:
             pass
 
-    # List[dict]
     if isinstance(result, list) and result and isinstance(result[0], dict):
         if pd is not None:
             try:
@@ -314,7 +290,6 @@ def _result_to_grid(result: Any):
                 return result
         return result
 
-    # Dict with columns/rows
     if isinstance(result, dict):
         cols = result.get("columns") or result.get("cols") or result.get("headers")
         rows = result.get("rows") or result.get("data")
@@ -326,42 +301,20 @@ def _result_to_grid(result: Any):
                     pass
             return rows
 
-    # CSV/TSV-ish string
-    if isinstance(result, str):
-        s = result.strip()
-        if not s:
-            return []
-        if pd is not None:
-            try:
-                import io
-                # try csv then tsv
-                try:
-                    return pd.read_csv(io.StringIO(s))
-                except Exception:
-                    return pd.read_csv(io.StringIO(s), sep="\t")
-            except Exception:
-                return []
-        return []
-
-    # List[list]
     if isinstance(result, list):
         return result
 
     return []
 
 
-def _safe_call_handle_user_turn(user_text: str, messages: Any, pending_sql: str, config: Any) -> Tuple[Any, str, str, Any]:
+def _safe_call_handle_user_turn(user_text: str, messages: Any, pending_sql: str, config: Any):
     """
-    Tries to call handle_user_turn with whatever signature exists.
     Expected output: (new_messages, new_pending_sql, last_sql, last_result_compact)
     """
     sig = inspect.signature(handle_user_turn)
     params = sig.parameters
-
     kwargs: Dict[str, Any] = {}
-    args: List[Any] = []
 
-    # Build by name if possible
     if "user_text" in params:
         kwargs["user_text"] = user_text
     elif "prompt" in params:
@@ -378,29 +331,23 @@ def _safe_call_handle_user_turn(user_text: str, messages: Any, pending_sql: str,
     if "config" in params:
         kwargs["config"] = config
 
-    # If we couldn't map well, fallback to positional in the common order
-    if not kwargs:
-        args = [user_text, messages, pending_sql, config]
+    if kwargs:
+        out = handle_user_turn(**kwargs)
+    else:
+        out = handle_user_turn(user_text, messages, pending_sql, config)
 
-    out = handle_user_turn(*args, **kwargs)
-    # Normalize
     if isinstance(out, tuple) and len(out) == 4:
-        return out  # type: ignore
+        return out
     raise RuntimeError(f"handle_user_turn returned unexpected value: {_safe_str(out)[:200]}")
 
 
 def _make_dataframe_component(label: str, elem_id: str):
-    """
-    Create a gr.Dataframe in a way that works across multiple gradio versions.
-    """
-    # Newer versions: interactive / wrap / max_height exist; older versions don't.
     try:
         return gr.Dataframe(value=[], label=label, interactive=False, elem_id=elem_id)
     except Exception:
         try:
             return gr.Dataframe(value=[], label=label, elem_id=elem_id)
         except Exception:
-            # extremely old fallback
             return gr.Dataframe(label=label, elem_id=elem_id)
 
 
@@ -408,7 +355,6 @@ def _make_dataframe_component(label: str, elem_id: str):
 # UI
 # -----------------------------
 def build_ui() -> gr.Blocks:
-    # Load config + init AI Search service (best effort)
     config = None
     ai_service = None
     init_error = None
@@ -425,31 +371,30 @@ def build_ui() -> gr.Blocks:
     except Exception as e:
         init_error = f"Config initialization failed: {_safe_str(e)}"
 
-    # Determine initial index list
     index_choices: List[str] = []
     default_index: Optional[str] = None
+
     if ai_service is not None:
         try:
             index_choices = list(ai_service.list_indexes() or [])
         except Exception:
             index_choices = []
-    # Pick default index safely
+
     if config is not None:
-        # Prefer AI_SEARCH_DEFAULT_INDEX if present, else AI_SEARCH_INDEX
         cfg_default = getattr(config, "ai_search_default_index", None) or getattr(config, "ai_search_index", None)
         if cfg_default and cfg_default in index_choices:
             default_index = cfg_default
+
     if default_index is None and index_choices:
         default_index = index_choices[0]
 
     ai_ok = ai_service is not None
-    sql_ok = True  # best-effort; actual SQL connectivity happens in your backend
+    sql_ok = True
     header_html = _make_badge_html(ai_ok=ai_ok, sql_ok=sql_ok)
 
     with gr.Blocks(css=CSS) as demo:
-        header = gr.HTML(value=header_html)
+        gr.HTML(value=header_html)
 
-        # Global app state
         state = gr.State(
             {
                 "messages": [],
@@ -460,7 +405,6 @@ def build_ui() -> gr.Blocks:
             }
         )
 
-        # Global error banner
         if init_error:
             gr.Markdown(
                 f"""
@@ -477,15 +421,13 @@ def build_ui() -> gr.Blocks:
             # -------------------------
             with gr.Tab("Chat"):
                 with gr.Row():
-                    # Left sidebar
                     with gr.Column(scale=4, elem_id="leftcol"):
                         with gr.Group(elem_classes=["card"]):
-                            gr.Markdown("### Context", elem_classes=["h3"])
+                            gr.Markdown("### Context")
                             gr.Markdown(
                                 "Choose the Azure AI Search index used as metadata reference.",
                                 elem_classes=["hint"],
                             )
-
                             refresh_btn = gr.Button("Refresh Index List", variant="primary")
                             index_dd = gr.Dropdown(
                                 label="Metadata Index (used by Chat)",
@@ -493,7 +435,6 @@ def build_ui() -> gr.Blocks:
                                 value=default_index if default_index in index_choices else None,
                             )
                             refresh_status = gr.Markdown(value="", visible=False)
-
                             list_tables_btn = gr.Button("List Tables")
 
                         with gr.Group(elem_classes=["card"]):
@@ -505,22 +446,18 @@ def build_ui() -> gr.Blocks:
                             results_grid = _make_dataframe_component("Grid view", elem_id="results_grid")
                             raw_debug = gr.Markdown(value="", visible=False)
 
-                    # Right main chat
                     with gr.Column(scale=8):
-                        chatbot = gr.Chatbot(label="Chat", elem_id="chatbox")
-                        with gr.Row():
-                            user_input = gr.Textbox(
-                                placeholder="Ask a question about your data…",
-                                label="",
-                                lines=2,
-                            )
+                        # IMPORTANT FIX: force tuples mode when supported
+                        chatbot = _make_chatbot(label="Chat", elem_id="chatbox")
+                        user_input = gr.Textbox(
+                            placeholder="Ask a question about your data…",
+                            label="",
+                            lines=2,
+                        )
                         with gr.Row():
                             send_btn = gr.Button("Send", variant="primary")
                             clear_btn = gr.Button("Clear")
 
-                # -------------------------
-                # Chat handlers
-                # -------------------------
                 def _set_selected_index(idx: Optional[str], st: Dict[str, Any]):
                     st = dict(st or {})
                     st["selected_index"] = idx
@@ -531,20 +468,17 @@ def build_ui() -> gr.Blocks:
                         if ai_service is None:
                             st = _set_selected_index(current_value, st)
                             return (
-                                gr.update(),  # dropdown unchanged
+                                gr.update(),
                                 gr.update(visible=True, value="❌ AI Search service not available."),
                                 st,
                             )
 
                         choices = list(ai_service.list_indexes() or [])
-                        # preserve selection if possible
                         selected = current_value if current_value in choices else (choices[0] if choices else None)
                         st = _set_selected_index(selected, st)
-
-                        msg = f"✅ Refreshed {len(choices)} index(es)."
                         return (
                             gr.update(choices=choices, value=selected),
-                            gr.update(visible=True, value=msg),
+                            gr.update(visible=True, value=f"✅ Refreshed {len(choices)} index(es)."),
                             st,
                         )
                     except Exception as e:
@@ -560,7 +494,6 @@ def build_ui() -> gr.Blocks:
                     messages = st.get("messages", [])
                     pending_sql = st.get("pending_sql", "")
 
-                    # keep config in sync (if your backend relies on it)
                     if config is not None and hasattr(config, "selected_index"):
                         try:
                             setattr(config, "selected_index", selected_index)
@@ -584,7 +517,6 @@ def build_ui() -> gr.Blocks:
                         chat_pairs = _to_chat_pairs(new_messages)
                         grid_val = _result_to_grid(last_result_compact)
 
-                        # Optional: show raw debug only if large/complex
                         raw = ""
                         if last_result_compact is not None and not isinstance(last_result_compact, (list, dict)):
                             raw = _safe_str(last_result_compact)
@@ -592,7 +524,7 @@ def build_ui() -> gr.Blocks:
                         return (
                             chat_pairs,
                             st,
-                            "",  # clear user input
+                            "",
                             last_sql or "",
                             grid_val,
                             gr.update(visible=bool(raw), value=f"```text\n{raw}\n```" if raw else ""),
@@ -600,9 +532,7 @@ def build_ui() -> gr.Blocks:
                     except Exception as e:
                         tb = traceback.format_exc()
                         chat_pairs = _to_chat_pairs(messages)
-                        err_msg = f"❌ Error: {_safe_str(e)}"
-                        # Append error to chat display without mutating backend messages
-                        chat_pairs.append(("", err_msg))
+                        chat_pairs.append(("", f"❌ Error: {_safe_str(e)}"))
                         return (
                             chat_pairs,
                             st,
@@ -613,7 +543,6 @@ def build_ui() -> gr.Blocks:
                         )
 
                 def _list_tables(st: Dict[str, Any], selected_index: Optional[str]):
-                    # reuse your NL->SQL backend: "list tables"
                     return _send("list tables", st, selected_index)
 
                 def _clear():
@@ -633,7 +562,6 @@ def build_ui() -> gr.Blocks:
                         gr.update(visible=False, value=""),
                     )
 
-                # Wire events (NO dropdown-triggered refresh to avoid loops)
                 refresh_btn.click(
                     _refresh_indexes,
                     inputs=[index_dd, state],
@@ -676,10 +604,9 @@ def build_ui() -> gr.Blocks:
                         with gr.Group(elem_classes=["card"]):
                             endpoint = ""
                             if config is not None:
-                                endpoint = getattr(config, "ai_search_endpoint", "") or getattr(config, "ai_search_endpoint", "")
+                                endpoint = getattr(config, "ai_search_endpoint", "") or ""
                             gr.Markdown("### Connection")
                             gr.Markdown(f"**Endpoint:** {endpoint or '(not set)'}")
-
                             ai_refresh_btn = gr.Button("Refresh", variant="primary")
                             ai_status = gr.Markdown(value="", visible=False)
 
@@ -704,23 +631,17 @@ def build_ui() -> gr.Blocks:
                                 "This uses the same **Metadata Index** selected in the **Chat** tab.",
                                 elem_classes=["hint"],
                             )
-                            # Show the global dropdown value here (read-only)
                             selected_idx_view = gr.Textbox(
                                 label="Selected Index",
                                 value=default_index or "",
                                 interactive=False,
                             )
-
-                            # Keep this display synced when dropdown changes
                             index_dd.change(
                                 lambda idx: gr.update(value=idx or ""),
                                 inputs=[index_dd],
                                 outputs=[selected_idx_view],
                             )
 
-                # -------------------------
-                # AI Search handlers
-                # -------------------------
                 def _ai_refresh(current_value: Optional[str], st: Dict[str, Any]):
                     dd_upd, status_upd, st2 = _refresh_indexes(current_value, st)
                     return dd_upd, status_upd, st2, gr.update(value=(st2.get("selected_index") or ""))
@@ -746,11 +667,11 @@ def build_ui() -> gr.Blocks:
 
                     try:
                         ok, msg = ai_service.create_metadata_index(sanitized)
-                        # Always refresh list after create attempt
                         choices = list(ai_service.list_indexes() or [])
-                        selected = sanitized if sanitized in choices else (current_value if current_value in choices else (choices[0] if choices else None))
+                        selected = sanitized if sanitized in choices else (
+                            current_value if current_value in choices else (choices[0] if choices else None)
+                        )
                         st["selected_index"] = selected
-
                         status = f"{'✅' if ok else '❌'} {msg}"
                         return (
                             gr.update(choices=choices, value=selected),
@@ -783,7 +704,6 @@ def build_ui() -> gr.Blocks:
 
                         success, fail, msg = ai_service.ingest_pipe_file(selected_index, file_path)
 
-                        # Stats (best effort)
                         stats_val = ""
                         try:
                             stats = ai_service.get_index_stats(selected_index)
