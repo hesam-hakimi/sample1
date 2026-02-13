@@ -1,4 +1,4 @@
-# ui.py
+# ui.py  (Gradio-compatible: NO Chatbot(type="messages") so it works on older Gradio)
 from __future__ import annotations
 
 import os
@@ -8,6 +8,7 @@ import time
 import logging
 import threading
 import traceback
+import inspect
 from typing import Any, Dict, List, Optional, Tuple
 
 import gradio as gr
@@ -18,7 +19,7 @@ from app.config import get_config
 from app.ai_search_service import AISearchService
 from app.identity import get_search_credential, IdentityError
 
-# Disable Gradio telemetry in restricted networks (avoids huggingface telemetry HEAD calls)
+# Avoid telemetry calls in restricted networks
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
@@ -34,7 +35,6 @@ CSS = """
   --td-text:#0b1f12;
   --td-muted:rgba(11,31,18,.65);
 }
-
 .gradio-container{ background: var(--td-bg) !important; }
 
 #td-header{
@@ -45,7 +45,6 @@ CSS = """
   margin-bottom: 12px;
   box-shadow: 0 8px 24px rgba(0,0,0,.05);
 }
-
 #td-header .title{
   font-weight: 800;
   font-size: 18px;
@@ -58,7 +57,6 @@ CSS = """
   color: var(--td-muted);
   font-size: 12px;
 }
-
 .td-pill{
   display:inline-flex;
   align-items:center;
@@ -71,21 +69,18 @@ CSS = """
   font-size: 12px;
   font-weight: 600;
 }
-
 .td-card{
   background: var(--td-card);
   border: 1px solid var(--td-border);
   border-radius: 16px;
   box-shadow: 0 10px 30px rgba(0,0,0,.05);
 }
-
 .td-section-title{
   font-weight: 800;
   font-size: 13px;
   color: var(--td-text);
   margin: 0 0 8px 0;
 }
-
 .td-muted{
   color: var(--td-muted);
   font-size: 12px;
@@ -99,7 +94,6 @@ button.primary:hover, .gr-button.primary:hover{
   background: var(--td-green-2) !important;
   border-color: var(--td-green-2) !important;
 }
-
 .gr-button.secondary{
   border-color: var(--td-border) !important;
 }
@@ -116,16 +110,13 @@ button.primary:hover, .gr-button.primary:hover{
   background: rgba(220,53,69,.08);
   border-color: rgba(220,53,69,.25);
 }
-
 #sql-code textarea, #sql-code pre{
   border-radius: 12px !important;
 }
-
 .gr-chatbot{
   border-radius: 14px !important;
 }
 """
-
 
 def _safe_str(x: Any) -> str:
   try:
@@ -137,31 +128,9 @@ def _safe_str(x: Any) -> str:
   except Exception:
     return repr(x)
 
-
-def to_gradio_messages(app_messages: List[AppChatMessage]) -> List[dict]:
-  out: List[dict] = []
-  for m in app_messages or []:
-    role = getattr(m, "role", "assistant") or "assistant"
-    content = _safe_str(getattr(m, "content", ""))
-
-    if role == "tool":
-      role = "assistant"
-      content = f"**[DATA]**\n\n{content}"
-    elif role == "system":
-      role = "assistant"
-      content = f"**[SYSTEM]** {content}"
-
-    if role not in ("user", "assistant"):
-      role = "assistant"
-
-    out.append({"role": role, "content": content})
-  return out
-
-
 def friendly_message(e: Exception) -> str:
   msg = str(e) if str(e) else e.__class__.__name__
   low = msg.lower()
-
   if "multiple user assigned identities exist" in low:
     return (
       "Azure Managed Identity error: multiple user-assigned identities exist. "
@@ -173,10 +142,7 @@ def friendly_message(e: Exception) -> str:
     return "Access denied to Azure AI Search. Ensure the identity has `Search Index Data Contributor` on the Search service."
   if "invalidname" in low or "index name" in low:
     return "Invalid index name. Use lowercase letters, digits, hyphens; cannot start/end with hyphen; <=128 chars."
-  if "data incompatible with message format" in low:
-    return "Chat message format invalid for Gradio. Must be list of dicts: {'role':'user|assistant','content':'...'}."
   return msg
-
 
 def sanitize_index_name(name: str) -> Tuple[str, Optional[str]]:
   raw = (name or "").strip()
@@ -186,14 +152,12 @@ def sanitize_index_name(name: str) -> Tuple[str, Optional[str]]:
   n = re.sub(r"-{2,}", "-", n)
   n = n.strip("-")
   n = n[:128].strip("-")
-
   if not n:
     return "", "Index name is empty after sanitizing."
   note = None
   if n != raw:
     note = f"Normalized to `{n}`"
   return n, note
-
 
 def _file_path(file_obj: Any) -> Optional[str]:
   if file_obj is None:
@@ -205,10 +169,48 @@ def _file_path(file_obj: Any) -> Optional[str]:
     return p
   return None
 
+# ---- IMPORTANT FIX: tuple-based chatbot payload (works without Chatbot(type="messages")) ----
+def to_chat_pairs(app_messages: List[AppChatMessage]) -> List[Tuple[str, str]]:
+  pairs: List[Tuple[str, str]] = []
+  pending_user: Optional[str] = None
+
+  def append_assistant(txt: str):
+    nonlocal pairs
+    if not pairs:
+      pairs.append(("", txt))
+    else:
+      u, a = pairs[-1]
+      pairs[-1] = (u, (a + "\n\n" + txt).strip())
+
+  for m in app_messages or []:
+    role = getattr(m, "role", "assistant") or "assistant"
+    content = _safe_str(getattr(m, "content", ""))
+
+    if role == "user":
+      # if user sends twice without assistant, keep last as pending
+      pending_user = content
+      continue
+
+    # assistant/tool/system -> treat as assistant
+    if role == "tool":
+      content = f"[DATA]\n{content}"
+    elif role == "system":
+      content = f"[SYSTEM] {content}"
+
+    if pending_user is None:
+      append_assistant(content)
+    else:
+      pairs.append((pending_user, content))
+      pending_user = None
+
+  # if last user has no assistant yet
+  if pending_user is not None:
+    pairs.append((pending_user, ""))
+
+  return pairs
 
 def to_grid_data(last_result_compact: Any) -> Tuple[Any, str]:
   raw = _safe_str(last_result_compact)
-
   if last_result_compact is None:
     return [], ""
 
@@ -242,7 +244,6 @@ def to_grid_data(last_result_compact: Any) -> Tuple[Any, str]:
       return last_result_compact, raw
 
   return [], raw
-
 
 def build_ui() -> gr.Blocks:
   config = get_config()
@@ -289,7 +290,6 @@ def build_ui() -> gr.Blocks:
     except Exception as e:
       return False, e
 
-  # State: sync_count prevents dropdown change loops.
   state = gr.State(
     {
       "messages": [],
@@ -301,14 +301,9 @@ def build_ui() -> gr.Blocks:
     }
   )
 
-  theme = gr.themes.Soft(
-    primary_hue="green",
-    secondary_hue="emerald",
-    neutral_hue="slate",
-    font=["Inter", "ui-sans-serif", "system-ui", "Segoe UI", "Roboto", "Arial"],
-  )
-
-  with gr.Blocks(theme=theme, css=CSS, title="NL→SQL Chatbot") as demo:
+  # Build Blocks without theme/css to avoid Gradio 6 warning; we pass css/theme to launch if supported.
+  blocks_kwargs = {"title": "NL→SQL Chatbot"}
+  with gr.Blocks(**blocks_kwargs) as demo:
     gr.HTML(
       f"""
       <div id="td-header">
@@ -378,7 +373,7 @@ def build_ui() -> gr.Blocks:
           desired = choices[0] if choices else None
 
         st["selected_index"] = desired
-        st["sync_count"] = 2  # we will update two dropdowns programmatically
+        st["sync_count"] = 2
 
         return (
           gr.update(choices=choices, value=desired),
@@ -398,7 +393,7 @@ def build_ui() -> gr.Blocks:
         st["selected_index"] = new_idx
         return gr.update(), st
       st["selected_index"] = new_idx
-      st["sync_count"] = 1  # we will update the other dropdown once
+      st["sync_count"] = 1
       return gr.update(value=new_idx), st
 
     def on_search_index_change(new_idx: Optional[str], st: Dict[str, Any]):
@@ -431,11 +426,11 @@ def build_ui() -> gr.Blocks:
         st["last_result_compact"] = last_result_compact
         st["selected_index"] = selected_index
 
-        chat_payload = to_gradio_messages(new_messages)
+        chat_pairs = to_chat_pairs(new_messages)
         grid, raw = to_grid_data(last_result_compact)
 
         return (
-          chat_payload,
+          chat_pairs,
           st,
           "",
           last_sql or "",
@@ -448,15 +443,8 @@ def build_ui() -> gr.Blocks:
         tb = traceback.format_exc()
         logger.error("Chat error: %s\n%s", e, tb)
 
-        try:
-          msgs = list(st.get("messages") or [])
-          msgs.append(AppChatMessage(role="assistant", content=f"⚠️ {msg}"))
-          st["messages"] = msgs
-        except Exception:
-          pass
-
         return (
-          to_gradio_messages(st.get("messages") or []),
+          to_chat_pairs(st.get("messages") or []),
           st,
           "",
           st.get("last_sql") or "",
@@ -506,10 +494,7 @@ def build_ui() -> gr.Blocks:
           )
 
         ok2, result2 = _list_indexes(timeout_s=12)
-        if ok2:
-          choices = sorted(result2)  # type: ignore[arg-type]
-        else:
-          choices = []
+        choices = sorted(result2) if ok2 else []  # type: ignore[arg-type]
 
         st["selected_index"] = clean
         st["sync_count"] = 2
@@ -579,38 +564,26 @@ def build_ui() -> gr.Blocks:
             with gr.Group(elem_classes=["td-card"]):
               gr.Markdown("<div class='td-section-title'>Context</div>")
               gr.Markdown("<div class='td-muted'>Choose the Azure AI Search index used as metadata reference.</div>")
-
               chat_refresh_btn = gr.Button("Refresh Index List", variant="secondary")
               chat_index_dd = gr.Dropdown(
                 label="Metadata Index (used by Chat)",
                 choices=[],
                 value=None,
-                allow_custom_value=False,
                 interactive=True,
               )
               list_tables_btn = gr.Button("List Tables", variant="secondary")
-              gr.Markdown("<div class='td-muted'>Use <b>List Tables</b> to validate connectivity.</div>")
 
             gr.Markdown("<div style='height:10px;'></div>")
 
             with gr.Group(elem_classes=["td-card"]):
               gr.Markdown("<div class='td-section-title'>Generated SQL</div>")
               sql_code = gr.Code(value="", language="sql", elem_id="sql-code")
-              gr.Markdown("<div class='td-muted'>SQL generated by the agent.</div>")
 
           with gr.Column(scale=8, min_width=520):
             with gr.Group(elem_classes=["td-card"]):
-              chatbot = gr.Chatbot(
-                label="Chat",
-                type="messages",
-                height=420,
-                show_copy_button=True,
-              )
-              user_input = gr.Textbox(
-                placeholder="Ask a question about your data…",
-                label="",
-                lines=2,
-              )
+              # ✅ no `type=` argument here (fixes your error)
+              chatbot = gr.Chatbot(label="Chat", height=420)
+              user_input = gr.Textbox(placeholder="Ask a question about your data…", label="", lines=2)
               with gr.Row():
                 send_btn = gr.Button("Send", variant="primary")
                 clear_btn = gr.Button("Clear", variant="secondary")
@@ -639,7 +612,14 @@ def build_ui() -> gr.Blocks:
         )
 
         def _clear():
-          st = {"messages": [], "pending_sql": "", "last_sql": "", "last_result_compact": None, "selected_index": None, "sync_count": 0}
+          st = {
+            "messages": [],
+            "pending_sql": "",
+            "last_sql": "",
+            "last_result_compact": None,
+            "selected_index": None,
+            "sync_count": 0,
+          }
           return [], st, "", "", [], "", _banner("", False)
 
         clear_btn.click(
@@ -664,7 +644,6 @@ def build_ui() -> gr.Blocks:
                 label="Select Index",
                 choices=[],
                 value=None,
-                allow_custom_value=False,
                 interactive=True,
               )
 
@@ -675,10 +654,10 @@ def build_ui() -> gr.Blocks:
 
             with gr.Group(elem_classes=["td-card"]):
               gr.Markdown("<div class='td-section-title'>Upload metadata (pipe-separated)</div>")
-              upload_file = gr.File(label="Upload Metadata File (.txt / .psv / .csv)", file_types=[".txt", ".psv", ".csv"])
+              upload_file = gr.File(label="Upload Metadata File (.txt / .psv / .csv)")
               upload_btn = gr.Button("Upload to Selected Index", variant="primary")
 
-    # ---------- cross-tab wiring (NO re-render) ----------
+    # ---------- cross-tab wiring ----------
     chat_refresh_btn.click(
       refresh_indexes,
       inputs=[state, chat_index_dd, search_index_dd],
@@ -748,15 +727,30 @@ def build_ui() -> gr.Blocks:
       outputs=[chat_index_dd, search_index_dd, state, status_banner],
     )
 
+  # Attach CSS via launch if supported, else fallback to Blocks(css=...) style not used here.
+  demo._td_css = CSS  # type: ignore[attr-defined]
   return demo
 
 
 if __name__ == "__main__":
   demo = build_ui()
-  demo.queue(default_concurrency_limit=int(os.getenv("GRADIO_CONCURRENCY", "20")))
-  demo.launch(
+
+  # Queue if available (safe)
+  if hasattr(demo, "queue"):
+    demo.queue(default_concurrency_limit=int(os.getenv("GRADIO_CONCURRENCY", "20")))
+
+  # Pass css/theme to launch ONLY if launch supports it
+  launch_kwargs = dict(
     server_name=os.getenv("GRADIO_SERVER_NAME", "0.0.0.0"),
     server_port=int(os.getenv("PORT", "7860")),
     show_error=True,
     share=False,
   )
+  try:
+    sig = inspect.signature(demo.launch).parameters
+    if "css" in sig:
+      launch_kwargs["css"] = getattr(demo, "_td_css", "")
+  except Exception:
+    pass
+
+  demo.launch(**launch_kwargs)
