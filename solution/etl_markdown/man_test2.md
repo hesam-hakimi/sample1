@@ -1,28 +1,13 @@
-FIX STEP: Make scripts/load_excel_to_sqlite.py runnable without “No module named app”.
+Fix scripts/load_excel_to_sqlite.py crash: NameError: os is not defined.
 
-Goal:
-- I want BOTH of these to work:
-  1) /app1/tag5916/projects/text2sql_v2/.venv/bin/python scripts/load_excel_to_sqlite.py
-  2) /app1/tag5916/projects/text2sql_v2/.venv/bin/python -m scripts.load_excel_to_sqlite
+1) Open scripts/load_excel_to_sqlite.py
+2) Ensure these imports are the very first lines in the file (before any sys.path insert):
+   import os
+   import sys
+3) Immediately after those imports, keep the sys.path bootstrap (can stay as-is):
+   sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-Required change:
-1) Edit scripts/load_excel_to_sqlite.py:
-   - At the very top (before importing app.*), add a safe sys.path bootstrap:
-     - compute PROJECT_ROOT = parent directory of this script (…/text2sql_v2)
-     - insert PROJECT_ROOT into sys.path if not present
-   - Then import load_config using:
-       from app.core.config import load_config
+4) Re-run:
+   /app1/tag5916/projects/text2sql_v2/.venv/bin/python scripts/load_excel_to_sqlite.py
 
-2) Add a main entry point:
-   - def main() -> int:
-       - load config
-       - run the loader
-       - return 0 on success, non-zero on failure
-   - if __name__ == "__main__": raise SystemExit(main())
-
-3) Do NOT change other modules for this fix.
-
-After patch:
-- Re-run:
-  /app1/tag5916/projects/text2sql_v2/.venv/bin/python scripts/load_excel_to_sqlite.py
-- Paste the full output.
+Return the full console output.
