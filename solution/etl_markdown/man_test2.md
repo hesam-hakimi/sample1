@@ -1,41 +1,24 @@
-## Fix Step 5 config mismatch (accept AZURE_* env var names)
+## Step 5 — End-to-end run (SQLite + AI Search + GPT)
 
-### Problem
-`load_config()` currently requires:
-SEARCH_ENDPOINT, OPENAI_ENDPOINT, OPENAI_API_VERSION, OPENAI_DEPLOYMENT
-But our `.env` uses:
-AZURE_SEARCH_ENDPOINT, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT
-
-### Required change
-In `app/core/config.py`, update `load_config()` so it accepts BOTH naming styles:
-- Prefer AZURE_* if present
-- Otherwise fall back to non-AZURE names
-
-### Mapping (must implement)
-- search endpoint:
-  - AZURE_SEARCH_ENDPOINT -> cfg.search_endpoint
-  - else SEARCH_ENDPOINT
-
-- openai endpoint:
-  - AZURE_OPENAI_ENDPOINT -> cfg.openai_endpoint
-  - else OPENAI_ENDPOINT
-
-- api version:
-  - AZURE_OPENAI_API_VERSION -> cfg.openai_api_version
-  - else OPENAI_API_VERSION
-
-- deployment:
-  - AZURE_OPENAI_DEPLOYMENT -> cfg.openai_deployment
-  - else OPENAI_DEPLOYMENT
-
-- MSI client id:
-  - AZURE_CLIENT_ID if present -> cfg.azure_client_id
-  - else CLIENT_ID (optional)
-
-### Validation
-Only raise "Missing required env vars" if neither option exists for each required field.
-
-### After patch
+### 1) Run a simple test first (known sample-style question)
 Run:
-- `python -c "from app.core.config import load_config; print(load_config())"`
-Paste the output or any stack trace.
+- `python -m app.main_cli "show me the list of all clients who are based in usa"`
+
+### 2) If that fails because the SQLite tables don’t exist, quickly list tables
+Run:
+- `python -c "import sqlite3; c=sqlite3.connect('local_data.db'); print(c.execute(\"select name from sqlite_master where type='table' order by name\").fetchall())"`
+
+Then rerun Step 1 using a question that matches an existing table name.
+
+### 3) Paste back ALL console output
+When you respond to me, include:
+- generated_sql
+- row_count
+- final_answer
+- debug section (since DEBUG=true)
+
+### 4) If it fails
+Paste the full stack trace.
+Also run:
+- `python -m app.main_cli "ping"`
+and paste the output (this helps confirm the pipeline path).
