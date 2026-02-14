@@ -1,115 +1,146 @@
-import csv
 from pathlib import Path
 import pandas as pd
 
+# -------- Config --------
 SRC = Path(r".\source_data\Weekly-Inventory-of-Certified-Assets-MOAR-as-of-2025-10-05.csv")
-CLEAN = Path(r".\output\Weekly-Inventory-cleaned.csv")
-XLSX = Path(r".\output\Weekly-Inventory-FULL.xlsx")
+OUT_XLSX = Path(r".\output\Filtered_Tables.xlsx")
 
-CHUNK_SIZE = 200_000
-MAX_ROWS_PER_SHEET = 1_000_000           # keep under Excel limit (1,048,576)
-TEXT_COLS = ["BUSINESS_DESCRIPTION"]      # add more columns if needed
+# These are SUBSTRINGS to match (e.g., "x" matches "x_base", "x_vw")
+TARGET_TABLE_PATTERNS = {
+    "x",
+    "dac_edc",
+    # add more...
+}
+
+CASE_INSENSITIVE = True
+ONE_SHEET_PER_TABLE = True
+
+# Excel limits
+MAX_ROWS_PER_SHEET = 1_000_000  # keep under 1,048,576
 
 
-def repair_pipe_file(src: Path, dst: Path, encoding="utf-8") -> int:
+def matches_any_pattern(table_name: str, patterns: set[str], case_insensitive: bool = True) -> bool:
+    if table_name is None:
+        return False
+    if case_insensitive:
+        tn = table_name.lower()
+        pats = [p.lower() for p in patterns]
+    else:
+        tn = table_name
+        pats = list(patterns)
+
+    return any(p in tn for p in pats)
+
+
+def stream_filter_tables_contains(src: Path, patterns: set[str], case_insensitive: bool):
     """
-    Repairs files where a row is broken by unquoted newlines inside a field.
-    Joins physical lines until delimiter count matches header delimiter count.
-    Replaces the embedded newline with a space.
-    Returns number of repaired rows written.
+    Streams a pipe-delimited file and repairs rows broken by unquoted newlines.
+    Yields (table_name, row_values_list) for rows where TABLE_NAME contains any pattern.
     """
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    with open(src, "r", encoding="utf-8", errors="replace", newline="") as f:
+        header_line = f.readline().rstrip("\r\n")
+        headers = header_line.split("|")
+        expected_cols = len(headers)
 
-    written = 0
-    with open(src, "r", encoding=encoding, errors="replace", newline="") as f, \
-         open(dst, "w", encoding=encoding, newline="") as out:
+        if "TABLE_NAME" not in headers:
+            raise ValueError('Column "TABLE_NAME" not found in file')
 
-        header = f.readline()
-        if not header:
-            raise ValueError("Empty file")
+        table_idx = headers.index("TABLE_NAME")
 
-        header = header.rstrip("\r\n")
-        out.write(header + "\n")
-
-        expected_pipes = header.count("|")
-
-        buf = ""
+        buffer = ""
         for line in f:
             line = line.rstrip("\r\n")
 
-            # join broken rows: replace the physical newline with a space
-            buf = (buf + " " + line) if buf else line
+            # Join broken lines: newline inside a field becomes a space
+            buffer = (buffer + " " + line) if buffer else line
 
-            # keep appending until we have enough separators for a complete row
-            if buf.count("|") < expected_pipes:
+            # Wait until the row looks complete (has enough separators)
+            if buffer.count("|") < expected_cols - 1:
                 continue
 
-            out.write(buf + "\n")
-            written += 1
-            buf = ""
+            # Split into exactly expected columns
+            parts = buffer.split("|", maxsplit=expected_cols - 1)
 
-        # write any leftover (rare)
-        if buf.strip():
-            out.write(buf + "\n")
-            written += 1
+            if len(parts) == expected_cols:
+                tname = parts[table_idx]
+                if matches_any_pattern(tname, patterns, case_insensitive):
+                    yield tname, parts
 
-    return written
+            buffer = ""
 
 
-def flatten_newlines(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    # after repair, this is mostly for nicer Excel display
-    for c in cols:
-        if c in df.columns:
-            df[c] = df[c].astype(str).str.replace(r"[\r\n]+", " ", regex=True)
-    return df
+def sanitize_sheet_name(name: str) -> str:
+    """
+    Excel sheet rules: max 31 chars; cannot contain: : \ / ? * [ ]
+    """
+    bad = [":", "\\", "/", "?", "*", "[", "]"]
+    for ch in bad:
+        name = name.replace(ch, "_")
+    name = name.strip()
+    return (name[:31] if len(name) > 31 else name) or "Sheet"
 
 
 def main():
-    # 1) Repair the raw file so rows don't split
-    rows = repair_pipe_file(SRC, CLEAN)
-    print(f"✅ Repaired + wrote cleaned CSV rows: {rows:,} -> {CLEAN}")
+    # Read header once
+    with open(SRC, "r", encoding="utf-8", errors="replace") as f:
+        header_line = f.readline().rstrip("\r\n")
+    headers = header_line.split("|")
 
-    # 2) Stream cleaned file into Excel (multi-sheet)
-    reader = pd.read_csv(
-        CLEAN,
-        sep="|",
-        engine="python",
-        quoting=csv.QUOTE_NONE,     # treat " as normal char (messy quotes safe)
-        dtype=str,
-        keep_default_na=False,
-        on_bad_lines="warn",
-        chunksize=CHUNK_SIZE,
-    )
+    # Collect rows by actual TABLE_NAME found in file
+    buckets: dict[str, list[list[str]]] = {}
 
-    sheet_idx = 1
-    rows_in_sheet = 0
-    first_chunk_for_sheet = True
+    for tname, row in stream_filter_tables_contains(SRC, TARGET_TABLE_PATTERNS, CASE_INSENSITIVE):
+        buckets.setdefault(tname, []).append(row)
 
-    XLSX.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(XLSX, engine="openpyxl") as writer:
-        for chunk in reader:
-            chunk = flatten_newlines(chunk, TEXT_COLS)
+    if not buckets:
+        print(f"❌ No rows found where TABLE_NAME contains any of: {sorted(TARGET_TABLE_PATTERNS)}")
+        return
 
-            if rows_in_sheet + len(chunk) > MAX_ROWS_PER_SHEET:
-                sheet_idx += 1
-                rows_in_sheet = 0
-                first_chunk_for_sheet = True
+    OUT_XLSX.parent.mkdir(parents=True, exist_ok=True)
 
-            sheet_name = f"Sheet{sheet_idx}"
+    with pd.ExcelWriter(OUT_XLSX, engine="openpyxl") as writer:
+        if ONE_SHEET_PER_TABLE:
+            for tname, rows in sorted(buckets.items(), key=lambda x: x[0].lower()):
+                df = pd.DataFrame(rows, columns=headers)
 
-            chunk.to_excel(
-                writer,
-                sheet_name=sheet_name,
-                index=False,
-                header=first_chunk_for_sheet,
-                startrow=0 if first_chunk_for_sheet else rows_in_sheet,
-            )
+                # Clean any leftover CR/LF chars in cells for nicer Excel display
+                df = df.replace({"\r": " ", "\n": " "}, regex=True)
 
-            rows_in_sheet += len(chunk)
-            first_chunk_for_sheet = False
-            print(f"✅ Wrote {len(chunk):,} rows to {sheet_name} (sheet total: {rows_in_sheet:,})")
+                sheet_base = sanitize_sheet_name(tname)
 
-    print(f"\n✅ Done: {XLSX}")
+                # Split large tables across multiple sheets if needed
+                if len(df) <= MAX_ROWS_PER_SHEET:
+                    df.to_excel(writer, sheet_name=sheet_base, index=False)
+                else:
+                    part = 1
+                    for start in range(0, len(df), MAX_ROWS_PER_SHEET):
+                        chunk = df.iloc[start:start + MAX_ROWS_PER_SHEET]
+                        sheet = sanitize_sheet_name(f"{sheet_base}_{part}")
+                        chunk.to_excel(writer, sheet_name=sheet, index=False)
+                        part += 1
+        else:
+            # Single combined sheet with all matched rows
+            all_rows = []
+            for _, rows in buckets.items():
+                all_rows.extend(rows)
+
+            df = pd.DataFrame(all_rows, columns=headers)
+            df = df.replace({"\r": " ", "\n": " "}, regex=True)
+
+            if len(df) <= MAX_ROWS_PER_SHEET:
+                df.to_excel(writer, sheet_name="Filtered", index=False)
+            else:
+                part = 1
+                for start in range(0, len(df), MAX_ROWS_PER_SHEET):
+                    chunk = df.iloc[start:start + MAX_ROWS_PER_SHEET]
+                    chunk.to_excel(writer, sheet_name=f"Filtered_{part}", index=False)
+                    part += 1
+
+    print("✅ Done")
+    print(f"✅ Output: {OUT_XLSX}")
+    print("✅ Matched table names:")
+    for tname in sorted(buckets.keys(), key=str.lower):
+        print(f"  - {tname}: {len(buckets[tname]):,} rows")
 
 
 if __name__ == "__main__":
