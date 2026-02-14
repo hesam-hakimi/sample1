@@ -1,69 +1,41 @@
-# Step 5 — Run end-to-end test + capture outputs
+## Fix Step 5 config mismatch (accept AZURE_* env var names)
 
-## 1) Confirm file structure exists
-Run:
-- `find app -maxdepth 3 -type f | sort`
+### Problem
+`load_config()` currently requires:
+SEARCH_ENDPOINT, OPENAI_ENDPOINT, OPENAI_API_VERSION, OPENAI_DEPLOYMENT
+But our `.env` uses:
+AZURE_SEARCH_ENDPOINT, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT
 
-Expected (at least):
-- app/core/config.py
-- app/core/logger.py
-- app/core/search_service.py
-- app/core/sql_service.py
-- app/core/llm_service.py
-- app/core/orchestrator.py
-- app/main_cli.py
+### Required change
+In `app/core/config.py`, update `load_config()` so it accepts BOTH naming styles:
+- Prefer AZURE_* if present
+- Otherwise fall back to non-AZURE names
 
----
+### Mapping (must implement)
+- search endpoint:
+  - AZURE_SEARCH_ENDPOINT -> cfg.search_endpoint
+  - else SEARCH_ENDPOINT
 
-## 2) Update `.env` with ALL required values
-Open `.env` and ensure these keys exist (values are examples):
+- openai endpoint:
+  - AZURE_OPENAI_ENDPOINT -> cfg.openai_endpoint
+  - else OPENAI_ENDPOINT
 
-### Debug
-DEBUG=true
-SEND_RESULT_TO_GPT=true
+- api version:
+  - AZURE_OPENAI_API_VERSION -> cfg.openai_api_version
+  - else OPENAI_API_VERSION
 
-### Azure AI Search
-AZURE_SEARCH_ENDPOINT="https://<your-service>.search.windows.net"
-AZURE_CLIENT_ID="<optional-user-assigned-msi-client-id>"
+- deployment:
+  - AZURE_OPENAI_DEPLOYMENT -> cfg.openai_deployment
+  - else OPENAI_DEPLOYMENT
 
-### Azure OpenAI (GPT 4.1)
-AZURE_OPENAI_ENDPOINT="https://<your-openai-resource>.openai.azure.com"
-AZURE_OPENAI_API_VERSION="2024-12-01-preview"
-AZURE_OPENAI_DEPLOYMENT="<your-gpt-4.1-deployment-name>"
+- MSI client id:
+  - AZURE_CLIENT_ID if present -> cfg.azure_client_id
+  - else CLIENT_ID (optional)
 
-### SQLite
-SQLITE_PATH="local_data.db"
+### Validation
+Only raise "Missing required env vars" if neither option exists for each required field.
 
-### Behavior
-MAX_SEARCH_DOCS=50
-MAX_RETRIES=5
-
-Save the file.
-
----
-
-## 3) Sanity import check
+### After patch
 Run:
 - `python -c "from app.core.config import load_config; print(load_config())"`
-
-If this fails, paste the stack trace.
-
----
-
-## 4) Run a real question (end-to-end)
-Run:
-- `python -m app.main_cli "show me deposit count by day"`
-
-If you don’t have deposit tables yet in SQLite, use a question that matches your current sqlite tables, for example:
-- `python -m app.main_cli "show me the list of all clients who are based in usa"`
-
----
-
-## 5) Paste back EXACTLY these outputs
-1) The full console output  
-2) If it fails: full stack trace  
-3) If it succeeds: show me:
-   - generated_sql
-   - row_count
-   - final_answer
-   - and the debug section (since DEBUG=true)
+Paste the output or any stack trace.
