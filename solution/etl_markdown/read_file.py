@@ -1,147 +1,210 @@
+import json
+import os
 from pathlib import Path
+
 import pandas as pd
 
-# -------- Config --------
-SRC = Path(r".\source_data\Weekly-Inventory-of-Certified-Assets-MOAR-as-of-2025-10-05.csv")
-OUT_XLSX = Path(r".\output\Filtered_Tables.xlsx")
+EXCEL_PATH = os.getenv("RRDW_META_XLSX", "data/rrdw_meta_data.xlsx")
+OUT_DIR = Path(os.getenv("OUT_DIR", "out"))
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# These are SUBSTRINGS to match (e.g., "x" matches "x_base", "x_vw")
-TARGET_TABLE_PATTERNS = {
-    "x",
-    "dac_edc",
-    # add more...
-}
+# Your "field" sheet order MUST start exactly like this (extra columns allowed AFTER these)
+FIELD_BASE_COLUMNS_ORDERED = [
+    "MAL_CODE",
+    "SCHEMA_NAME",
+    "TABLE_NAME",
+    "COLUMN_NAME",
+    "SECURITY_CLASSIFICATION_CANDIDATE",
+    "PII",
+    "PCI",
+    "BUSINESS_NAME",
+    "BUSINESS_DESCRIPTION",
+    "DATA_TYPE",
+]
 
-CASE_INSENSITIVE = True
-ONE_SHEET_PER_TABLE = True
+TABLE_REQUIRED = ["SCHEMA_NAME", "TABLE_NAME", "TABLE_BUSINESS_NAME", "TABLE_BUSINESS_DESCRIPTION"]
+REL_REQUIRED = ["FROM_SCHEMA", "FROM_TABLE", "TO_SCHEMA", "TO_TABLE", "JOIN_TYPE", "JOIN_KEYS"]
 
-# Excel limits
-MAX_ROWS_PER_SHEET = 1_000_000  # keep under 1,048,576
+def norm_colname(c: str) -> str:
+    return str(c).strip().upper()
 
+def norm_yesno(v) -> bool:
+    s = str(v).strip().lower()
+    return s in {"yes", "y", "true", "1", "t"}
 
-def matches_any_pattern(table_name: str, patterns: set[str], case_insensitive: bool = True) -> bool:
-    if table_name is None:
-        return False
-    if case_insensitive:
-        tn = table_name.lower()
-        pats = [p.lower() for p in patterns]
-    else:
-        tn = table_name
-        pats = list(patterns)
+def read_sheet(xlsx: str, sheet: str) -> pd.DataFrame:
+    df = pd.read_excel(xlsx, sheet_name=sheet, dtype=str)
+    df.columns = [norm_colname(c) for c in df.columns]
+    return df.fillna("")
 
-    return any(p in tn for p in pats)
+def require_cols(df: pd.DataFrame, required: list[str], sheet: str):
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"[{sheet}] Missing required columns: {missing}")
 
+def validate_field_order(df: pd.DataFrame):
+    first_cols = list(df.columns[: len(FIELD_BASE_COLUMNS_ORDERED)])
+    if first_cols != FIELD_BASE_COLUMNS_ORDERED:
+        raise ValueError(
+            "[field] Column order mismatch.\n"
+            f"Expected first {len(FIELD_BASE_COLUMNS_ORDERED)} columns:\n"
+            f"{FIELD_BASE_COLUMNS_ORDERED}\n"
+            f"But got:\n{first_cols}\n"
+            "You can add new columns only AFTER these."
+        )
 
-def stream_filter_tables_contains(src: Path, patterns: set[str], case_insensitive: bool):
-    """
-    Streams a pipe-delimited file and repairs rows broken by unquoted newlines.
-    Yields (table_name, row_values_list) for rows where TABLE_NAME contains any pattern.
-    """
-    with open(src, "r", encoding="utf-8", errors="replace", newline="") as f:
-        header_line = f.readline().rstrip("\r\n")
-        headers = header_line.split("|")
-        expected_cols = len(headers)
+def stable_id(*parts: str) -> str:
+    return ".".join([p.strip() for p in parts if p.strip()])
 
-        if "TABLE_NAME" not in headers:
-            raise ValueError('Column "TABLE_NAME" not found in file')
+def build_field_docs(df: pd.DataFrame) -> list[dict]:
+    docs = []
+    for _, r in df.iterrows():
+        schema = r["SCHEMA_NAME"].strip()
+        table = r["TABLE_NAME"].strip()
+        col = r["COLUMN_NAME"].strip()
+        if not (schema and table and col):
+            continue
 
-        table_idx = headers.index("TABLE_NAME")
+        pii = norm_yesno(r.get("PII", ""))
+        pci = norm_yesno(r.get("PCI", ""))
 
-        buffer = ""
-        for line in f:
-            line = line.rstrip("\r\n")
+        doc = {
+            "id": stable_id("field", schema, table, col),
+            "mal_code": r.get("MAL_CODE", "").strip(),
+            "schema_name": schema,
+            "table_name": table,
+            "column_name": col,
+            "security_classification_candidate": r.get("SECURITY_CLASSIFICATION_CANDIDATE", "").strip(),
+            "pii": pii,
+            "pci": pci,
+            "business_name": r.get("BUSINESS_NAME", "").strip(),
+            "business_description": r.get("BUSINESS_DESCRIPTION", "").strip(),
+            "data_type": r.get("DATA_TYPE", "").strip(),
+            # Optional appended columns (only if you added them)
+            "is_key": norm_yesno(r.get("IS_KEY", "")) if "IS_KEY" in df.columns else False,
+            "is_filter_hint": norm_yesno(r.get("IS_FILTER_HINT", "")) if "IS_FILTER_HINT" in df.columns else False,
+            "allowed_values": r.get("ALLOWED_VALUES", "").strip() if "ALLOWED_VALUES" in df.columns else "",
+            "notes": r.get("NOTES", "").strip() if "NOTES" in df.columns else "",
+        }
 
-            # Join broken lines: newline inside a field becomes a space
-            buffer = (buffer + " " + line) if buffer else line
+        # Searchable content string (for BM25/semantic + later embeddings)
+        doc["content"] = (
+            f"Schema: {schema}\n"
+            f"Table: {table}\n"
+            f"Column: {col}\n"
+            f"Business Name: {doc['business_name']}\n"
+            f"Description: {doc['business_description']}\n"
+            f"Data Type: {doc['data_type']}\n"
+            f"PII: {doc['pii']} PCI: {doc['pci']}\n"
+            f"Security: {doc['security_classification_candidate']}\n"
+            f"Allowed Values: {doc['allowed_values']}\n"
+            f"Notes: {doc['notes']}\n"
+        )
+        docs.append(doc)
+    return docs
 
-            # Wait until the row looks complete (has enough separators)
-            if buffer.count("|") < expected_cols - 1:
-                continue
+def build_table_docs(df: pd.DataFrame) -> list[dict]:
+    docs = []
+    for _, r in df.iterrows():
+        schema = r["SCHEMA_NAME"].strip()
+        table = r["TABLE_NAME"].strip()
+        if not (schema and table):
+            continue
 
-            # Split into exactly expected columns
-            parts = buffer.split("|", maxsplit=expected_cols - 1)
+        doc = {
+            "id": stable_id("table", schema, table),
+            "schema_name": schema,
+            "table_name": table,
+            "table_business_name": r.get("TABLE_BUSINESS_NAME", "").strip(),
+            "table_business_description": r.get("TABLE_BUSINESS_DESCRIPTION", "").strip(),
+            "grain": r.get("GRAIN", "").strip(),
+            "primary_keys": r.get("PRIMARY_KEYS", "").strip(),
+            "default_filters": r.get("DEFAULT_FILTERS", "").strip(),
+            "notes": r.get("NOTES", "").strip(),
+        }
+        doc["content"] = (
+            f"Schema: {schema}\n"
+            f"Table: {table}\n"
+            f"Business Name: {doc['table_business_name']}\n"
+            f"Description: {doc['table_business_description']}\n"
+            f"Grain: {doc['grain']}\n"
+            f"Primary Keys: {doc['primary_keys']}\n"
+            f"Default Filters: {doc['default_filters']}\n"
+            f"Notes: {doc['notes']}\n"
+        )
+        docs.append(doc)
+    return docs
 
-            if len(parts) == expected_cols:
-                tname = parts[table_idx]
-                if matches_any_pattern(tname, patterns, case_insensitive):
-                    yield tname, parts
+def build_rel_docs(df: pd.DataFrame) -> list[dict]:
+    docs = []
+    for _, r in df.iterrows():
+        fs = r["FROM_SCHEMA"].strip()
+        ft = r["FROM_TABLE"].strip()
+        ts = r["TO_SCHEMA"].strip()
+        tt = r["TO_TABLE"].strip()
+        if not (fs and ft and ts and tt):
+            continue
 
-            buffer = ""
+        doc = {
+            "id": stable_id("rel", fs, ft, "to", ts, tt),
+            "from_schema": fs,
+            "from_table": ft,
+            "to_schema": ts,
+            "to_table": tt,
+            "join_type": r.get("JOIN_TYPE", "").strip().upper(),
+            "join_keys": r.get("JOIN_KEYS", "").strip(),
+            "cardinality": r.get("CARDINALITY", "").strip(),
+            "relationship_description": r.get("RELATIONSHIP_DESCRIPTION", "").strip(),
+            "active": norm_yesno(r.get("ACTIVE", "Yes")),
+        }
+        doc["content"] = (
+            f"FROM {fs}.{ft}\n"
+            f"TO {ts}.{tt}\n"
+            f"JOIN_TYPE: {doc['join_type']}\n"
+            f"JOIN_KEYS: {doc['join_keys']}\n"
+            f"CARDINALITY: {doc['cardinality']}\n"
+            f"DESCRIPTION: {doc['relationship_description']}\n"
+        )
+        docs.append(doc)
+    return docs
 
-
-def sanitize_sheet_name(name: str) -> str:
-    """
-    Excel sheet rules: max 31 chars; cannot contain: : \ / ? * [ ]
-    """
-    bad = [":", "\\", "/", "?", "*", "[", "]"]
-    for ch in bad:
-        name = name.replace(ch, "_")
-    name = name.strip()
-    return (name[:31] if len(name) > 31 else name) or "Sheet"
-
+def write_jsonl(path: Path, docs: list[dict]):
+    with path.open("w", encoding="utf-8") as f:
+        for d in docs:
+            f.write(json.dumps(d, ensure_ascii=False) + "\n")
 
 def main():
-    # Read header once
-    with open(SRC, "r", encoding="utf-8", errors="replace") as f:
-        header_line = f.readline().rstrip("\r\n")
-    headers = header_line.split("|")
+    if not Path(EXCEL_PATH).exists():
+        raise FileNotFoundError(f"Excel not found: {EXCEL_PATH}")
 
-    # Collect rows by actual TABLE_NAME found in file
-    buckets: dict[str, list[list[str]]] = {}
+    field_df = read_sheet(EXCEL_PATH, "field")
+    validate_field_order(field_df)
+    require_cols(field_df, FIELD_BASE_COLUMNS_ORDERED, "field")
 
-    for tname, row in stream_filter_tables_contains(SRC, TARGET_TABLE_PATTERNS, CASE_INSENSITIVE):
-        buckets.setdefault(tname, []).append(row)
+    table_df = read_sheet(EXCEL_PATH, "table")
+    require_cols(table_df, TABLE_REQUIRED, "table")
 
-    if not buckets:
-        print(f"❌ No rows found where TABLE_NAME contains any of: {sorted(TARGET_TABLE_PATTERNS)}")
-        return
+    rel_df = read_sheet(EXCEL_PATH, "relationship")
+    require_cols(rel_df, REL_REQUIRED, "relationship")
 
-    OUT_XLSX.parent.mkdir(parents=True, exist_ok=True)
+    field_docs = build_field_docs(field_df)
+    table_docs = build_table_docs(table_df)
+    rel_docs = build_rel_docs(rel_df)
 
-    with pd.ExcelWriter(OUT_XLSX, engine="openpyxl") as writer:
-        if ONE_SHEET_PER_TABLE:
-            for tname, rows in sorted(buckets.items(), key=lambda x: x[0].lower()):
-                df = pd.DataFrame(rows, columns=headers)
+    write_jsonl(OUT_DIR / "field_docs.jsonl", field_docs)
+    write_jsonl(OUT_DIR / "table_docs.jsonl", table_docs)
+    write_jsonl(OUT_DIR / "relationship_docs.jsonl", rel_docs)
 
-                # Clean any leftover CR/LF chars in cells for nicer Excel display
-                df = df.replace({"\r": " ", "\n": " "}, regex=True)
-
-                sheet_base = sanitize_sheet_name(tname)
-
-                # Split large tables across multiple sheets if needed
-                if len(df) <= MAX_ROWS_PER_SHEET:
-                    df.to_excel(writer, sheet_name=sheet_base, index=False)
-                else:
-                    part = 1
-                    for start in range(0, len(df), MAX_ROWS_PER_SHEET):
-                        chunk = df.iloc[start:start + MAX_ROWS_PER_SHEET]
-                        sheet = sanitize_sheet_name(f"{sheet_base}_{part}")
-                        chunk.to_excel(writer, sheet_name=sheet, index=False)
-                        part += 1
-        else:
-            # Single combined sheet with all matched rows
-            all_rows = []
-            for _, rows in buckets.items():
-                all_rows.extend(rows)
-
-            df = pd.DataFrame(all_rows, columns=headers)
-            df = df.replace({"\r": " ", "\n": " "}, regex=True)
-
-            if len(df) <= MAX_ROWS_PER_SHEET:
-                df.to_excel(writer, sheet_name="Filtered", index=False)
-            else:
-                part = 1
-                for start in range(0, len(df), MAX_ROWS_PER_SHEET):
-                    chunk = df.iloc[start:start + MAX_ROWS_PER_SHEET]
-                    chunk.to_excel(writer, sheet_name=f"Filtered_{part}", index=False)
-                    part += 1
-
-    print("✅ Done")
-    print(f"✅ Output: {OUT_XLSX}")
-    print("✅ Matched table names:")
-    for tname in sorted(buckets.keys(), key=str.lower):
-        print(f"  - {tname}: {len(buckets[tname]):,} rows")
-
+    print("✅ Build complete")
+    print(f"- field docs: {len(field_docs)} -> {OUT_DIR/'field_docs.jsonl'}")
+    print(f"- table docs: {len(table_docs)} -> {OUT_DIR/'table_docs.jsonl'}")
+    print(f"- rel docs:   {len(rel_docs)} -> {OUT_DIR/'relationship_docs.jsonl'}")
+    if field_docs:
+        print("\nSample field doc id:", field_docs[0]["id"])
+    if table_docs:
+        print("Sample table doc id:", table_docs[0]["id"])
+    if rel_docs:
+        print("Sample rel doc id:", rel_docs[0]["id"])
 
 if __name__ == "__main__":
     main()
