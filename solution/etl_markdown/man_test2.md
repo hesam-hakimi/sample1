@@ -1,28 +1,46 @@
-We now have:
-IndentationError: expected an indented block after 'try' statement on line 14
-File: scripts/load_excel_to_sqlite.py (error points at/near a sys.path.insert line)
+NEXT STEP: End-to-end CLI smoke test (SQLite)
 
-DO NOT add new features. Fix ONLY this syntax/indentation issue and keep the script runnable.
+Goal
+- Confirm the app can: (1) generate SQL for SQLite, (2) strip markdown/code fences, (3) execute successfully, (4) return rows.
 
-TASK
-1) Open scripts/load_excel_to_sqlite.py and fix indentation so it parses.
-2) There must be exactly ONE sys.path.insert block, and it must be:
-   - at the very top of the file (module level)
-   - NOT inside any try/except, function, or class
-3) Remove any stray/duplicate sys.path.insert lines elsewhere in the file.
-4) Ensure any `try:` has a properly indented body (or remove the try if it’s not needed).
-5) After fixing, run:
-   PYTHONUNBUFFERED=1 /app1/tag5916/projects/text2sql_v2/.venv/bin/python -m py_compile scripts/load_excel_to_sqlite.py
-   (this must succeed)
-6) Then run:
-   PYTHONUNBUFFERED=1 /app1/tag5916/projects/text2sql_v2/.venv/bin/python -u scripts/load_excel_to_sqlite.py
-7) Paste the full output.
+Pre-check (must show evidence)
+1) Verify SQLite DB exists and tables are present.
+   Run ONE of these (whichever is available):
 
-Implementation guidance (minimal + safe):
-- Put these imports first: `import os, sys`
-- Immediately after, add sys.path insert once:
-  sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-- Then all other imports.
-- Then main()/if __name__ guard as previously planned.
+   Option A (sqlite3 CLI):
+     sqlite3 local_data.db ".tables"
 
-Now do steps 1–7 and paste results.
+   Option B (python):
+     /app1/tag5916/projects/text2sql_v2/.venv/bin/python -c "
+     import sqlite3;
+     con=sqlite3.connect('local_data.db');
+     print(con.execute(\"select name from sqlite_master where type='table' order by 1\").fetchall());
+     "
+
+2) Confirm these tables exist (exact names):
+   v_dlv_dep_agmt_clr
+   v_dlv_dep_prty_agmt
+   v_dlv_dep_prty_clr
+   v_dlv_dep_tran
+
+Run end-to-end CLI tests (paste full outputs)
+3) Run:
+   PYTHONUNBUFFERED=1 /app1/tag5916/projects/text2sql_v2/.venv/bin/python -m app.main_cli "show me 10 rows from v_dlv_dep_prty_clr"
+
+4) Run:
+   PYTHONUNBUFFERED=1 /app1/tag5916/projects/text2sql_v2/.venv/bin/python -m app.main_cli "show me the list of all clients who are based in usa"
+
+What to capture
+- For each run: generated SQL (after sanitization), and execution result (rows or summary).
+- If it fails: paste full stack trace.
+
+Important fix rule (only if you see this error)
+- If SQLite fails with:
+    sqlite3.OperationalError: near "```": syntax error
+  then update ONLY the SQL extraction/sanitization in LLMService so that:
+  - removes triple backticks and optional language tags like ```sql
+  - removes any leading/trailing backticks
+  - returns plain SQL only (no markdown)
+  After patching, re-run steps 3 and 4 and paste outputs.
+
+Do NOT add new features. Only patch what is needed for the smoke test to pass.
