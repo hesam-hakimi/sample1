@@ -1,283 +1,409 @@
-# Prompt for Copilot/Codex: Build a Chat-First Text2SQL UI with Streaming Agent Logs (Streamlit)
+# TD‑Themed Text‑to‑SQL UI (Streamlit) — Copilot Build Spec (No implementation code)
 
-## Context
-You are working in the repo `text2sql_v2`. There is already:
-- A CLI that can translate a user question into SQL, execute it, and print results.
-- App code under `app/` including `app/core/orchestrator_facade.py` (used by the Streamlit UI).
-- A Streamlit UI file at `app/ui/streamlit_app.py` (currently not matching requirements).
-
-Your task: **Refactor / rebuild the Streamlit UI to be a true chat interface** where the **user and agent collaborate**. The UI must show:
-- A **chat transcript** (user + assistant messages)
-- A **streaming “activity log”** (progress updates like: “Deciding if search is needed…”, “Fetching from AI Search…”, “Reviewing table schema…”, “Generating SQL…”, “Executing SQL…”, “Summarizing results…”)
-- The final assistant response must be produced by the LLM using the **SQL result data** (and optionally AI Search context) and be displayed in the chat.
-
-> IMPORTANT: Do **NOT** invent new product features or UX beyond what’s written here. Do **NOT** redesign branding. Keep it clean, TD-like (white + green), but minimal. Your job is **implementation**, not product design.
-
----
-
-## Non-negotiable behavior requirements
-
-### 1) Chat-first collaboration
-- The primary experience is a chat:
-  - User types a message.
-  - Agent replies in chat.
-  - If the agent needs more info (missing table, ambiguous request), it asks follow-up questions in chat.
-- The assistant message must include:
-  - **Natural language answer**
-  - **Generated SQL** (optional toggle)
-  - **Result preview** (table/grid)
-  - **Citations to data sources** (e.g., “SQL result”, “AI Search context”) in plain text
-
-### 2) Streaming activity log (NOT chain-of-thought)
-- Show a **streaming progress log** in the UI as the agent works.
-- Do **NOT** expose raw chain-of-thought. Instead, expose **structured progress events**.
-- Example events:
-  - “Intent check: does this need AI Search?”
-  - “AI Search: retrieving relevant docs…”
-  - “Schema inspection: reading columns for v_dlv_dep_prty_clr…”
-  - “SQL generation: drafting query…”
-  - “SQL execution: running query (limit=50)…”
-  - “Post-processing: formatting results…”
-  - “LLM answer: summarizing output…”
-
-### 3) Decide when AI Search is needed
-- Some questions are pure SQL; some are not.
-- Implement a deterministic **decision step**:
-  - If question references policies/definitions/business meaning/documentation, or asks “what does X mean”, prefer AI Search.
-  - If question is a direct data retrieval request (“show top 10…”, “count…”, “group by…”), AI Search usually not needed.
-- The UI must show the decision and rationale in the activity log.
-
-### 4) SQL results must go back to the LLM
-- After SQL execution, the **dataset (rows + columns)** must be fed back into the LLM to generate the assistant’s final answer in chat.
-- The user should see the assistant’s answer in chat, not just the raw table.
-
-### 5) Strict structure: classes + methods
-You must implement the following exact **public** structures (names, methods). You can add internal helpers, but do not rename these.
+> **Purpose:** This doc is meant to be pasted into **GitHub Copilot Chat** inside the repo so it can implement the UI step‑by‑step.
+>
+> **Constraints you gave:**
+> - **TD theme:** white + TD green, clean cards, TD logo.
+> - **Interactive chat UI** where the **LLM decides** whether to query **Azure AI Search** (metadata) and/or run **SQL** (SQLite now; Oracle later).
+> - **Clarifying questions** when user intent/metadata is unclear.
+> - **Streaming logs** visible to the user (thought process + tool steps).
+> - **Keyboard shortcut** to submit (and generally modern UX).
+> - **No Hugging Face** / external downloads; keep dependencies minimal.
+> - **Managed Identity auth** (same method as earlier backend).
+> - **Debug panel** exists but must be **disabled unless DEBUG=true**.
 
 ---
 
-## Required Python structures
+## 1) Pick the UI framework (decision)
 
-Create/ensure these modules exist:
+Use **Streamlit** for maximum flexibility and fastest TD‑themed UI iteration.
 
-### A) `app/core/chat_models.py`
-Implement:
+---
+
+## 2) Target UX (what the user sees)
+
+### Layout
+- **Header bar** (TD green accents)
+  - TD logo (left)
+  - App name (e.g., “Text2SQL (POC)”) (center)
+  - Debug toggle (right) visible only when `DEBUG=true`
+- **Main area**
+  - **Chat transcript** (assistant + user bubbles)
+  - **Chat input** at bottom (Enter submits)
+- **Right sidebar (collapsible)**
+  - **Data source controls**
+    - “Execution target”: SQLite (now), Oracle (later, placeholder)
+    - “Max rows” default 50, adjustable
+  - **Indexes**
+    - show the index names (meta_data_field/meta_data_table/meta_data_relationship)
+    - show “Refresh metadata” button (calls existing indexing flow later)
+  - **Session controls**
+    - Clear chat
+    - Download conversation/logs (JSONL)
+- **Below assistant message (per answer)**
+  - Card 1: **SQL** (expandable)
+  - Card 2: **Results grid** (st.dataframe)
+  - Card 3: **Explanation** (short, business‑friendly)
+  - Card 4 (debug only): **Trace / Logs stream** (live during run)
+
+### Streaming logs (must)
+While the assistant is working, show a live “Trace” stream with events like:
+- `Intent detected: ...`
+- `Need metadata? yes -> searching meta_data_*`
+- `Building prompt`
+- `Generated SQL`
+- `Sanitizing SQL`
+- `Validating SQL syntax`
+- `Executing SQL`
+- `Rows returned: N`
+- `0 rows fallback triggered`
+- `Clarifying question needed: ...`
+
+### Clarification behavior
+If the orchestrator is not confident / missing info:
+- Assistant asks a **single clear question** (not multiple).
+- Provide **choices** when possible (chips or numbered options).
+- Do **not** hallucinate table/columns if not found in metadata.
+
+### Keyboard shortcuts
+- **Enter** submits (Streamlit `st.chat_input` default behavior).
+- Optional: **Ctrl+Enter** submit if you choose a multi-line input (only if you implement a safe component; otherwise skip).
+
+---
+
+## 3) Minimal dependencies (keep it TD‑friendly)
+
+Add to `requirements.txt` (only if missing):
+- `streamlit`
+- (already used) `python-dotenv`
+- (already used) `azure-identity`
+- (already used) `azure-search-documents`
+- (already used) `pandas` (for displaying results)
+
+**Do NOT** add heavy “agentic” libs unless explicitly approved.
+
+---
+
+## 4) File/Folder structure (create these)
+
+Create this UI package layout:
+
+```
+app/
+  ui/
+    __init__.py
+    streamlit_app.py          # entry point: `streamlit run app/ui/streamlit_app.py`
+    theme.py                  # TD theme + CSS
+    state.py                  # session state helpers
+    models.py                 # UI dataclasses (ChatMessage, LogEvent, etc.)
+    orchestrator_client.py    # thin adapter to existing backend orchestrator
+    components/
+      __init__.py
+      chat.py                 # chat rendering helpers
+      trace.py                # streaming log panel
+      results.py              # sql + grid cards
+assets/
+  td_logo.png                 # add TD logo image
+```
+
+Also add:
+- `.streamlit/config.toml` (optional) for base theme settings (keep minimal)
+
+---
+
+## 5) Environment variables (standardize names)
+
+**UI reads config only via `app.core.config.load_config()`** (your repo already has this).  
+Ensure the UI does not invent new env names.
+
+Expected (based on your earlier config loader fixes):
+- `SEARCH_ENDPOINT`
+- `OPENAI_ENDPOINT`
+- `OPENAI_API_VERSION`
+- `OPENAI_DEPLOYMENT`
+- `SQLITE_PATH` (e.g., `local_data.db`)
+- `MAX_SEARCH_DOCS` (default 50; UI overrides per user input)
+- `MAX_RETRIES` (default 5)
+- `DEBUG` (`true/false`)
+- `SEND_RESULT_TO_GPT` (optional)
+
+> **Important:** The UI should **not** require secrets in `.env` if using Managed Identity; it should only need endpoints + deployment names.
+
+---
+
+## 6) Data flow (high-level)
+
+**UI**  
+→ calls **OrchestratorClient.run_turn(user_text, chat_history, ui_options, event_cb)**  
+→ orchestrator decides:
+- metadata search (Azure AI Search)
+- SQL generation (Azure OpenAI)
+- SQL sanitize/validate
+- execute SQL (SQLite now)
+- post-processing: 0‑rows fallback, clarification question
+
+**UI renders**
+- live trace events (from `event_cb`)
+- final assistant message + SQL + results grid
+
+---
+
+## 7) Required classes & method signatures (Copilot MUST follow these)
+
+> **Note:** Only signatures + responsibilities. Copilot will implement the bodies.
+
+### 7.1 `app/ui/models.py`
 
 ```python
-from __future__ import annotations
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Optional, Dict, List
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Literal
 
-class Role(str, Enum):
-    USER = "user"
-    ASSISTANT = "assistant"
-    SYSTEM = "system"
-
-class EventType(str, Enum):
-    INFO = "info"
-    WARNING = "warning"
-    ERROR = "error"
-    STEP = "step"
+Role = Literal["user", "assistant", "system"]
+EventType = Literal[
+    "intent",
+    "tool_call",
+    "tool_result",
+    "prompt_build",
+    "sql_generated",
+    "sql_sanitized",
+    "sql_validated",
+    "sql_executing",
+    "sql_result",
+    "fallback_0_rows",
+    "clarification",
+    "error",
+    "info",
+]
 
 @dataclass
 class ChatMessage:
     role: Role
     content: str
-    meta: Dict[str, Any] = field(default_factory=dict)
+    ts_iso: str  # ISO timestamp string
 
 @dataclass
-class ActivityEvent:
+class LogEvent:
     type: EventType
     message: str
-    meta: Dict[str, Any] = field(default_factory=dict)
+    ts_iso: str  # ISO timestamp string
+    data: Optional[Dict[str, Any]] = None
 
 @dataclass
-class SqlResultPayload:
-    sql: str
-    columns: List[str]
-    rows: List[List[Any]]
-    row_count: int
-    elapsed_ms: Optional[float] = None
-
-@dataclass
-class SearchPayload:
-    used: bool
-    query: str
-    snippets: List[str] = field(default_factory=list)
-
-@dataclass
-class OrchestrationResult:
-    assistant_message: ChatMessage
-    generated_sql: Optional[str] = None
-    sql_result: Optional[SqlResultPayload] = None
-    search: Optional[SearchPayload] = None
-    events: List[ActivityEvent] = field(default_factory=list)
+class UIOptions:
+    max_rows: int
+    execution_target: Literal["sqlite", "oracle"]  # oracle placeholder
+    debug_enabled: bool
 ```
 
-### B) `app/core/activity_stream.py`
-Implement:
+### 7.2 `app/ui/state.py`
 
 ```python
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Callable, List, Optional
-from app.core.chat_models import ActivityEvent, EventType
+from typing import List
+from .models import ChatMessage, LogEvent, UIOptions
 
-EventSink = Callable[[ActivityEvent], None]
+def init_session_state() -> None:
+    """Initialize Streamlit session state keys if missing."""
 
-@dataclass
-class ActivityStreamer:
-    sink: EventSink
+def get_chat_history() -> List[ChatMessage]:
+    """Return chat history from session state."""
 
-    def step(self, msg: str, **meta) -> None:
-        self.sink(ActivityEvent(type=EventType.STEP, message=msg, meta=dict(meta)))
+def append_chat_message(msg: ChatMessage) -> None:
+    """Append message to chat history in session state."""
 
-    def info(self, msg: str, **meta) -> None:
-        self.sink(ActivityEvent(type=EventType.INFO, message=msg, meta=dict(meta)))
+def clear_chat() -> None:
+    """Clear chat + trace in session state."""
 
-    def warn(self, msg: str, **meta) -> None:
-        self.sink(ActivityEvent(type=EventType.WARNING, message=msg, meta=dict(meta)))
+def get_trace_events() -> List[LogEvent]:
+    """Return trace events in session state."""
 
-    def error(self, msg: str, **meta) -> None:
-        self.sink(ActivityEvent(type=EventType.ERROR, message=msg, meta=dict(meta)))
+def append_trace_event(ev: LogEvent) -> None:
+    """Append a trace event to session state."""
+
+def get_ui_options() -> UIOptions:
+    """Return UIOptions based on sidebar controls and DEBUG flag."""
 ```
 
-### C) `app/core/search_decider.py`
-Implement:
+### 7.3 `app/ui/theme.py`
 
 ```python
-from __future__ import annotations
-from dataclasses import dataclass
-
-@dataclass(frozen=True)
-class SearchDecision:
-    use_search: bool
-    reason: str
-
-def decide_use_search(user_question: str) -> SearchDecision:
-    """Deterministic heuristics (no LLM) to decide whether AI Search should be used."""
-    ...
+def inject_td_theme() -> None:
+    """
+    Inject TD-styled CSS:
+    - white background
+    - TD green accents
+    - clean rounded cards
+    - better spacing/typography
+    """
 ```
 
-Rules:
-- Must be deterministic (regex/keyword rules OK)
-- Return `reason` suitable for showing in UI.
-
-### D) `app/core/orchestrator_facade.py`
-Expose **this exact function signature**:
+### 7.4 `app/ui/components/chat.py`
 
 ```python
-from __future__ import annotations
+from typing import List
+from ..models import ChatMessage
+
+def render_header() -> None:
+    """Render TD header with logo + title + debug indicator (if enabled)."""
+
+def render_chat_history(messages: List[ChatMessage]) -> None:
+    """Render chat bubbles using Streamlit chat components."""
+
+def chat_input_box() -> str | None:
+    """
+    Render the input box.
+    Return user text when submitted, else None.
+    Use st.chat_input for Enter-to-submit.
+    """
+```
+
+### 7.5 `app/ui/components/trace.py`
+
+```python
+from typing import List
+from ..models import LogEvent
+
+def render_trace_panel(events: List[LogEvent], enabled: bool) -> None:
+    """
+    If enabled:
+      - show a scrollable card with newest events at bottom
+    Else:
+      - show nothing (no empty space)
+    """
+```
+
+### 7.6 `app/ui/components/results.py`
+
+```python
 from typing import Optional
-from app.core.chat_models import OrchestrationResult, ChatMessage
-from app.core.activity_stream import ActivityStreamer
+import pandas as pd
 
-def run_chat_turn(
-    *,
-    user_message: ChatMessage,
-    result_limit: int,
-    show_sql: bool,
-    streamer: ActivityStreamer,
-) -> OrchestrationResult:
-    """Runs exactly one chat turn end-to-end and returns a structured result."""
-    ...
+def render_sql_card(sql: Optional[str]) -> None:
+    """Expandable card showing SQL (monospace)."""
+
+def render_results_grid(df: Optional[pd.DataFrame]) -> None:
+    """Show results in a modern grid (st.dataframe) with reasonable height."""
+
+def render_explanation(text: Optional[str]) -> None:
+    """Short explanation card (keep business-friendly)."""
+
+def render_error_card(err: str, debug_details: Optional[str], debug_enabled: bool) -> None:
+    """User-friendly error + debug stack trace in expander when debug enabled."""
 ```
 
-Inside `run_chat_turn`, implement these phases and emit events:
-1. `decide_use_search`
-2. If search: call existing AI Search client (whatever already exists in repo) and collect snippets
-3. Schema inspection (if available): column list for target table(s) (reuse existing code you already have)
-4. SQL generation (LLM call or existing generator)
-5. SQL execution (existing SQLService)
-6. LLM “final answer” generation using:
-   - original question
-   - generated SQL
-   - sql result rows/columns (truncated safely)
-   - search snippets (if any)
-7. Return `OrchestrationResult` with assistant message and payloads
+### 7.7 `app/ui/orchestrator_client.py` (thin adapter)
 
-> Do not remove existing CLI logic. Reuse it where possible.
+```python
+from typing import Callable, List, Optional
+import pandas as pd
+from .models import ChatMessage, LogEvent, UIOptions
 
----
+TraceCallback = Callable[[LogEvent], None]
 
-## Streamlit UI Requirements (`app/ui/streamlit_app.py`)
+class OrchestratorClient:
+    def __init__(self) -> None:
+        """Wire to existing app modules (config, orchestrator, sql service, search service)."""
 
-### Layout
-- Left/top: App header (small TD logo if valid, otherwise fallback “TD” badge)
-- Main: Chat transcript (like ChatGPT)
-- Under/side: **Activity log** panel that updates during execution
-- Below assistant message: optional SQL + results table with pagination/limit
+    def run_turn(
+        self,
+        user_text: str,
+        history: List[ChatMessage],
+        options: UIOptions,
+        trace_cb: Optional[TraceCallback] = None,
+    ) -> "UIRunResult":
+        """
+        Run one user turn end-to-end.
+        Must emit LogEvent via trace_cb at each major step.
+        Must never raise raw exceptions to UI; return them in result.
+        """
 
-### Chat mechanics
-- Use `st.session_state` to store:
-  - `messages: list[ChatMessage]`
-  - `events: list[ActivityEvent]` (only for current turn or rolling)
-- Use `st.chat_input` for message input.
-- When user submits:
-  - Append user message
-  - Clear events
-  - Create `ActivityStreamer` whose sink appends to session_state AND renders into a placeholder
-  - Call `run_chat_turn(...)`
-  - Append assistant message
-  - Render results table (if any)
+class UIRunResult:
+    """
+    Keep this as a simple container (dataclass recommended).
+    Fields must include:
+      - assistant_message: str
+      - sql: Optional[str]
+      - df: Optional[pd.DataFrame]
+      - clarification_question: Optional[str]
+      - error_message: Optional[str]
+      - debug_details: Optional[str]
+    """
+```
 
-### Result rendering
-- Use `st.dataframe` for results with `height` set and `use_container_width=True` (or Streamlit modern equivalent)
-- Truncate very large results:
-  - max rows displayed = `result_limit`
-  - max columns displayed = all columns, but allow horizontal scroll
-- Do not crash if no rows: show a helpful assistant message + keep log.
-
-### Reliability / no import errors
-- Fix `ModuleNotFoundError: No module named 'app'` by ensuring project root is on `sys.path` **at the top** of `streamlit_app.py`:
-  - Detect repo root relative to this file and insert it into `sys.path` before importing `app.*`
-- Do not add fragile absolute paths.
+> **Important integration rule:** OrchestratorClient should reuse your already-built backend logic instead of re-implementing tool calls in UI.
 
 ---
 
-## Acceptance Criteria (must pass)
-1. Running:
-   - `python -m compileall app/ui/streamlit_app.py`
-   - `.venv/bin/streamlit run app/ui/streamlit_app.py`
-   must work without exceptions.
-2. UI shows:
-   - Chat transcript
-   - Streaming activity log during run
-3. A SQL question (e.g., “show me 10 rows from v_dlv_dep_prty_clr”) produces:
-   - Generated SQL
-   - Result grid
-   - Assistant natural language summary in chat that uses the result
-4. A non-SQL “definition/policy” question triggers:
-   - AI Search usage decision = TRUE
-   - Activity log includes “Fetching from AI Search…”
-5. Code is clean, typed, and minimal.
+## 8) Streaming logs contract (how to emit trace)
+
+In `OrchestratorClient.run_turn`, emit events like:
+
+- `trace_cb(LogEvent(type="intent", message="Intent detected: ...", ...))`
+- `trace_cb(LogEvent(type="tool_call", message="Searching metadata index meta_data_table", data={...}))`
+- `trace_cb(LogEvent(type="tool_result", message="Found 3 candidate tables", data={...}))`
+- `trace_cb(LogEvent(type="sql_generated", message="Generated SQL", data={"sql": "..."}))`
+- `trace_cb(LogEvent(type="sql_executing", message="Executing SQL against SQLite", ...))`
+
+UI will append them into session state and re-render the trace panel during execution.
 
 ---
 
-## Implementation instructions (do this in order)
-1. Create `app/core/chat_models.py`, `activity_stream.py`, `search_decider.py`
-2. Refactor `app/core/orchestrator_facade.py` to implement `run_chat_turn(...)` while reusing existing code
-3. Refactor `app/ui/streamlit_app.py` to:
-   - bootstrap sys.path
-   - implement chat UI + activity log
-   - call `run_chat_turn`
-4. Add lightweight unit tests (if repo has pytest):
-   - test `decide_use_search` behavior with 6–8 examples
-5. Provide a short summary of files changed
+## 9) UI entrypoint behavior (`app/ui/streamlit_app.py`)
+
+**Must do:**
+1) `inject_td_theme()`
+2) `init_session_state()`
+3) Render header + sidebar controls
+4) Render chat history
+5) Read `user_text = chat_input_box()`
+6) If user_text submitted:
+   - Append user message
+   - Create a placeholder for assistant response (spinner)
+   - Call `OrchestratorClient.run_turn(..., trace_cb=append_trace_event)`
+   - Append assistant message (or clarification question)
+   - Render SQL/results/explanation cards
+   - If error: render error card
+
+**Debug mode:**
+- `debug_enabled = (DEBUG env is true) AND (user toggled debug ON)`
+- If not debug mode: do not show trace panel, and do not show stack traces.
 
 ---
 
-## Guardrails
-- Do NOT add external heavy frameworks.
-- Do NOT add a new UI framework; use Streamlit only.
-- Do NOT hardcode credentials.
-- Do NOT output chain-of-thought; only progress events.
-- Keep the UI minimal and functional.
+## 10) Acceptance criteria (definition of done)
+
+- UI starts with: `streamlit run app/ui/streamlit_app.py`
+- TD theme applied (white + green + logo)
+- Chat works end-to-end with your orchestrator
+- Logs stream shows step-by-step events while running (debug only)
+- Results show as grid + SQL expander
+- Clarifying question is displayed instead of hallucinated answers
+- Keyboard submit works (Enter)
+- No secrets committed; `.env` stays in `.gitignore`
 
 ---
 
-## Deliverables
-- Updated/created Python files implementing the required structures.
-- Updated Streamlit UI matching the requirements.
-- Tests for `decide_use_search`.
+## 11) Copilot execution steps (what Copilot should do now)
+
+1) Create the folder/files in section 4.
+2) Implement the class signatures exactly as in section 7.
+3) Implement Streamlit UI rendering per section 9.
+4) Wire `OrchestratorClient` to existing backend modules:
+   - config loader
+   - LLM SQL generation
+   - Azure AI Search metadata lookup
+   - SQL sanitize/validate/execute
+   - 0‑rows fallback + clarification flows
+5) Add minimal CSS in `theme.py` for TD look.
+6) Provide a short README snippet with the run command.
+
+**After implementation**, Copilot must run:
+- `python -m app.main_cli "show me 10 rows from v_dlv_dep_prty_clr"` (backend sanity)
+- `streamlit run app/ui/streamlit_app.py` (UI sanity)
+
+---
+
+## 12) Questions to answer ONLY if blocked (single question max)
+If Copilot needs clarification, ask ONLY one:
+- “Do you want the trace panel on the right sidebar or below the chat?”
+
+(If not blocked, proceed with “below chat in debug mode”.)
