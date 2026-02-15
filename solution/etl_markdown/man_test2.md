@@ -1,200 +1,190 @@
-# Prompt for Copilot/Codex: Fix failing pytest `test_get_ui_options_returns_instance`
+# Prompt: Fix Streamlit crash — `NameError: name 'OrchestratorClient' is not defined` (and validate type-hint safety)
 
-## Context
-You are working in repo `text2sql_v2`. Running tests shows **one failing test**:
+You are working in repo **text2sql_v2**. The Streamlit UI crashes at import time with:
 
-- `app/ui/test_state.py::test_get_ui_options_returns_instance`
-- Failure symptom: when the test sets `st.session_state["max_rows"] = 77` (and other keys), `get_ui_options()` still returns defaults (e.g., `max_rows=50`), so the assertion `assert options.max_rows == 77` fails.
+- `NameError: name 'OrchestratorClient' is not defined`
+- Trace points to: `app/ui/streamlit_app.py`, around the function signature:
+  - `def render_chat_main(orchestrator: OrchestratorClient) -> None:`
 
-This indicates `get_ui_options()` is **not reading Streamlit session state correctly** (common causes: importing `session_state` directly, caching a reference, or always returning `DEFAULT_UI_OPTIONS`).
+This happens because **Python evaluates annotations at function definition time** (unless postponed), and `OrchestratorClient` is **not in scope** at that moment (it’s imported only inside `main()` or later).
 
-## Goal
-Make **all tests pass** (`pytest -q`), specifically:
-- `get_ui_options()` must return a **UIOptions instance**
-- It must honor **valid values** from `st.session_state`
-- It must **sanitize invalid values** (fall back to defaults)
-- It must be compatible with monkeypatching in tests
+Your job:
+1) Fix the crash in a **clean, production-grade** way.
+2) Validate that **no other file** has the same “runtime-evaluated type hint” problem.
+3) Keep runtime imports minimal (avoid circular import traps).
+4) Run tests + a Streamlit smoke run to confirm.
 
-## Non-negotiable API / Signatures (do not change)
-Keep these names and signatures as-is (because UI + tests depend on them):
+---
 
-### `app/ui/models.py`
-```py
-@dataclass(frozen=True)
-class UIOptions:
-    max_rows: int
-    execution_target: Literal["sqlite", "oracle"]  # oracle is placeholder
-    debug_enabled: bool
+## Constraints
+
+- **Do not** change public behavior of the app.
+- **Do not** remove useful typing; make it safe.
+- Keep existing architecture (SearchDecider / OrchestratorFacade / ActivityStream etc.) intact.
+- Prefer changes that prevent this class of error from recurring.
+
+---
+
+## Step 1 — Fix `OrchestratorClient` NameError in `app/ui/streamlit_app.py`
+
+### Option A (preferred): Postpone evaluation of all annotations in the module
+
+1) Edit `app/ui/streamlit_app.py`
+2) Ensure the very first import is:
+
+```python
+from __future__ import annotations
 ```
 
-### `app/ui/state.py`
-```py
-DEFAULT_UI_OPTIONS: UIOptions
+> It must appear at the top of the file (after an optional module docstring, before other imports).
 
-def get_ui_options() -> UIOptions:
+3) Keep `OrchestratorClient` imported where you want it at runtime (it can remain inside `main()`), but **typing will now be safe**.
+
+### Option B: Use `TYPE_CHECKING` + forward reference string (also good)
+
+If you don’t want `__future__` for some reason, then:
+
+1) At the top of `app/ui/streamlit_app.py`, add:
+
+```python
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.ui.orchestrator_client import OrchestratorClient
+```
+
+2) Change the function signature to a string annotation:
+
+```python
+def render_chat_main(orchestrator: "OrchestratorClient") -> None:
     ...
 ```
 
-> You may add helper functions in `state.py`, but do **not** change the public signatures above.
+This avoids importing `OrchestratorClient` at import time and prevents runtime NameError.
+
+✅ Either Option A or B is acceptable. **Option A is simpler and prevents future similar issues in this file.**
 
 ---
 
-## Root cause to fix
-The test does:
-```py
-monkeypatch.setattr(st, "session_state", {})
-st.session_state["max_rows"] = 77
-...
-options = get_ui_options()
-assert options.max_rows == 77
-```
-This will only work if `get_ui_options()` reads **`streamlit.session_state` dynamically via `import streamlit as st`**.
+## Step 2 — Confirm the runtime import plan is correct
 
-If `state.py` does any of these, the monkeypatch won’t work and the test will fail:
-- `from streamlit import session_state` (captures reference)
-- `from streamlit.runtime.state import SessionState` (captures implementation)
-- caching `session_state` into a module global
-- returning `DEFAULT_UI_OPTIONS` without checking session state
+In `app/ui/streamlit_app.py` ensure:
 
----
+- `OrchestratorClient` (or facade client) is instantiated **inside** `main()`:
 
-## Required implementation behavior
-### 1) Always import streamlit as a module (important for monkeypatch)
-In `app/ui/state.py` (module scope):
-```py
-import streamlit as st
+```python
+from app.ui.orchestrator_client import OrchestratorClient
+orchestrator = OrchestratorClient()
 ```
 
-### 2) `get_ui_options()` must:
-- Read `st.session_state` safely (even if empty or missing)
-- Look for these keys (exact names):
-  - `"max_rows"` → int
-  - `"execution_target"` → `"sqlite"` or `"oracle"`
-  - `"debug_enabled"` → bool
-- Validate/sanitize:
-  - `max_rows` must be `int` and **> 0** (you can also enforce an upper bound like 500/1000 if you want)
-  - `execution_target` must be allowed
-  - `debug_enabled` must be bool
-- If invalid/missing, fall back to `DEFAULT_UI_OPTIONS.<field>`
-- Return a new `UIOptions(...)` instance
-
-### 3) Optional but recommended
-Write sanitized values back into `st.session_state` so the UI stays consistent. This won’t break tests.
+- `render_chat_main(orchestrator)` is called after that.
+- No module-level code executes `OrchestratorClient()` on import.
 
 ---
 
-## Exact patch to implement (copy/paste friendly)
-Open `app/ui/state.py` and ensure you have something like this (adapt only if your file already has overlapping helpers):
+## Step 3 — Validate other modules for the same problem
 
-```py
-from __future__ import annotations
+Search the repo for type hints that reference names **not imported in that module**.
 
-from typing import Any, Optional
-import streamlit as st
+Run these searches (or equivalent):
 
-from app.ui.models import UIOptions
+- Look for annotations referencing OrchestratorClient:
+  - `OrchestratorClient`
+- More generally search for patterns like:
+  - `: SomeClass`
+  - `-> SomeClass`
+  - where `SomeClass` is not imported.
 
-DEFAULT_UI_OPTIONS = UIOptions(
-    max_rows=50,
-    execution_target="sqlite",
-    debug_enabled=False,
-)
+Checklist:
+1) Any file that has a function signature referencing a class **only imported inside a function** is a candidate for this NameError.
+2) Fix using one of:
+   - `from __future__ import annotations`
+   - `TYPE_CHECKING` + `"ForwardRef"`
+   - replace with a protocol/interface type (only if you already have one)
+   - `Any` as a last resort (avoid if possible)
 
-_ALLOWED_EXEC_TARGETS = {"sqlite", "oracle"}
-
-def _coerce_int(value: Any) -> Optional[int]:
-    if isinstance(value, bool):  # bool is int subclass, exclude it
-        return None
-    if isinstance(value, int):
-        return value
-    return None
-
-def _coerce_bool(value: Any) -> Optional[bool]:
-    if isinstance(value, bool):
-        return value
-    return None
-
-def _coerce_exec_target(value: Any) -> Optional[str]:
-    if isinstance(value, str) and value in _ALLOWED_EXEC_TARGETS:
-        return value
-    return None
-
-def get_ui_options() -> UIOptions:
-    """Return UI options from Streamlit session state. Never returns None."""
-    ss = getattr(st, "session_state", None)
-    if ss is None:
-        ss = {}
-
-    # max_rows
-    raw_max_rows = ss.get("max_rows", DEFAULT_UI_OPTIONS.max_rows) if hasattr(ss, "get") else DEFAULT_UI_OPTIONS.max_rows
-    max_rows = _coerce_int(raw_max_rows)
-    if max_rows is None or max_rows <= 0:
-        max_rows = DEFAULT_UI_OPTIONS.max_rows
-
-    # execution_target
-    raw_target = ss.get("execution_target", DEFAULT_UI_OPTIONS.execution_target) if hasattr(ss, "get") else DEFAULT_UI_OPTIONS.execution_target
-    execution_target = _coerce_exec_target(raw_target) or DEFAULT_UI_OPTIONS.execution_target
-
-    # debug_enabled
-    raw_debug = ss.get("debug_enabled", DEFAULT_UI_OPTIONS.debug_enabled) if hasattr(ss, "get") else DEFAULT_UI_OPTIONS.debug_enabled
-    debug_enabled = _coerce_bool(raw_debug)
-    if debug_enabled is None:
-        debug_enabled = DEFAULT_UI_OPTIONS.debug_enabled
-
-    options = UIOptions(
-        max_rows=max_rows,
-        execution_target=execution_target,  # type: ignore[arg-type] if Literal complains
-        debug_enabled=debug_enabled,
-    )
-
-    # Optional: persist sanitized values for the UI
-    try:
-        st.session_state["max_rows"] = options.max_rows
-        st.session_state["execution_target"] = options.execution_target
-        st.session_state["debug_enabled"] = options.debug_enabled
-    except Exception:
-        pass
-
-    return options
-```
-
-### Important notes
-- **Do not** use `from streamlit import session_state`
-- If you already have `DEFAULT_UI_OPTIONS` defined elsewhere, keep its values but ensure behavior matches the test.
-- If `UIOptions.execution_target` is a `Literal[...]`, you may need a small `# type: ignore[arg-type]` on assignment.
+**Apply the same safe pattern consistently** across `app/ui/*.py`.
 
 ---
 
-## Verification steps (must do)
-Run these commands and confirm results:
+## Step 4 — Add a guardrail (recommended)
+
+To prevent repeats, do this:
+
+- Add `from __future__ import annotations` to all UI modules that are Streamlit entrypoints or likely to have runtime imports (at least `app/ui/streamlit_app.py`, optionally others in `app/ui/`).
+
+This is safe in Python 3.11 and reduces annotation-related import-time failures.
+
+---
+
+## Step 5 — Verify with commands
+
+### 5.1 Unit tests
+Run:
 
 ```bash
-# 1) Run only failing test
-.venv/bin/pytest -q app/ui/test_state.py::test_get_ui_options_returns_instance
-
-# 2) Run full suite
 .venv/bin/pytest -q
 ```
 
-Expected:
-- `test_get_ui_options_returns_instance` passes
-- All tests pass (`0 failed`)
+All tests must pass.
 
----
+### 5.2 Streamlit smoke test
+Run:
 
-## If it still fails
-Do this investigation and fix accordingly (do not stop at guessing):
-1. Open `app/ui/test_state.py` and confirm the expected keys and values.
-2. Add temporary debug prints in `get_ui_options()` to log what it reads from session state (remove prints before final commit).
-3. Search for any `from streamlit import session_state` patterns:
-   ```bash
-   rg -n "from\s+streamlit\s+import\s+session_state|session_state\s*=|SessionState" app/ui
-   ```
-   Replace those usages with `import streamlit as st` + `st.session_state`.
+```bash
+.venv/bin/streamlit run app/ui/streamlit_app.py
+```
+
+Acceptance criteria:
+- App loads with no red traceback.
+- The “Text2SQL Chat” page renders.
+- Chat input works.
+- Activity log still updates.
 
 ---
 
 ## Deliverables
-- Updated `app/ui/state.py` (or the correct file where `get_ui_options()` lives)
-- All tests passing (`pytest -q`)
-- No signature changes to `UIOptions` or `get_ui_options()`
+
+When you implement the fix, provide:
+
+1) A short explanation of **why** the NameError happened (annotation evaluation) and what you changed.
+2) Exact code diff (or file patches) for `app/ui/streamlit_app.py`.
+3) List of any other files you updated for annotation safety.
+4) Proof steps you ran:
+   - pytest output summary
+   - Streamlit start confirmation (no crash)
+
+---
+
+## Quick expected patch (example)
+
+If using Option A, the top of `app/ui/streamlit_app.py` should look like:
+
+```python
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+import streamlit as st
+...
+```
+
+and you can keep:
+
+```python
+def render_chat_main(orchestrator: OrchestratorClient) -> None:
+    ...
+```
+
+because the annotation is now postponed.
+
+---
+
+## If anything is unclear
+
+If you need more context, request:
+- The **top 60 lines** of `app/ui/streamlit_app.py`
+- The `app/ui/orchestrator_client.py` class signature
+- Any other file where `OrchestratorClient` is used in type hints
+
+But do **not** guess. Confirm with the actual code.
