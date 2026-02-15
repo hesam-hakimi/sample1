@@ -1,11 +1,24 @@
-# TD‑Themed Text‑to‑SQL UI (Streamlit) — Copilot Build Spec (No implementation code)
+from pathlib import Path
 
-> **Purpose:** This doc is meant to be pasted into **GitHub Copilot Chat** inside the repo so it can implement the UI step‑by‑step.
+content = '''# TD-Themed Text-to-SQL UI (Streamlit) — Copilot Build Spec (No implementation code)
 
+> **Purpose:** This doc is meant to be pasted into **GitHub Copilot Chat** inside the repo so it can implement the UI step-by-step.
+>
+> **Constraints you gave:**
+> - **TD theme:** white + TD green, clean cards, TD logo.
+> - **Interactive chat UI** where the **LLM decides** whether to query **Azure AI Search** (metadata) and/or run **SQL** (SQLite now; Oracle later).
+> - **Clarifying questions** when user intent/metadata is unclear.
+> - **Streaming logs** visible to the user (thought process + tool steps).
+> - **Keyboard shortcut** to submit (and generally modern UX).
+> - **No Hugging Face** / external downloads; keep dependencies minimal.
+> - **Managed Identity auth** (same method as earlier backend).
+> - **Debug panel** exists but must be **disabled unless DEBUG=true**.
+
+---
 
 ## 1) Pick the UI framework (decision)
 
-Use **Streamlit** for maximum flexibility and fastest TD‑themed UI iteration.
+Use **Streamlit** for maximum flexibility and fastest TD-themed UI iteration.
 
 ---
 
@@ -32,7 +45,7 @@ Use **Streamlit** for maximum flexibility and fastest TD‑themed UI iteration.
 - **Below assistant message (per answer)**
   - Card 1: **SQL** (expandable)
   - Card 2: **Results grid** (st.dataframe)
-  - Card 3: **Explanation** (short, business‑friendly)
+  - Card 3: **Explanation** (short, business-friendly)
   - Card 4 (debug only): **Trace / Logs stream** (live during run)
 
 ### Streaming logs (must)
@@ -60,7 +73,7 @@ If the orchestrator is not confident / missing info:
 
 ---
 
-## 3) Minimal dependencies (keep it TD‑friendly)
+## 3) Minimal dependencies (keep it TD-friendly)
 
 Add to `requirements.txt` (only if missing):
 - `streamlit`
@@ -77,23 +90,24 @@ Add to `requirements.txt` (only if missing):
 
 Create this UI package layout:
 
-```
 app/
-  ui/
-    __init__.py
-    streamlit_app.py          # entry point: `streamlit run app/ui/streamlit_app.py`
-    theme.py                  # TD theme + CSS
-    state.py                  # session state helpers
-    models.py                 # UI dataclasses (ChatMessage, LogEvent, etc.)
-    orchestrator_client.py    # thin adapter to existing backend orchestrator
-    components/
-      __init__.py
-      chat.py                 # chat rendering helpers
-      trace.py                # streaming log panel
-      results.py              # sql + grid cards
+ui/
+init.py
+streamlit_app.py # entry point: streamlit run app/ui/streamlit_app.py
+theme.py # TD theme + CSS
+state.py # session state helpers
+models.py # UI dataclasses (ChatMessage, LogEvent, etc.)
+orchestrator_client.py # thin adapter to existing backend orchestrator
+components/
+init.py
+chat.py # chat rendering helpers
+trace.py # streaming log panel
+results.py # sql + grid cards
 assets/
-  td_logo.png                 # add TD logo image
-```
+td_logo.png # add TD logo image
+
+Always show details
+
 
 Also add:
 - `.streamlit/config.toml` (optional) for base theme settings (keep minimal)
@@ -129,7 +143,7 @@ Expected (based on your earlier config loader fixes):
 - SQL generation (Azure OpenAI)
 - SQL sanitize/validate
 - execute SQL (SQLite now)
-- post-processing: 0‑rows fallback, clarification question
+- post-processing: 0-rows fallback, clarification question
 
 **UI renders**
 - live trace events (from `event_cb`)
@@ -182,11 +196,9 @@ class UIOptions:
     max_rows: int
     execution_target: Literal["sqlite", "oracle"]  # oracle placeholder
     debug_enabled: bool
-```
+7.2 app/ui/state.py
+Always show details
 
-### 7.2 `app/ui/state.py`
-
-```python
 from typing import List
 from .models import ChatMessage, LogEvent, UIOptions
 
@@ -210,11 +222,9 @@ def append_trace_event(ev: LogEvent) -> None:
 
 def get_ui_options() -> UIOptions:
     """Return UIOptions based on sidebar controls and DEBUG flag."""
-```
+7.3 app/ui/theme.py
+Always show details
 
-### 7.3 `app/ui/theme.py`
-
-```python
 def inject_td_theme() -> None:
     """
     Inject TD-styled CSS:
@@ -223,11 +233,9 @@ def inject_td_theme() -> None:
     - clean rounded cards
     - better spacing/typography
     """
-```
+7.4 app/ui/components/chat.py
+Always show details
 
-### 7.4 `app/ui/components/chat.py`
-
-```python
 from typing import List
 from ..models import ChatMessage
 
@@ -243,11 +251,9 @@ def chat_input_box() -> str | None:
     Return user text when submitted, else None.
     Use st.chat_input for Enter-to-submit.
     """
-```
+7.5 app/ui/components/trace.py
+Always show details
 
-### 7.5 `app/ui/components/trace.py`
-
-```python
 from typing import List
 from ..models import LogEvent
 
@@ -258,11 +264,9 @@ def render_trace_panel(events: List[LogEvent], enabled: bool) -> None:
     Else:
       - show nothing (no empty space)
     """
-```
+7.6 app/ui/components/results.py
+Always show details
 
-### 7.6 `app/ui/components/results.py`
-
-```python
 from typing import Optional
 import pandas as pd
 
@@ -277,11 +281,9 @@ def render_explanation(text: Optional[str]) -> None:
 
 def render_error_card(err: str, debug_details: Optional[str], debug_enabled: bool) -> None:
     """User-friendly error + debug stack trace in expander when debug enabled."""
-```
+7.7 app/ui/orchestrator_client.py (thin adapter)
+Always show details
 
-### 7.7 `app/ui/orchestrator_client.py` (thin adapter)
-
-```python
 from typing import Callable, List, Optional
 import pandas as pd
 from .models import ChatMessage, LogEvent, UIOptions
@@ -316,83 +318,110 @@ class UIRunResult:
       - error_message: Optional[str]
       - debug_details: Optional[str]
     """
-```
+Important integration rule: OrchestratorClient should reuse your already-built backend logic instead of re-implementing tool calls in UI.
 
-> **Important integration rule:** OrchestratorClient should reuse your already-built backend logic instead of re-implementing tool calls in UI.
+8) Streaming logs contract (how to emit trace)
+In OrchestratorClient.run_turn, emit events like:
 
----
+trace_cb(LogEvent(type="intent", message="Intent detected: ...", ...))
 
-## 8) Streaming logs contract (how to emit trace)
+trace_cb(LogEvent(type="tool_call", message="Searching metadata index meta_data_table", data={...}))
 
-In `OrchestratorClient.run_turn`, emit events like:
+trace_cb(LogEvent(type="tool_result", message="Found 3 candidate tables", data={...}))
 
-- `trace_cb(LogEvent(type="intent", message="Intent detected: ...", ...))`
-- `trace_cb(LogEvent(type="tool_call", message="Searching metadata index meta_data_table", data={...}))`
-- `trace_cb(LogEvent(type="tool_result", message="Found 3 candidate tables", data={...}))`
-- `trace_cb(LogEvent(type="sql_generated", message="Generated SQL", data={"sql": "..."}))`
-- `trace_cb(LogEvent(type="sql_executing", message="Executing SQL against SQLite", ...))`
+trace_cb(LogEvent(type="sql_generated", message="Generated SQL", data={"sql": "..."}))
+
+trace_cb(LogEvent(type="sql_executing", message="Executing SQL against SQLite", ...))
 
 UI will append them into session state and re-render the trace panel during execution.
 
----
+9) UI entrypoint behavior (app/ui/streamlit_app.py)
+Must do:
 
-## 9) UI entrypoint behavior (`app/ui/streamlit_app.py`)
+inject_td_theme()
 
-**Must do:**
-1) `inject_td_theme()`
-2) `init_session_state()`
-3) Render header + sidebar controls
-4) Render chat history
-5) Read `user_text = chat_input_box()`
-6) If user_text submitted:
-   - Append user message
-   - Create a placeholder for assistant response (spinner)
-   - Call `OrchestratorClient.run_turn(..., trace_cb=append_trace_event)`
-   - Append assistant message (or clarification question)
-   - Render SQL/results/explanation cards
-   - If error: render error card
+init_session_state()
 
-**Debug mode:**
-- `debug_enabled = (DEBUG env is true) AND (user toggled debug ON)`
-- If not debug mode: do not show trace panel, and do not show stack traces.
+Render header + sidebar controls
 
----
+Render chat history
 
-## 10) Acceptance criteria (definition of done)
+Read user_text = chat_input_box()
 
-- UI starts with: `streamlit run app/ui/streamlit_app.py`
-- TD theme applied (white + green + logo)
-- Chat works end-to-end with your orchestrator
-- Logs stream shows step-by-step events while running (debug only)
-- Results show as grid + SQL expander
-- Clarifying question is displayed instead of hallucinated answers
-- Keyboard submit works (Enter)
-- No secrets committed; `.env` stays in `.gitignore`
+If user_text submitted:
 
----
+Append user message
 
-## 11) Copilot execution steps (what Copilot should do now)
+Create a placeholder for assistant response (spinner)
 
-1) Create the folder/files in section 4.
-2) Implement the class signatures exactly as in section 7.
-3) Implement Streamlit UI rendering per section 9.
-4) Wire `OrchestratorClient` to existing backend modules:
-   - config loader
-   - LLM SQL generation
-   - Azure AI Search metadata lookup
-   - SQL sanitize/validate/execute
-   - 0‑rows fallback + clarification flows
-5) Add minimal CSS in `theme.py` for TD look.
-6) Provide a short README snippet with the run command.
+Call OrchestratorClient.run_turn(..., trace_cb=append_trace_event)
 
-**After implementation**, Copilot must run:
-- `python -m app.main_cli "show me 10 rows from v_dlv_dep_prty_clr"` (backend sanity)
-- `streamlit run app/ui/streamlit_app.py` (UI sanity)
+Append assistant message (or clarification question)
 
----
+Render SQL/results/explanation cards
 
-## 12) Questions to answer ONLY if blocked (single question max)
+If error: render error card
+
+Debug mode:
+
+debug_enabled = (DEBUG env is true) AND (user toggled debug ON)
+
+If not debug mode: do not show trace panel, and do not show stack traces.
+
+10) Acceptance criteria (definition of done)
+UI starts with: streamlit run app/ui/streamlit_app.py
+
+TD theme applied (white + green + logo)
+
+Chat works end-to-end with your orchestrator
+
+Logs stream shows step-by-step events while running (debug only)
+
+Results show as grid + SQL expander
+
+Clarifying question is displayed instead of hallucinated answers
+
+Keyboard submit works (Enter)
+
+No secrets committed; .env stays in .gitignore
+
+11) Copilot execution steps (what Copilot should do now)
+Create the folder/files in section 4.
+
+Implement the class signatures exactly as in section 7.
+
+Implement Streamlit UI rendering per section 9.
+
+Wire OrchestratorClient to existing backend modules:
+
+config loader
+
+LLM SQL generation
+
+Azure AI Search metadata lookup
+
+SQL sanitize/validate/execute
+
+0-rows fallback + clarification flows
+
+Add minimal CSS in theme.py for TD look.
+
+Provide a short README snippet with the run command.
+
+After implementation, Copilot must run:
+
+python -m app.main_cli "show me 10 rows from v_dlv_dep_prty_clr" (backend sanity)
+
+streamlit run app/ui/streamlit_app.py (UI sanity)
+
+12) Questions to answer ONLY if blocked (single question max)
 If Copilot needs clarification, ask ONLY one:
-- “Do you want the trace panel on the right sidebar or below the chat?”
+
+“Do you want the trace panel on the right sidebar or below the chat?”
 
 (If not blocked, proceed with “below chat in debug mode”.)
+'''
+
+path = Path("/mnt/data/copilot_td_ui_spec.md")
+path.write_text(content, encoding="utf-8")
+print(path)
