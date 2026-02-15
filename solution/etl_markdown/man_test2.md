@@ -1,25 +1,17 @@
-We have a Streamlit app in app/ui/streamlit_app.py. It currently crashes because assets/td_logo.png is invalid (it’s ASCII text, not a PNG), causing PIL.UnidentifiedImageError when calling st.image.
+In app/ui/streamlit_app.py, the TD logo is displaying huge (it fills the page). Fix the header UI so the logo is small and the page looks like a bank header bar.
 
-Please implement a robust logo loader:
+Requirements:
 
-Add a helper load_logo_safe(path: str) -> PIL.Image.Image | None that:
+Build a header bar at the top (white background, subtle bottom border, padding).
 
-checks file exists
+Put logo on the left, title/subtitle next to it, and keep the rest of the page content below.
 
-tries Image.open(path) and img.verify() safely
+The logo MUST NOT use width="stretch" or use_container_width=True. Render it as a fixed size like st.image(logo, width=110) and preserve aspect ratio.
 
-returns None if invalid (catch UnidentifiedImageError, OSError, etc.)
+If the logo is large, also resize in PIL before showing: logo.thumbnail((140, 140)).
 
-If logo is invalid/missing, do NOT crash. Show a fallback “TD” badge (simple st.markdown with CSS or st.caption), and continue.
+Keep the previous “safe logo load” behavior: if invalid/missing, show a small fallback “TD” badge (not huge).
 
-Replace deprecated st.image(..., use_container_width=...) with the new API:
+Ensure the header remains compact on wide layout (st.set_page_config(layout="wide") is OK).
 
-prefer st.image(img, width="stretch")
-
-but keep backward compatibility: if TypeError occurs (older Streamlit), fall back to use_container_width=True
-
-Add a quick validation log message to the debug panel showing whether the logo loaded or fallback was used.
-
-Add/ensure .gitignore contains .env and add .env.example if missing (names only).
-
-After patching, provide the exact command to run the app and verify it no longer crashes even if the logo file is invalid.
+Implement the code changes directly and keep the rest of the app behavior the same.
