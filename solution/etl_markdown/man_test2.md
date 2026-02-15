@@ -1,77 +1,68 @@
-## Copilot / Codex Prompt — Fix Streamlit errors (NameError `display` + ModuleNotFoundError `No module named 'app'`)
+## Copilot / Codex Prompt — Fix remaining `NameError: name 'display' is not defined` in Streamlit
 
-You are working in this repo (Linux path example): `/app1/tag5916/projects/text2sql_v2/`
+You are in repo: `/app1/tag5916/projects/text2sql_v2/`
 
-### Goal
-Make `streamlit run app/ui/streamlit_app.py` work reliably with:
-1) **No stray CSS interpreted as Python** (fix `NameError: name 'display' is not defined`)
-2) **No import failure** (fix `ModuleNotFoundError: No module named 'app'`)
-3) Keep changes minimal + safe. Do not change business logic.
+### Current failure
+Running:
+- `.venv/bin/streamlit run app/ui/streamlit_app.py`
 
----
+Still crashes with:
+- `NameError: name 'display' is not defined`
 
-## What to do (REQUIRED)
-
-### 1) Fix the stray CSS → Python issue
-- Open `app/ui/streamlit_app.py`
-- Find any lines like `display: inline-block;` or other CSS properties that exist as raw Python statements.
-- Move ALL CSS into a single helper like:
-
-- `def inject_css(): st.markdown("""<style> ... </style>""", unsafe_allow_html=True)`
-- Call `inject_css()` once near the top (after imports and `st.set_page_config`).
-
-✅ Result: no `NameError: display is not defined` and no “CSS lines in Python scope”.
+This means there is STILL at least one stray CSS line like:
+- `display: flex;`
+- `display: inline-block;`
+(or any `something: something;` line)
+**sitting in Python scope** (not inside a string / not inside `st.markdown("""<style>...</style>""")`).
 
 ---
 
-### 2) Fix `ModuleNotFoundError: No module named 'app'`
-This happens because Streamlit’s working directory / sys.path doesn’t include the project root, so `from app.core...` fails.
+## Required fix (DO THIS EXACTLY)
 
-Implement **ONE** of the following solutions (prefer A; use B if packaging already exists):
+### 1) Find ALL stray CSS-like lines outside strings
+In `app/ui/streamlit_app.py`, search for any lines that match CSS property syntax (examples):
+- `display: flex;`
+- `gap: 8px;`
+- `margin-top: 12px;`
+- `background: #fff;`
 
-#### Option A (minimal + reliable): add project-root bootstrap to sys.path
-At the top of `app/ui/streamlit_app.py` (before `from app.core...` imports), add:
+Use ripgrep to catch them:
+- `rg -n "^\s*[a-zA-Z_-]+\s*:\s*[^#\n;]+;?\s*$" app/ui/streamlit_app.py`
+Also search specifically for display:
+- `rg -n "^\s*display\s*:" app/ui/streamlit_app.py`
 
-- `from pathlib import Path`
-- `import sys`
-- `PROJECT_ROOT = Path(__file__).resolve().parents[2]  # .../text2sql_v2`
-- `sys.path.insert(0, str(PROJECT_ROOT))` only if not already present.
+### 2) Move them into ONE CSS injection block (or delete)
+Create/keep ONE helper (only one) like:
 
-Then keep the normal import:
-- `from app.core.orchestrator_facade import run_question`
+- `def inject_css():`
+  - `st.markdown("""<style> ... ALL CSS HERE ... </style>""", unsafe_allow_html=True)`
 
-#### Option B (packaging): ensure `app` is a real package and install it
-- Ensure these files exist (create if missing):
-  - `app/__init__.py`
-  - `app/core/__init__.py`
-  - `app/ui/__init__.py`
-- If repo has `pyproject.toml` / `setup.py`, run editable install:
-  - `pip install -e .`
-- Then imports should work without sys.path hacks.
+Then call `inject_css()` once near the top (after imports and `st.set_page_config`).
 
-✅ Result: Streamlit can import `app.*` when run from anywhere.
+**Absolutely no CSS property lines can remain in Python scope.**
+If a CSS line is currently sitting between Python code, delete it or move it inside the `<style>` string.
+
+### 3) Prevent future regressions (optional but recommended)
+At the very top of the file (first line), add:
+- `from __future__ import annotations`
+This reduces the chance of “annotation-like” CSS lines evaluating at runtime, but it is NOT a substitute for cleaning the file.
 
 ---
 
-## Verification (MUST RUN and report results)
-Run from repo root: `/app1/tag5916/projects/text2sql_v2`
+## Acceptance criteria (MUST PASS)
+Run these commands from repo root:
 
 1) Syntax check:
 - `python -m compileall app/ui/streamlit_app.py`
 
-2) Import check:
-- `python -c "import app; import app.core.orchestrator_facade; print('imports OK')"`
-
-3) Run Streamlit:
+2) Run Streamlit:
 - `.venv/bin/streamlit run app/ui/streamlit_app.py`
-  (or `python -m streamlit run app/ui/streamlit_app.py`)
 
-✅ App should load at `http://localhost:8501` without traceback.
+✅ App loads without `NameError` or traceback.
 
 ---
 
 ## Output format (IMPORTANT)
-- Provide a **single patch** (diff) or edited file content for `app/ui/streamlit_app.py`
-- If you create `__init__.py` files, include them too.
-- Then list the exact commands used for verification + their outputs (short).
-- Do NOT add extra explanations beyond what’s needed.
+- Provide a single patch (diff) for `app/ui/streamlit_app.py`
+- Show the exact grep results you found and confirm they are gone after the fix
+- Then show the Streamlit run output up to “You can now view your Streamlit app…”
