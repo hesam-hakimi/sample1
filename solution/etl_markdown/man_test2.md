@@ -1,213 +1,151 @@
-# Text2SQL UI – Fix `__future__` Import Error + Consistency Checklist
+# Prompt for GitHub Copilot (Agent) — Fix `TraceEvent.__init__()` unexpected keyword `stage`
 
-**Current blocker you’re seeing**
+## Goal
+Your Streamlit app crashes on greeting (“hi”) with:
 
-```
-SyntaxError: from __future__ imports must occur at the beginning of the file
-File: app/ui/state.py (line ~10)
-```
+`TypeError: TraceEvent.__init__() got an unexpected keyword argument 'stage'`
 
-This is happening while running `pytest` (e.g., `app/ui/test_state.py` imports `app.ui.state`), so tests fail before they even execute.
+This occurs inside `app/ui/orchestrator_client.py` when it calls:
 
----
+`TraceEvent(ts_iso=..., stage="intent", message="...")`
 
-## 1) Root cause (what’s actually wrong)
+So `TraceEvent` in `app/ui/models.py` (or wherever it’s defined/imported from) does **not** currently accept a `stage` keyword.
 
-Python requires any `from __future__ import ...` statements to appear **before any other non‑docstring statements** in a module.
-
-Allowed before the `__future__` import:
-- A **module docstring** (triple-quoted string at top)
-- **Comments** (recommended)
-- `# -*- coding: utf-8 -*-` encoding header (rare nowadays)
-
-**Not allowed** before the `__future__` import:
-- Any `import ...`
-- Any assignments / constants
-- Any function / class definitions
-- Any other executable statements
-
-What usually triggers this in your case:
-- Copilot inserted **multiple** `from __future__ import annotations` lines,
-- and at least one of them is **not at the top** (e.g., after `import streamlit as st`), which breaks module import.
+## What you must deliver
+1. **Fix the crash** by making `TraceEvent` compatible with the usage `TraceEvent(ts_iso=..., stage=..., message=...)`.
+2. Ensure **all tests pass** (`pytest -q`).
+3. Ensure **Streamlit runs** (`streamlit run app/ui/streamlit_app.py`) and greeting messages do not crash.
+4. Do **not** change public behavior of the app except fixing the error and keeping trace streaming working.
 
 ---
 
-## 2) Fix (do this first)
+## Step-by-step plan (do in this order)
 
-### 2.1 Edit `app/ui/state.py`
+### 1) Locate the authoritative `TraceEvent` definition
+- Open `app/ui/models.py` (or the file that defines `TraceEvent` imported by `app/ui/orchestrator_client.py`).
+- Confirm which `TraceEvent` class is actually imported:
+  - In `app/ui/orchestrator_client.py`, find `from .models import ... TraceEvent ...` (or similar).
+  - Ensure you are editing the same `TraceEvent`.
 
-**Goal:** Ensure there is **exactly one** `from __future__ import annotations`, and it is at the very top (after optional module docstring/comments).
+### 2) Standardize `TraceEvent` to support `stage` + `message`
+Update the `TraceEvent` model so it accepts these fields:
 
-**Expected file header pattern (example):**
+- `ts_iso: str`
+- `stage: str`
+- `message: str`
+- optionally:
+  - `detail: str | None = None`
+  - `payload: dict | None = None`
+
+#### Preferred implementation (simple + robust)
+Use a dataclass:
+
 ```python
-\"\"\"UI session-state helpers for the Streamlit Text2SQL app.\"\"\"
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, List, Dict
-import os
+from typing import Optional, Dict, Any
 
-import streamlit as st
+@dataclass(frozen=True)
+class TraceEvent:
+    ts_iso: str
+    stage: str
+    message: str
+    detail: Optional[str] = None
+    payload: Optional[Dict[str, Any]] = None
 ```
 
-### 2.2 What to change exactly
+**Important:**  
+- If the file already has `from __future__ import annotations`, it MUST be the **very first import** (line 1) with no blank lines or code before it.
+- If there are duplicates, remove duplicates and keep only one at the very top.
 
-1. **Open** `app/ui/state.py`
-2. **Search** for `from __future__ import annotations`
-3. Do both:
-   - Keep **only one** occurrence
-   - Move that one occurrence to the very top (after module docstring if present)
-4. Ensure there are **no imports** (like `import streamlit as st`) before the `__future__` import.
-5. Save the file.
+### 3) Backward compatibility (if older fields exist)
+If the existing `TraceEvent` is currently used elsewhere with a different kwarg name (e.g., `kind`, `event`, `label`, `step`, `msg`), do one of these:
 
-> Tip: If you want a module docstring, it must be the very first statement. The `__future__` import must come right after the docstring.
+**Option A (preferred): Update call sites**
+- `rg "TraceEvent\(" app/ui -n`
+- Update all usages to use `stage=` and `message=`.
 
----
-
-## 3) Verification (must pass)
-
-Run these commands from repo root:
-
-### 3.1 Compile-time check (fast)
-```bash
-python -m compileall app/ui -q
-```
-If this fails, you still have an import-time issue.
-
-### 3.2 Unit tests
-```bash
-pytest -q
-```
-Expected: all tests pass.
-
-### 3.3 Run Streamlit
-```bash
-streamlit run app/ui/streamlit_app.py
-```
-Expected: app loads and chat UI renders.
-
----
-
-## 4) Prevent this from coming back (recommended)
-
-### 4.1 Rule of thumb for Copilot
-Whenever Copilot suggests adding `from __future__ import annotations`:
-- **Do it only once per file**
-- Put it at the **top**
-- Never add it in the middle of a file
-
-### 4.2 Alternative (if you want to avoid `__future__` entirely)
-Instead of `from __future__ import annotations`, you can:
-- Use **string annotations**:
-  ```python
-  def render_chat_main(orchestrator: "OrchestratorClient") -> None:
-      ...
-  ```
-- Or use `typing.TYPE_CHECKING` + local imports.
-
-But since you already started using `__future__`, the simplest is: **keep one at the top**.
-
----
-
-## 5) Consistency checklist (architecture you want)
-
-This section helps you ensure “all files and implementation are the same as what you want”.
-
-### 5.1 Tool-gating requirement (Search vs No Search)
-**Expected behavior:**
-- Greeting/smalltalk/help/thanks (e.g., `"hi"`, `"hello"`, `"thanks"`, `"help"`) should **NOT** call:
-  - Azure AI Search
-  - SQL generation/execution
-- It should produce a friendly assistant message only.
-
-**Implementation pattern:**
-- `SearchDecider.decide(user_text: str, history: list[ChatMessage], options: UIOptions) -> SearchDecision`
-- `SearchDecision` should allow at least:
-  - `NO_TOOLS` (greetings/smalltalk/help)
-  - `USE_SEARCH_AND_SQL` (real data questions)
-  - `ASK_CLARIFICATION` (missing table/time filters, etc.)
-
-**Acceptance criteria:**
-- Input `"hi"` ⇒ `SearchDecision.NO_TOOLS` (no search, no SQL)
-- Input `"show me top 10 customers by balance"` ⇒ `USE_SEARCH_AND_SQL`
-
-### 5.2 Activity log streaming requirement (“step shows, then fades, then next step…”)
-What Streamlit can do reliably:
-- Append trace events as they occur (via callback)
-- Render newest event at full opacity, older events faded (CSS)
-- Optionally show `st.toast(...)` for ephemeral “fade away” feel
-
-**Recommended UX compromise (works well):**
-- Activity panel shows a list:
-  - newest event: opacity 1.0
-  - older events: opacity 0.4–0.6
-- Also show `st.toast()` for each new event (auto disappears)
-
-**Acceptance criteria:**
-- When running a real question, activity events show in order:
-  1) intent detected  
-  2) (if needed) search tool called  
-  3) prompt build  
-  4) SQL generated  
-  5) SQL validated  
-  6) SQL executed  
-  7) results returned  
-- New events appear without waiting for the whole turn to finish.
-
-### 5.3 Session-state function signatures (must exist and be imported)
-Your Streamlit entrypoint should **only** call functions that exist in `state.py` (or wherever your state helpers live).
-
-At minimum, you should have helpers like:
+**Option B: Provide aliases**
+If you want to avoid touching many call sites, you can keep the canonical fields and add a constructor helper:
 
 ```python
-def init_session_state() -> None: ...
-def get_chat_history() -> list[ChatMessage]: ...
-def append_chat_message(msg: ChatMessage) -> None: ...
-
-def get_trace_events() -> list[TraceEvent]: ...
-def append_trace_event(ev: TraceEvent) -> None: ...
-def clear_trace_events() -> None: ...
-
-def get_ui_options() -> UIOptions: ...
-def set_ui_options(options: UIOptions) -> None: ...
+    @staticmethod
+    def from_legacy(
+        ts_iso: str,
+        *,
+        kind: str | None = None,
+        label: str | None = None,
+        msg: str | None = None,
+        message: str | None = None,
+        stage: str | None = None,
+        **kw,
+    ) -> "TraceEvent":
+        return TraceEvent(
+            ts_iso=ts_iso,
+            stage=stage or kind or label or "info",
+            message=message or msg or "",
+            payload=kw or None,
+        )
 ```
 
-**Acceptance criteria:**
-- `streamlit run app/ui/streamlit_app.py` produces **no NameError** for missing state functions.
-- `pytest -q` passes.
+…but **only** do this if you actually find legacy usage patterns in this repo.
+
+### 4) Ensure the UI rendering matches the model
+In `app/ui/streamlit_app.py`, the activity log rendering uses:
+
+- `e.stage`
+- `e.message`
+
+Confirm those attributes exist on `TraceEvent` after your change.
+
+### 5) Fix `orchestrator_client.py` (only if needed)
+The crash shows it passes `stage=` already, so it’s probably fine.  
+But verify that every `TraceEvent(...)` call uses only valid kwargs after step 2.
+
+### 6) Add a regression test to prevent this from breaking again
+Create or update a test file (pick an existing test module under `app/ui/`):
+
+Example: `app/ui/test_models.py`
+
+```python
+from app.ui.models import TraceEvent
+
+def test_traceevent_accepts_stage_and_message():
+    ev = TraceEvent(ts_iso="2026-01-01T00:00:00", stage="intent", message="hello")
+    assert ev.stage == "intent"
+    assert ev.message == "hello"
+```
+
+If you already have tests around trace events, just add assertions there.
+
+### 7) Verification commands (must run and pass)
+Run these in order and ensure no failures:
+
+```bash
+.venv/bin/pytest -q
+.venv/bin/streamlit run app/ui/streamlit_app.py
+```
+
+**Manual UI sanity:**
+- Type: `hi`
+- Expected:
+  - assistant replies with greeting
+  - activity log still renders (even if empty)
+  - no crash
 
 ---
 
-## 6) If you want a Copilot “do this now” patch prompt (copy/paste)
-
-Use this exact prompt in Copilot Chat (in repo root):
-
-> **Prompt to Copilot:**
-> 1) Fix `SyntaxError: from __future__ imports must occur at the beginning of the file` in `app/ui/state.py`.  
->    - Ensure there is exactly one `from __future__ import annotations` and it is the first import in the file (after optional module docstring/comments only).  
->    - Remove any duplicate `from __future__ ...` lines.  
-> 2) Do not change public function signatures.  
-> 3) Run `python -m compileall app/ui -q` and `pytest -q`; include the results.  
-> 4) Then run `streamlit run app/ui/streamlit_app.py` and confirm the page loads without NameError.
+## Acceptance criteria (checklist)
+- [ ] `TraceEvent(ts_iso=..., stage=..., message=...)` works everywhere (no TypeError)
+- [ ] `pytest -q` passes
+- [ ] Streamlit app loads and accepts input without crash
+- [ ] `TraceEvent` field names match UI rendering (`stage`, `message`)
+- [ ] `from __future__ import annotations` appears **once** and at the very top of each file that uses it
 
 ---
 
-## 7) Quick troubleshooting
-
-### Still seeing the same SyntaxError?
-- You still have an `import` / assignment before the `__future__` import.
-- Or you have a second `from __future__` later in the file (remove it).
-
-### Tests pass but Streamlit fails with NameError (e.g., `get_trace_events` not defined)
-- That’s a **separate** missing symbol issue.
-- Fix by adding the function in `state.py` **or** importing it correctly in `streamlit_app.py`.
-
----
-
-### Done criteria for this step
-✅ `python -m compileall app/ui -q` passes  
-✅ `pytest -q` passes  
-✅ `streamlit run app/ui/streamlit_app.py` loads without SyntaxError/NameError
-
-
+## Notes (do NOT ignore)
+- Keep changes minimal and localized to `TraceEvent` and any direct call sites.
+- Do not refactor unrelated UI code.
+- If you find multiple competing `TraceEvent` definitions (duplicate classes in other files), remove duplication and keep a **single canonical model** in `app/ui/models.py`, and import it everywhere else.
