@@ -1,160 +1,165 @@
-# Fix Streamlit crash: `AttributeError: 'NoneType' object has no attribute 'debug_enabled'`
+# Copilot Prompt — Fix Streamlit UI: blank main page (render chat in main area)
 
-## Context
-When running the Streamlit UI:
+## Goal
+Your Streamlit app currently renders the **sidebar** (“Data source & Session”) but the **main page is blank**.  
+Update the UI so the **main area always shows a chat interface** where the **user + agent collaborate**.
 
-```bash
-.venv/bin/streamlit run app/ui/streamlit_app.py
-```
+The chat must:
+- Show a running **chat transcript** (user + assistant messages).
+- Include a **chat input** at the bottom.
+- Stream an **activity / thought-process log** (e.g., “Deciding if search is needed…”, “Fetching from AI Search…”, “Reviewing table schema…”, “Running SQL…”, “Summarizing results…”).
+- When SQL returns rows, the **dataset preview must be sent back into the LLM** so the assistant can explain/summarize in chat (do not only show a dataframe without assistant commentary).
 
-the app crashes with:
-
-```text
-AttributeError: 'NoneType' object has no attribute 'debug_enabled'
-File ".../app/ui/streamlit_app.py", line 87, in <module>
-    if options.debug_enabled:
-```
-
-This indicates `options` is `None` at runtime.
+**Important:** Do not “redesign” the product. Implement the required structure + methods and make the chat appear in main content reliably.
 
 ---
 
-## Your task (Copilot Agent)
-### Goal
-Fix the crash **without redesigning the UI**. Ensure `options` is **always** a valid `UIOptions` instance (never `None`), with sensible defaults.
+## Context / Symptom
+- Page loads (no crash), sidebar is visible.
+- Main content area is empty/blank.
+- Expected: chat on main page.
 
-### Constraints
-- Do **not** redesign or refactor the UI flow beyond what is needed to fix this bug.
-- Preserve existing UX and layout.
-- Make the fix robust: no `None` options in any execution path.
-
----
-
-## Expected code structure (must match)
-You already have a dataclass like:
-
-```python
-@dataclass
-class UIOptions:
-    max_rows: int
-    execution_target: Literal["sqlite", "oracle"]
-    debug_enabled: bool
-```
-
-There must be **one** canonical place that creates/loads UI options, e.g.:
-- `app/ui/state.py` (preferred), OR
-- `app/ui/chat_models.py` (if that’s where you put UI models)
-
-Call it something like:
-
-```python
-def load_ui_options() -> UIOptions:
-    ...
-```
-
-or
-
-```python
-def get_ui_options() -> UIOptions:
-    ...
-```
-
-**Important:** This function must **always** return `UIOptions(...)` and never `None`.
+This symptom usually means one of these is happening:
+- `st.stop()` / early `return` occurs after sidebar render, before main render.
+- Main render is inside a condition that isn’t met (e.g., “metadata loaded” / “index selected”).
+- Custom CSS hides main container (e.g., `display:none`, `height:0`, overlay).
+- Main UI is written into an `st.empty()` placeholder that is never filled.
 
 ---
 
-## Root cause (what to look for)
-In `app/ui/streamlit_app.py` the variable `options` is being assigned from a function that can return `None`, for example:
-- returning `None` when env vars are missing
-- returning `None` when config load fails
-- returning `None` if `st.session_state` doesn’t have a key yet
+## Files to inspect (do NOT guess—inspect repo)
+1. `app/ui/streamlit_app.py` (primary)
+2. Any helpers referenced by the UI (existing in repo if present):
+   - `app/ui/chat_models.py`
+   - `app/ui/activity_stream.py`
+   - `app/ui/search_decider.py`
+3. Orchestrator entrypoint used by UI:
+   - `app/core/orchestrator_facade.py` (or equivalent)
 
 ---
 
-## Required fix (implement these)
-### 1) Make option-loading total (never returns `None`)
-Find where `options` is created (search for `UIOptions(`, `get_ui_options`, `load_ui_options`, `options =`).
+## Required UI architecture (implement exactly)
+### 1) `app/ui/streamlit_app.py`
+Create/ensure these functions exist and are used **in this order**:
 
-Update the option loader to:
-- provide defaults if env/config is missing
-- catch parsing errors and fallback to defaults
-- optionally write a warning to Streamlit (only if `debug_enabled` is True OR if you already have a logger)
+#### `bootstrap_project_root() -> None`
+- Ensures project root is in `sys.path` so imports like `from app.core...` work reliably when Streamlit runs.
+- Must run **before** importing internal `app.*` modules that may fail in Streamlit.
 
-Example pattern:
+#### `inject_css() -> None`
+- Inject all CSS inside **one** `st.markdown(\"\"\"<style>...</style>\"\"\", unsafe_allow_html=True)` call.
+- Do **not** leave stray CSS lines in Python scope.
+- Ensure CSS does **not** hide the main area. Specifically, do NOT set:
+  - `.main { display:none; }`
+  - `.block-container { height: 0; overflow: hidden; }`
+  - overlays with `position: fixed` covering the page.
 
-```python
-DEFAULT_UI_OPTIONS = UIOptions(
-    max_rows=50,
-    execution_target="sqlite",
-    debug_enabled=False,
-)
+#### `init_session_state() -> None`
+Must set defaults so the UI never crashes and never becomes blank due to missing state:
+- `st.session_state.messages: list[dict]` (each dict at least `{role, content}`)
+- `st.session_state.activity: list[str]`
+- `st.session_state.debug_enabled: bool` (default `False`)
+- Any UI options should always have a default object/dict (never `None`).
 
-def load_ui_options() -> UIOptions:
-    try:
-        # read env/config/session_state, validate
-        ...
-        return UIOptions(...)
-    except Exception:
-        return DEFAULT_UI_OPTIONS
-```
+#### `render_sidebar() -> None`
+- Keep your existing sidebar controls (indexes list, refresh metadata, download json, clear chat).
+- **Do not** call `st.stop()` in the sidebar logic.
+- If something is missing (no indexes, metadata not loaded), show a warning in sidebar but continue rendering main chat.
 
-### 2) Add a defensive fallback in `streamlit_app.py`
-Even with a correct loader, make the UI file safe:
+#### `render_chat_main(orchestrator) -> None`
+This is the key fix:
+- Must ALWAYS render something in the main area on every run:
+  - Title/header (e.g., “Text2SQL Chat”)
+  - Chat transcript
+  - Chat input
+  - Activity panel (expander / status component)
 
-```python
-options = load_ui_options()
-if options is None:
-    options = DEFAULT_UI_OPTIONS
-```
+Pseudo-UI requirements:
+- Show transcript with `st.chat_message(role)` for each message.
+- If transcript is empty, add an initial assistant greeting message (“Hi — ask me a question…”).
+- Add `st.chat_input(...)` at bottom for user input.
+- The activity log must update while processing a turn (streaming).
 
-Then use `options.debug_enabled` safely.
+#### `main() -> None`
+Must follow this high-level order:
 
-### 3) Validate/normalize inputs
-If `execution_target` is read from env/config, normalize:
-- accept case-insensitive values (`SQLITE`, `sqlite`)
-- if invalid -> fallback to `"sqlite"`
-
-If `max_rows` is read from env/config, ensure it’s an `int` with bounds:
-- `1 <= max_rows <= 1000` (or your chosen bound)
-- invalid -> fallback to default
-
-### 4) Tests (minimum)
-Add a small unit test ensuring the loader never returns `None`.
-
-Example (pytest):
-- if env vars are absent -> returns defaults
-- if env vars are invalid -> returns defaults
-
----
-
-## Acceptance criteria (must pass)
-1. Running Streamlit no longer crashes:
-   ```bash
-   .venv/bin/streamlit run app/ui/streamlit_app.py
-   ```
-2. `options` is never `None` in `streamlit_app.py`.
-3. A unit test confirms the loader returns a `UIOptions` instance in all cases.
-4. No UI redesign.
+1) `st.set_page_config(...)`
+2) `bootstrap_project_root()`
+3) Import internal modules (orchestrator, helpers)
+4) `inject_css()`
+5) `init_session_state()`
+6) `render_sidebar()`
+7) `render_chat_main(orchestrator)`  ✅ this must run unconditionally
 
 ---
 
-## Helpful commands
-From repo root:
+## Required backend contract (UI ↔ orchestrator)
+### 2) Orchestrator method (create if missing; otherwise adapt)
+In `app/core/orchestrator_facade.py`, expose a single UI-friendly entrypoint:
 
-```bash
-# quick syntax check
-python -m compileall app/ui/streamlit_app.py
+#### `run_chat_turn(user_text: str, *, max_rows: int, debug: bool) -> dict`
+Return a dict with:
+- `assistant_text: str` (final assistant message)
+- `activity: list[str]` (ordered log lines for UI streaming)
+- Optional `sql: str`
+- Optional `rows: list[dict]` (preview rows)
+- Optional `columns: list[str]`
+- Optional `error: str`
 
-# run app
-.venv/bin/streamlit run app/ui/streamlit_app.py
-
-# run tests (if you have pytest)
-pytest -q
-```
+**Critical requirement:** If `rows` is present, the orchestrator must pass a compact preview (e.g., first 10–50 rows) into the LLM so the assistant message includes an explanation/summary, not just raw rows.
 
 ---
 
-## Deliverables
-- Updated option loader (`load_ui_options()` / `get_ui_options()`).
-- Updated `app/ui/streamlit_app.py` with a defensive fallback.
-- New/updated tests verifying non-None options.
+## “Search or not” decision requirement
+### 3) Deterministic search decision
+Implement (or confirm) a function used by the orchestrator:
+
+#### `decide_use_search(user_text: str) -> tuple[bool, str]`
+Returns:
+- `use_search: bool`
+- `reason: str` (must be appended to activity log)
+
+Rule: If the question is general (“what is…”, help, non-table question), do NOT hit AI Search. If the question needs schema/metadata/table discovery, DO use search.
+
+---
+
+## How to fix the blank main page (explicit steps)
+1. In `app/ui/streamlit_app.py`, **find any `st.stop()` or early `return`** before the main render.
+   - Replace with warnings + continue.
+2. Find any conditions gating main rendering (e.g., `if not indexes: ...`).
+   - Ensure chat renders regardless; show warning inside chat area if prerequisites missing.
+3. Add a temporary visible marker at the top of main:
+   - `st.write(\"[DEBUG] main rendered\")`
+   - If you still don’t see it, CSS is hiding content—fix CSS.
+4. Ensure `render_chat_main()` is called on every script run.
+5. Ensure `st.chat_input()` is not inside a condition that might skip.
+
+---
+
+## Acceptance criteria
+- Opening the app shows:
+  - Sidebar controls on left
+  - Chat UI in main area (always visible)
+- Sending a message:
+  - Adds user message to transcript
+  - Shows assistant streaming activity log while processing
+  - Shows assistant answer in chat
+  - If SQL executed and rows returned:
+    - UI can display a dataframe preview
+    - Assistant message includes a summary derived from those rows
+
+---
+
+## Verification commands
+Run these and paste any errors if they occur:
+- `python -m compileall app/ui/streamlit_app.py`
+- `streamlit run app/ui/streamlit_app.py`
+- Open the Local URL and confirm chat appears in main.
+
+---
+
+## If you need more context
+If you cannot find where main content is being suppressed, ask me to paste:
+- `app/ui/streamlit_app.py` (entire file)
+- Any helper imported by it (`activity_stream.py`, `chat_models.py`, `search_decider.py`)
+- The orchestrator entrypoint (`app/core/orchestrator_facade.py`)
