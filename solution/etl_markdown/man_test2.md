@@ -1,46 +1,44 @@
-NEXT STEP: End-to-end CLI smoke test (SQLite)
+STEP 4 — Handle “0 rows” results + discover valid filter values (SQLite)
+
+Context
+- End-to-end flow works.
+- Query “based in usa” generated WHERE TERR_CD='US' and returned 0 rows.
+- We need the system to validate filter values against real data and recover gracefully.
 
 Goal
-- Confirm the app can: (1) generate SQL for SQLite, (2) strip markdown/code fences, (3) execute successfully, (4) return rows.
+When a SQL query returns 0 rows, the CLI should:
+1) Detect empty result set
+2) Identify the likely filter column(s) used (e.g., TERR_CD)
+3) Run a lightweight “value discovery” query (top values + counts)
+4) Ask the user a clarifying question with valid options (or suggest alternatives)
 
-Pre-check (must show evidence)
-1) Verify SQLite DB exists and tables are present.
-   Run ONE of these (whichever is available):
+A) First: run diagnostics (no code changes yet)
+From repo root, run these and paste outputs:
 
-   Option A (sqlite3 CLI):
-     sqlite3 local_data.db ".tables"
+1) Show columns:
+   sqlite3 local_data.db "PRAGMA table_info(v_dlv_dep_prty_clr);"
 
-   Option B (python):
-     /app1/tag5916/projects/text2sql_v2/.venv/bin/python -c "
-     import sqlite3;
-     con=sqlite3.connect('local_data.db');
-     print(con.execute(\"select name from sqlite_master where type='table' order by 1\").fetchall());
-     "
+2) Check what values exist for TERR_CD:
+   sqlite3 local_data.db "SELECT TERR_CD, COUNT(*) cnt FROM v_dlv_dep_prty_clr GROUP BY TERR_CD ORDER BY cnt DESC LIMIT 30;"
 
-2) Confirm these tables exist (exact names):
-   v_dlv_dep_agmt_clr
-   v_dlv_dep_prty_agmt
-   v_dlv_dep_prty_clr
-   v_dlv_dep_tran
+3) Check null/blank TERR_CD:
+   sqlite3 local_data.db "SELECT SUM(CASE WHEN TERR_CD IS NULL OR TRIM(TERR_CD)='' THEN 1 ELSE 0 END) AS null_or_blank, COUNT(*) AS total FROM v_dlv_dep_prty_clr;"
 
-Run end-to-end CLI tests (paste full outputs)
-3) Run:
-   PYTHONUNBUFFERED=1 /app1/tag5916/projects/text2sql_v2/.venv/bin/python -m app.main_cli "show me 10 rows from v_dlv_dep_prty_clr"
+4) Search for any “US-like” values:
+   sqlite3 local_data.db "SELECT TERR_CD, COUNT(*) cnt FROM v_dlv_dep_prty_clr WHERE UPPER(TERR_CD) LIKE '%US%' GROUP BY TERR_CD ORDER BY cnt DESC LIMIT 30;"
 
-4) Run:
-   PYTHONUNBUFFERED=1 /app1/tag5916/projects/text2sql_v2/.venv/bin/python -m app.main_cli "show me the list of all clients who are based in usa"
+B) Implement “0 rows fallback” in backend (minimal change, no new dependencies)
+Create/Update these components (be explicit in code so we can modify later):
 
-What to capture
-- For each run: generated SQL (after sanitization), and execution result (rows or summary).
-- If it fails: paste full stack trace.
+1) New dataclass:
+   - File: app/core/query_result.py
+   - class QueryResult:
+       - sql: str
+       - rows: list[dict] (or list[tuple])
+       - row_count: int
+       - columns: list[str]
+       - execution_ms: float | None
+       - error: str | None
 
-Important fix rule (only if you see this error)
-- If SQLite fails with:
-    sqlite3.OperationalError: near "```": syntax error
-  then update ONLY the SQL extraction/sanitization in LLMService so that:
-  - removes triple backticks and optional language tags like ```sql
-  - removes any leading/trailing backticks
-  - returns plain SQL only (no markdown)
-  After patching, re-run steps 3 and 4 and paste outputs.
-
-Do NOT add new features. Only patch what is needed for the smoke test to pass.
+2) Add a post-execution hook:
+   - Where: after SQL execution returns results (likely in app/main_cli.py or_
