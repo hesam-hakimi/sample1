@@ -1,153 +1,126 @@
-# Copilot Prompt — Step: Frontend Streamlit UI (TD theme + event stream)
-
-You are working in repo **text2sql_v2**. Backend now supports **structured event logs** during execution (planner → ai_search → prompt → llm → sql_sanitize → sql_execute → fallback / clarify / error). The CLI smoke tests pass.
-
-**Goal (this step):** Upgrade the Streamlit UI to:
-1) look modern with **TD-like white + green** styling, clean cards, optional TD logo  
-2) support a **chat experience** (user asks, assistant answers)  
-3) show an **Activity Log** panel that **streams live events** (e.g., “planning… calling AI search… generating SQL… executing…”)  
-4) allow **debug mode**: Activity Log visible only when debug is ON  
-5) support **keyboard shortcut** for submit (Enter) and allow newline with Shift+Enter  
-6) fix the issue where UI shows **“(No assistant message returned)”** after user says “hi” (must always return a friendly assistant response)
-
 ---
+name: Text2SQL UI Agent — User-Friendly Responses (Prompt Update)
+description: >
+  Update the backend agent + UI so end users get clear, non-technical answers.
+  Hide internal SQL/latency/errors by default, but keep a developer-facing streamed log in the Activity Log panel.
+argument-hint: >
+  Copy/paste this into GitHub Copilot Chat. It instructs Copilot exactly what prompt changes to make.
+tools: []
+handoffs:
+  - label: Backend-agent prompt update
+    agent: github-copilot
+    prompt: |
+      CONTEXT
+      - This repo has a Text2SQL chat UI (Streamlit) and a backend router/planner that can:
+        1) decide whether to use AI Search (metadata) or other tools,
+        2) generate SQL,
+        3) sanitize SQL (remove markdown fences),
+        4) execute SQL in SQLite,
+        5) provide a fallback when result set is 0 rows.
+      - We already have an event stream / activity log (planner → ai_search → prompt → llm → sql_sanitize → sql_execute → fallback, etc.)
+      - Current problem: assistant responses still leak technical details (SQL timings, sanitization notes, “no rows fallback” technical phrasing).
+      - Goal: user sees business-friendly answers; technical details only appear in Activity Log (developer view).
 
-## Constraints
-- Keep Streamlit (no heavy UI frameworks).
-- Add dependencies only if absolutely necessary (prefer stdlib + existing deps).
-- No secrets in code. Keep using `.env` via existing config loader.
-- Do not redesign backend router/orchestrator—UI should be a thin consumer.
+      WHAT TO CHANGE (PROMPTS ONLY, NO CODE UNLESS ASKED)
+      1) Update the primary assistant prompt (and any planner/system prompts if present) to enforce:
+         - User-facing messages MUST be non-technical by default.
+         - Do NOT mention:
+           * SQL statements
+           * table/view names unless user asked “what tables exist?”
+           * latency timings (ms)
+           * sanitization / markdown fences / SDK versions / stack traces
+           * internal tool names (“planner”, “sql_execute”, etc.)
+         - The UI may still display Activity Log events separately; the assistant message must not include them.
 
----
+      2) Define a strict RESPONSE CONTRACT (what the LLM should output) so the UI can render consistently.
+         - The assistant MUST always produce:
+           A) user_message: string (human-friendly)
+           B) followups: list[string] (0–5 suggested next questions)
+           C) needs_clarification: boolean
+           D) clarification_questions: list[string] (0–3), only when needs_clarification=true
+           E) safe_notes_for_logs: string (optional) — technical notes intended ONLY for Activity Log, not user chat
 
-## A) UI layout + styling (TD theme)
-Update: `app/ui/streamlit_app.py`
+         - If your project already uses a JSON response_format:
+           * keep it compatible with existing code
+           * ensure keys above are present
+           * keep additional keys allowed but not required
 
-**Header**
-- Title: “Text2SQL Chat”
-- Optional logo: if `app/ui/assets/td_logo.png` exists, show it; otherwise skip.
+      3) Update behavior for common cases:
 
-**Theme**
-- White background, TD-green accent (use a single constant like `TD_GREEN = "#00A94F"` or similar).
-- Use `st.markdown(<style>, unsafe_allow_html=True)` + CSS for:
-  - chat bubbles (user vs assistant)
-  - clean cards (border, subtle shadow, rounded corners)
-  - activity log lines (small monospace + muted)
+         CASE A — Smalltalk (“hi”, “hello”, “thanks”)
+         - user_message: friendly + suggests examples.
+         - followups: include 2–4 examples such as:
+           “What tables are available?”
+           “Show me 10 rows from <table>”
+           “Count deposits by day”
+         - Never query tools for smalltalk.
 
----
+         CASE B — User asks “what tables are available?”
+         - user_message: list table names in bullet form (OK to show names here).
+         - Add 1–2 tips like “You can ask for a sample: ‘show me 10 rows from …’”.
 
-## B) Chat state + message rendering
-Keep history in `st.session_state`:
-- `messages`: list of `{"role": "user"|"assistant", "content": str}`
-- `activity`: list of log lines (strings) OR event objects (then format at render time)
+         CASE C — Query returns results (N rows)
+         - user_message should summarize results in plain language:
+           - If N is small: show a compact table-like preview (top 10 rows), with friendly column labels if available.
+           - If N is large: summarize + offer to filter / group / export.
+         - Do NOT mention execution time.
+         - Do NOT show raw SQL.
 
-Create helper functions (these signatures must exist for future edits):
+         CASE D — Query returns 0 rows
+         - user_message must NOT say “0-row fallback” or “no results found” alone.
+         - Instead:
+           1) Briefly state no matching records were found for the requested filter.
+           2) Offer 2–3 actionable refinements:
+              - suggest alternative filter values discovered (e.g., “TERR_CD looks like state/province codes (NY, CA, …) rather than ‘US’”)
+              - ask a clarification question if needed (e.g., “Do you mean US-based clients, or clients in a specific state?”)
+           3) Provide followups that the user can click/type.
 
-```python
-def init_state() -> None: ...
-def render_header() -> None: ...
-def render_messages(messages: list[dict]) -> None: ...
-def render_activity_log(activity: list[str], enabled: bool) -> None: ...
-def append_message(role: str, content: str) -> None: ...
-```
+         CASE E — Errors (tool failure, SQL errors, missing env vars)
+         - user_message: brief apology + one simple next step (retry / rephrase / check setup).
+         - Put full technical detail in safe_notes_for_logs only.
+         - needs_clarification should be false unless you truly need user input.
 
-**Fix “No assistant message returned”**
-- Every user input MUST result in an assistant message.
-- If backend returns empty/None, show fallback:
-  “Hi! Ask me a question about your data, or type ‘help’ for examples.”
+      4) Add STYLE RULES to the prompt
+         - Use short paragraphs.
+         - Prefer bullets for lists.
+         - Never mention internal file paths.
+         - Never expose secrets or env var values.
+         - If you must mention a table name, format it consistently (backticks are OK), but avoid overusing.
 
----
+      DELIVERABLES (NO CODE)
+      - Produce the updated prompt text(s) as markdown blocks:
+        1) “System/Assistant Prompt (User-Facing)”
+        2) “Planner Prompt (Tool Decision) — if exists”
+        3) “Response JSON Schema”
+      - Also include a short checklist for manual testing (3–5 tests) that I will run after applying the prompt changes.
 
-## C) Streaming Activity Log from backend events
-Wire Streamlit to show events as they arrive.
+      ACCEPTANCE CRITERIA
+      - “Deposit count by day?” produces a helpful clarification instead of technical details.
+      - “What tables are available?” lists the 4 tables without SQL/latency.
+      - “show me 10 rows from v_dlv_dep_prty_clr” shows a user-friendly preview (no SQL shown).
+      - Any technical diagnostics appear ONLY in Activity Log / safe_notes_for_logs.
 
-Implement:
+  - label: Frontend rendering alignment
+    agent: github-copilot
+    prompt: |
+      CONTEXT
+      - The UI shows chat bubbles + an Activity Log stream.
+      - The agent will now return a structured response:
+        user_message, followups, needs_clarification, clarification_questions, safe_notes_for_logs.
 
-```python
-def format_event_line(event: object) -> str:
-    """Convert backend event objects/dicts/strings into one log line."""
+      TASK (NO CODE UNLESS ASKED)
+      - Verify the UI uses ONLY user_message in the Assistant chat bubble.
+      - Activity Log should display:
+        - streamed events emitted by backend
+        - safe_notes_for_logs (if present) as “developer note”
+      - Followups should render as clickable chips/buttons (optional) or as a short list.
+      - Clarification questions should be displayed as a small “I need one detail” section.
 
-def run_chat_turn(user_text: str, debug: bool) -> None:
-    """Runs one chat turn: streams events to Activity Log and appends final assistant message."""
-```
+      ACCEPTANCE CRITERIA
+      - Chat bubble never shows SQL, execution time, sanitization, or tool names.
+      - Activity Log can show technical steps.
 
-**Event format compatibility**
-Backend may emit:
-- dataclass objects (with `.type`/`.message` or similar)
-- dicts (keys like `type`, `message`)
-- strings
-
-Formatter must handle all 3 safely (never crash).
-
-**Streaming**
-- Use `st.empty()` placeholders to incrementally update the Activity Log panel while the backend runs.
-
-Recommended log line format:
-- `[{type}] {message}`
-
----
-
-## D) Input UX + keyboard shortcut
-- Default: `st.chat_input()` (Enter submits).
-- If multiline needed: add a toggle to switch to `st.text_area()` + “Send”.
-- Debug toggle in sidebar: Activity Log hidden when debug OFF.
-
----
-
-## Backend integration (thin)
-UI should call ONE backend entrypoint used by CLI (preferred).
-If a tiny adapter is needed, add:
-
-File: `app/ui/ui_backend_adapter.py`
-
-```python
-from collections.abc import Iterator
-from typing import Any
-
-def run_request_stream(user_text: str) -> Iterator[Any]:
-    """Yield events during execution; last yield may be the final result event."""
-
-def extract_final_assistant_text(events: list[Any]) -> str:
-    """Return the assistant text from accumulated events/results."""
-```
-
-Keep adapter minimal (call existing orchestrator/router).
-
----
-
-## Tests (required before manual UI testing)
-Create: `tests/test_ui_event_formatting.py`
-
-Test cases:
-- `format_event_line()` handles:
-  - dict event with `type` + `message`
-  - dataclass event with `.type`/`.message`
-  - string event
-  - unknown object → safe string (no crash)
-- core logic never returns empty assistant message (fallback is used)
-
-If you add the adapter, test `extract_final_assistant_text()` too.
-
----
-
-## Manual verification (Copilot must run + paste outputs)
-1) `pytest -q`
-2) `.venv/bin/streamlit run app/ui/streamlit_app.py`
-3) In UI:
-- send `hi` → assistant replies (not empty)
-- send `show me 10 rows from v_dlv_dep_prty_clr`
-  - assistant responds with results summary
-  - Activity Log streams events when Debug ON
-
----
-
-## Acceptance Criteria
-- TD-styled UI (white/green, clean cards).
-- Assistant message is NEVER empty.
-- Activity Log streams and can be hidden with Debug toggle.
-- No heavy deps added.
-- `pytest -q` passes.
-
-Now implement, run verification commands, and paste:
-- `pytest -q` output
-- Streamlit startup output + one interaction log
+other info:
+  - If you find an existing prompt file (e.g., app/prompts/*.md or similar), update it in-place.
+  - If prompts are embedded in Python, extract them into a dedicated prompt file only if low-risk.
+  - Keep changes minimal and testable; do not refactor unrelated parts.
