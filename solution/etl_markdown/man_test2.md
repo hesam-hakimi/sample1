@@ -1,18 +1,7 @@
 # TD‑Themed Text‑to‑SQL UI (Streamlit) — Copilot Build Spec (No implementation code)
 
 > **Purpose:** This doc is meant to be pasted into **GitHub Copilot Chat** inside the repo so it can implement the UI step‑by‑step.
->
-> **Constraints you gave:**
-> - **TD theme:** white + TD green, clean cards, TD logo.
-> - **Interactive chat UI** where the **LLM decides** whether to query **Azure AI Search** (metadata) and/or run **SQL** (SQLite now; Oracle later).
-> - **Clarifying questions** when user intent/metadata is unclear.
-> - **Streaming logs** visible to the user (thought process + tool steps).
-> - **Keyboard shortcut** to submit (and generally modern UX).
-> - **No Hugging Face** / external downloads; keep dependencies minimal.
-> - **Managed Identity auth** (same method as earlier backend).
-> - **Debug panel** exists but must be **disabled unless DEBUG=true**.
 
----
 
 ## 1) Pick the UI framework (decision)
 
