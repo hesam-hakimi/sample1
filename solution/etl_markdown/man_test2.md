@@ -149,3 +149,4 @@ Run these in order and ensure no failures:
 - Keep changes minimal and localized to `TraceEvent` and any direct call sites.
 - Do not refactor unrelated UI code.
 - If you find multiple competing `TraceEvent` definitions (duplicate classes in other files), remove duplication and keep a **single canonical model** in `app/ui/models.py`, and import it everywhere else.
+
