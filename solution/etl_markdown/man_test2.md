@@ -1,38 +1,76 @@
-## Prompt: Fix Streamlit `NameError: name 'display' is not defined` (CSS leaked into Python)
+## Prompt: Make the Streamlit UI look modern (TD-style: clean white + green), without breaking logic
 
-You are working in a Python Streamlit repo. Running:
+You are in a Python Streamlit repo. The app works, but the UI looks plain/misaligned.  
+Refactor **ONLY the UI layer** to look modern and polished (white background, TD-green accents), while keeping the existing SQL generation/execution logic unchanged.
 
-- `streamlit run app/ui/streamlit_app.py`
+### Target file(s)
+- Primary: `app/ui/streamlit_app.py`
+- You may add small UI helpers in `app/ui/` if needed (e.g., `ui_components.py`), but avoid big refactors.
 
-fails with:
+---
 
-- `NameError: name 'display' is not defined`
-- Trace shows `app/ui/streamlit_app.py` around a line like: `display: inline-block;`
+## Requirements
 
-### Root cause
-Raw CSS property lines (e.g., `display: ...;`, `padding: ...;`) are sitting in **Python scope** (not inside a string). Python tries to execute them as code → `NameError`.
+### 1) Keep core behavior identical
+- Do **not** change how the app:
+  - reads config
+  - calls the orchestrator/LLM
+  - executes SQL
+  - returns results
+- Only improve layout, styling, and presentation.
 
-### What to do
-1. Open `app/ui/streamlit_app.py`.
-2. Find **any CSS-like lines** that are not inside a Python string (search for patterns like `display:`, `padding:`, `margin:`, `border:`, `background:`, `font-`, `color:`).
-3. Move **ALL** CSS into a single CSS injection block that runs once near the top of the script, right after imports. Use either:
-   - one `st.markdown("""<style>...</style>""", unsafe_allow_html=True)`, or
-   - a helper like `def inject_css(): ...` then call it once.
+### 2) Modern page layout (like a clean banking dashboard)
+Implement:
+- `st.set_page_config(page_title="Text2SQL", layout="wide")`
+- A clean header area:
+  - left: logo + app name + subtitle
+  - right: small status pill (e.g., “Local Mode” / “Connected”)
+- A main “query card” section:
+  - Question input (full width)
+  - Result limit slider + “Show SQL” toggle + Run button aligned nicely in one row
+- A results section that feels “app-like”, not “notebook-like”.
 
-**Important:** After the fix, there must be **zero** bare CSS properties in Python scope.
+### 3) Results presentation (must be better than current)
+- Show results in **Tabs**:
+  - **Results**: data grid
+  - **SQL**: generated SQL in a code block
+  - **Debug**: timing + row count + any debug output (if exists)
+- Use `st.dataframe` for the grid, set a reasonable height and enable full width.
+- If there are 0 rows, show a friendly message with suggestions (but do not change backend logic).
 
-### Also keep these constraints
-- Don’t redesign the whole app. Keep existing UI/layout logic the same.
-- Keep styling deterministic (no user-input HTML injection).
-- If you see any `st.image(..., use_container_width=...)` deprecation warnings, update to the modern parameter style (e.g., `width="stretch"` or equivalent per Streamlit docs) while keeping behavior the same.
-- If the app loads a logo from `assets/td_logo.png`, make it robust: if the file is missing or not a valid image, show a clean fallback (e.g., a “TD” badge) instead of crashing.
+### 4) Styling rules (avoid previous CSS crash)
+- All CSS must be injected via **ONE** function, called once:
+  - `inject_css()` that uses `st.markdown("""<style>...</style>""", unsafe_allow_html=True)`
+- There must be **zero** stray CSS lines in Python scope.
+- Use a clean design:
+  - white background
+  - subtle borders
+  - soft shadows
+  - TD-like green accent for buttons/toggles/headers
+- Don’t use external CDNs.
 
-### Verification (must do)
-Run these commands and ensure they pass:
-- `python -m compileall app/ui/streamlit_app.py`
-- `streamlit run app/ui/streamlit_app.py`
+### 5) Logo robustness (no crashes)
+- If `assets/td_logo.png` is missing/invalid, show a fallback “TD” badge (still green) and continue.
 
-### Deliverable
-- Provide the patch / code changes.
-- Briefly explain what lines caused the `NameError`, and where the CSS now lives.
-- Confirm the verification commands succeed.
+### 6) Streamlit compatibility cleanup
+- Fix any Streamlit deprecation warnings (e.g. `use_container_width` changes) while keeping behavior identical.
+
+---
+
+## Acceptance Criteria (must pass)
+1. `python -m compileall app/ui/streamlit_app.py` ✅
+2. `streamlit run app/ui/streamlit_app.py` ✅ loads without errors
+3. UI looks modern and aligned:
+   - header is neat
+   - query controls are aligned
+   - results are in tabs
+   - dataframe uses full width and has a good height
+
+---
+
+## Deliverable
+- Provide a patch (diff) or the full updated `app/ui/streamlit_app.py` (and any small helper file if you created one).
+- Explain briefly:
+  - what UI sections were changed
+  - where CSS is injected
+  - how logo fallback works
