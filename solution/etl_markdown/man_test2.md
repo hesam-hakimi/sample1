@@ -1,195 +1,204 @@
-# Copilot Prompt — Add Minimal Agent Smoke Test (no framework)
+# Copilot Prompt — Backend-first: Event Streaming + Tests (UI comes later)
 
-Create a new file: `scripts/agent_smoke_test.py`
+> **Do NOT implement any Streamlit/UI changes in this step.**  
+> Focus on backend reliability + test coverage. After this passes, we will wire the same event stream into the UI.
 
-Paste the following code exactly. Do NOT change existing files.
+## Goal
 
-```python
-"""
-Minimal 'agent' smoke test (no agentic frameworks).
-Goal: prove the loop works: plan -> tool -> observe -> next step, with streaming logs.
+1) Add a **structured activity/event stream** to the backend that captures progress like:
 
-Run:
-  /app1/tag5916/projects/text2sql_v2/.venv/bin/python scripts/agent_smoke_test.py "show me 10 rows from v_dlv_dep_prty_clr"
+- deciding whether tools are needed  
+- calling AI Search  
+- building prompt  
+- generating SQL  
+- sanitizing SQL (remove markdown fences)  
+- validating SQL (basic)  
+- executing SQL  
+- **0-row fallback** diagnostics  
+- errors/retries (max 5) decisions
 
-Optional env:
-  DRY_RUN=true   # default true (no LLM call)
-  MAX_STEPS=5    # default 5
-"""
+2) Add **tests** to verify the stream + critical behaviors.
 
-from __future__ import annotations
+## Constraints (must follow)
 
-import os
-import re
-import json
-import time
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+- **No new agent frameworks** (keep it lightweight, pure Python).  
+- Keep existing public APIs working; add new optional params rather than breaking changes.  
+- Avoid new heavy dependencies. Use `pytest` if already present; otherwise add it.  
+- Logging must be **structured** (events), not just `print()`.
 
-# Optional .env loading (safe if python-dotenv is not installed)
-try:
-    from dotenv import load_dotenv  # type: ignore
-    load_dotenv()
-except Exception:
-    pass
+## Quick repo scan (do this first)
 
+Search the repo for these files/classes and note current signatures:
+- `app/main_cli.py` (CLI entry)
+- `app/core/llm_service.py` (LLM calls + response_format handling)
+- `app/core/sql_service.py` (SQLite execution)
+- `app/core/query_orchestrator.py` OR `app/core/orchestrator.py` OR similar (router/orchestrator)
+- `app/core/query_result.py` (already introduced for 0-row fallback)
+- `app/core/ai_search_service.py` or similar (Azure AI Search tool integration)
 
-@dataclass
-class AgentDecision:
-    action: str  # "tool" | "clarify" | "final"
-    tool_name: Optional[str] = None
-    tool_input: Optional[Dict[str, Any]] = None
-    message: Optional[str] = None
+If some names differ, **adapt the changes to the actual structure** but keep the intent.
 
+---
 
-class ToolRegistry:
-    def __init__(self) -> None:
-        self._tools: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {}
+## New backend types to add (signatures)
 
-    def register(self, name: str, fn: Callable[[Dict[str, Any]], Dict[str, Any]]) -> None:
-        self._tools[name] = fn
+### 1) `app/core/events.py`
 
-    def call(self, name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
-        if name not in self._tools:
-            raise KeyError(f"Tool not found: {name}")
-        return self._tools[name](tool_input)
+Create these types:
 
+**`LogEvent` (dataclass)**
+- `ts: datetime` (UTC)
+- `stage: str`  (examples: `planner`, `ai_search`, `prompt`, `llm`, `sql_sanitize`, `sql_validate`, `sql_execute`, `fallback`, `retry`, `error`)
+- `message: str`
+- `level: str` (one of: `info`, `warning`, `error`)
+- `data: dict | None` (optional structured payload)
 
-class SimpleAgent:
-    """
-    A tiny agent that decides between tools by rules (DRY_RUN) or by LLM later.
-    For now, we keep it dependency-light so it works in restricted environments.
-    """
+**`EventSink` (protocol / interface)**
+- `emit(self, event: LogEvent) -> None`
 
-    def __init__(self, tools: ToolRegistry) -> None:
-        self.tools = tools
+**`NullEventSink`**
+- does nothing
 
-    def log(self, text: str) -> None:
-        # stream-style logs
-        print(f"[agent] {text}", flush=True)
+**`ListEventSink`**
+- stores events in-memory for tests (`events: list[LogEvent]`)
 
-    def plan(self, user_text: str, last_observation: Optional[Dict[str, Any]]) -> AgentDecision:
-        """
-        Decision policy:
-          - If user asks ambiguous request, ask clarification.
-          - If user mentions "metadata" or "relationship", call search tool.
-          - Else assume SQL tool.
-        """
-        # Example clarification trigger (extend later)
-        if len(user_text.strip()) < 4:
-            return AgentDecision(action="clarify", message="Can you rephrase your question with more detail?")
+Optionally add:
+- `emit_info(stage, message, data=None)`
+- `emit_warn(...)`
+- `emit_error(...)`
 
-        t = user_text.lower()
+### 2) Extend `QueryResult` (or create a wrapper response)
 
-        if any(k in t for k in ["metadata", "meta data", "relationship", "fields", "table info", "schema"]):
-            return AgentDecision(
-                action="tool",
-                tool_name="search_metadata",
-                tool_input={"query": user_text, "top_k": 5},
-            )
+You already have `QueryResult`. Update it (non-breaking) to include:
 
-        # Default: go SQL
-        return AgentDecision(
-            action="tool",
-            tool_name="run_sql",
-            tool_input={"nl_query": user_text, "limit": 10},
-        )
+- `assistant_message: str | None`  (final user-facing response)
+- `sql: str | None`
+- `rows: list[dict] | None`  (or your existing format)
+- `row_count: int | None`
+- `events: list[LogEvent]`  (copy from sink at end)
 
-    def run(self, user_text: str, max_steps: int = 5) -> Dict[str, Any]:
-        self.log("Starting agent loop")
-        observation: Optional[Dict[str, Any]] = None
+If you cannot safely change `QueryResult`, create a new dataclass (e.g., `OrchestratorResponse`) with the fields above and return that from the orchestrator **without breaking existing callers**.
 
-        for step in range(1, max_steps + 1):
-            self.log(f"Step {step}/{max_steps}: planning")
-            decision = self.plan(user_text, observation)
+---
 
-            if decision.action == "clarify":
-                self.log("Need clarification")
-                return {"status": "clarify", "message": decision.message}
+## Orchestrator changes (core of this step)
 
-            if decision.action == "final":
-                self.log("Final answer ready")
-                return {"status": "final", "message": decision.message, "observation": observation}
+Find the function that handles a user question end-to-end (router/orchestrator). Update it so:
 
-            # Tool call
-            assert decision.tool_name and decision.tool_input is not None
-            self.log(f"Calling tool: {decision.tool_name} with {decision.tool_input}")
+### A) It accepts an optional event sink
+Add a parameter:
+- `event_sink: EventSink | None = None`
+and inside do:
+- `sink = event_sink or NullEventSink()`
 
-            try:
-                observation = self.tools.call(decision.tool_name, decision.tool_input)
-                self.log(f"Tool observation keys: {list(observation.keys())}")
-            except Exception as e:
-                self.log(f"Tool error: {type(e).__name__}: {e}")
-                return {"status": "error", "error_type": type(e).__name__, "error": str(e)}
+### B) Emit events at each step
+Emit at least:
 
-            # Simple stop condition for smoke test
-            if observation.get("done") is True:
-                self.log("Tool signaled done=True, finishing")
-                return {"status": "final", "message": observation.get("message", "Done"), "observation": observation}
+1. `planner` — received question
+2. `planner` — deciding tools needed
+3. `ai_search` — if called: query + number of docs returned
+4. `prompt` — building prompt (DO NOT log secrets)
+5. `llm` — calling LLM, and LLM returned (include model/deployment name if safe)
+6. `sql_sanitize` — before/after sanitization (do not log huge SQL; truncate)
+7. `sql_validate` — validation success/fail reason
+8. `sql_execute` — execution started + completed, include row_count
+9. `fallback` — only when row_count == 0: discovered likely filter columns + top values
+10. `error` — exceptions with safe message
+11. `retry` — when you decide to retry (max 5), include reason + attempt number
 
-            # Otherwise continue loop (in real agent you'd feed observation back to LLM)
-            time.sleep(0.05)
+### C) Fix “hi” / smalltalk producing no assistant message
+If the user says something like `hi`, `hello`, `help`:
+- return a friendly assistant_message and emit `planner` event
+- do **not** attempt SQL execution
+This should prevent the UI from showing “(No assistant message returned)”.
 
-        self.log("Reached max steps without final answer")
-        return {"status": "max_steps", "observation": observation}
+### D) SQL sanitization must be centralized
+Ensure the final SQL passed to SQLite never contains:
+- triple backticks
+- leading “```sql”
+- trailing “```”
+Emit a `sql_sanitize` event showing that sanitization happened.
 
+### E) Retry logic (model decides based on error)
+Implement a retry loop (max 5):
+- If LLM or tool call fails with a transient-ish error (timeout, rate limit, connection error), emit `retry` and retry.
+- If SQL execution fails due to obvious SQL syntax issues, emit `error`, then:
+  - call LLM once to “repair SQL” using the error message and schema context
+  - emit `retry`
+- Always stop after 5 attempts and return a helpful assistant_message.
 
-# -------------------------
-# Stub tools (replace later)
-# -------------------------
+---
 
-def tool_search_metadata(inp: Dict[str, Any]) -> Dict[str, Any]:
-    q = inp.get("query", "")
-    top_k = int(inp.get("top_k", 5))
-    # Stub response (replace with Azure AI Search query)
-    return {
-        "done": True,
-        "message": f"(stub) searched metadata for: {q}",
-        "top_k": top_k,
-        "results": [
-            {"id": "meta_data_field:demo", "score": 1.0, "text": "Field metadata result (stub)"},
-        ],
-    }
+## CLI wiring (backend-only)
 
+Update `app/main_cli.py` so that:
+- It creates a `ListEventSink`
+- Passes it into orchestrator
+- Prints events to console as they happen (or at end)
+  - Format: `[stage] message` (keep it short)
+- If assistant_message is empty/None, print a safe default.
 
-def tool_run_sql(inp: Dict[str, Any]) -> Dict[str, Any]:
-    nlq = inp.get("nl_query", "")
-    limit = int(inp.get("limit", 10))
+> Keep CLI backwards compatible: existing command `python -m app.main_cli "question"` should still work.
 
-    # Extremely naive NL->SQL for smoke test
-    # Replace with your real LLM->SQL + sqlite execution later.
-    if "from" in nlq.lower():
-        sql = nlq
-    else:
-        # Try to infer a table name token
-        m = re.search(r"(v_[a-z0-9_]+)", nlq.lower())
-        table = m.group(1) if m else "v_dlv_dep_prty_clr"
-        sql = f"SELECT * FROM {table} LIMIT {limit};"
+---
 
-    return {
-        "done": True,
-        "message": f"(stub) would execute SQL: {sql}",
-        "sql": sql,
-        "rows_preview": [],
-    }
+## Tests (must add)
 
+Create/extend tests under `tests/` using `pytest`.
 
-def main() -> None:
-    import sys
+### Test 1 — events are emitted for a normal query
+- Use a **FakeLLM** that returns SQL like: `SELECT 1 as x LIMIT 1;`
+- Use a **FakeSQLService** that returns 1 row
+- Assert:
+  - returned `assistant_message` is not empty
+  - events include stages: `planner`, `llm`, `sql_sanitize`, `sql_execute`
 
-    user_text = sys.argv[1] if len(sys.argv) > 1 else "show me 10 rows from v_dlv_dep_prty_clr"
-    max_steps = int(os.getenv("MAX_STEPS", "5"))
+### Test 2 — markdown fences are stripped
+- FakeLLM returns:
+  - ```sql
+    SELECT 1;
+    ```
+- Assert SQL passed to executor has no backticks and no “sql” fence.
 
-    tools = ToolRegistry()
-    tools.register("search_metadata", tool_search_metadata)
-    tools.register("run_sql", tool_run_sql)
+### Test 3 — 0-row fallback emits diagnostics
+- FakeSQLService returns 0 rows
+- Ensure `fallback` stage event exists and includes some `data` payload (e.g. `candidate_filters`, `top_values`)
+- Ensure assistant_message includes a helpful explanation + suggestion
 
-    agent = SimpleAgent(tools)
-    result = agent.run(user_text, max_steps=max_steps)
+### Test 4 — “hi” returns assistant message and no SQL execution
+- Input: `hi`
+- Assert assistant_message is not empty
+- Assert no `sql_execute` event exists
 
-    print("\n=== RESULT ===")
-    print(json.dumps(result, indent=2))
+> If you already have a dependency injection approach, use it. If not, minimally refactor orchestrator to accept `llm_service` and `sql_service` as optional parameters to enable fakes in tests.
 
+---
 
-if __name__ == "__main__":
-    main()
+## Verification commands (run locally)
+
+1) Run tests:
+- `pytest -q`
+
+2) Run CLI:
+- `python -m app.main_cli "hi"`
+- `python -m app.main_cli "show me 10 rows from v_dlv_dep_prty_clr"`
+
+Expected:
+- assistant_message printed
+- event log shows meaningful stages
+- no crashes
+
+---
+
+## Deliverables for this step
+
+- `app/core/events.py` added
+- orchestrator updated to accept `event_sink` and emit events
+- `QueryResult` (or new response) includes `events`
+- CLI prints/logs events and never returns empty assistant message
+- tests added and passing
+
+When done, paste:
+- `pytest -q` output
+- output of the 2 CLI commands above
+- a short list of files changed
