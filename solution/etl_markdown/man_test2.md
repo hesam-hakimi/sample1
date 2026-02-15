@@ -1,76 +1,77 @@
-## Prompt: Make the Streamlit UI look modern (TD-style: clean white + green), without breaking logic
+## Copilot / Codex Prompt — Fix Streamlit errors (NameError `display` + ModuleNotFoundError `No module named 'app'`)
 
-You are in a Python Streamlit repo. The app works, but the UI looks plain/misaligned.  
-Refactor **ONLY the UI layer** to look modern and polished (white background, TD-green accents), while keeping the existing SQL generation/execution logic unchanged.
+You are working in this repo (Linux path example): `/app1/tag5916/projects/text2sql_v2/`
 
-### Target file(s)
-- Primary: `app/ui/streamlit_app.py`
-- You may add small UI helpers in `app/ui/` if needed (e.g., `ui_components.py`), but avoid big refactors.
-
----
-
-## Requirements
-
-### 1) Keep core behavior identical
-- Do **not** change how the app:
-  - reads config
-  - calls the orchestrator/LLM
-  - executes SQL
-  - returns results
-- Only improve layout, styling, and presentation.
-
-### 2) Modern page layout (like a clean banking dashboard)
-Implement:
-- `st.set_page_config(page_title="Text2SQL", layout="wide")`
-- A clean header area:
-  - left: logo + app name + subtitle
-  - right: small status pill (e.g., “Local Mode” / “Connected”)
-- A main “query card” section:
-  - Question input (full width)
-  - Result limit slider + “Show SQL” toggle + Run button aligned nicely in one row
-- A results section that feels “app-like”, not “notebook-like”.
-
-### 3) Results presentation (must be better than current)
-- Show results in **Tabs**:
-  - **Results**: data grid
-  - **SQL**: generated SQL in a code block
-  - **Debug**: timing + row count + any debug output (if exists)
-- Use `st.dataframe` for the grid, set a reasonable height and enable full width.
-- If there are 0 rows, show a friendly message with suggestions (but do not change backend logic).
-
-### 4) Styling rules (avoid previous CSS crash)
-- All CSS must be injected via **ONE** function, called once:
-  - `inject_css()` that uses `st.markdown("""<style>...</style>""", unsafe_allow_html=True)`
-- There must be **zero** stray CSS lines in Python scope.
-- Use a clean design:
-  - white background
-  - subtle borders
-  - soft shadows
-  - TD-like green accent for buttons/toggles/headers
-- Don’t use external CDNs.
-
-### 5) Logo robustness (no crashes)
-- If `assets/td_logo.png` is missing/invalid, show a fallback “TD” badge (still green) and continue.
-
-### 6) Streamlit compatibility cleanup
-- Fix any Streamlit deprecation warnings (e.g. `use_container_width` changes) while keeping behavior identical.
+### Goal
+Make `streamlit run app/ui/streamlit_app.py` work reliably with:
+1) **No stray CSS interpreted as Python** (fix `NameError: name 'display' is not defined`)
+2) **No import failure** (fix `ModuleNotFoundError: No module named 'app'`)
+3) Keep changes minimal + safe. Do not change business logic.
 
 ---
 
-## Acceptance Criteria (must pass)
-1. `python -m compileall app/ui/streamlit_app.py` ✅
-2. `streamlit run app/ui/streamlit_app.py` ✅ loads without errors
-3. UI looks modern and aligned:
-   - header is neat
-   - query controls are aligned
-   - results are in tabs
-   - dataframe uses full width and has a good height
+## What to do (REQUIRED)
+
+### 1) Fix the stray CSS → Python issue
+- Open `app/ui/streamlit_app.py`
+- Find any lines like `display: inline-block;` or other CSS properties that exist as raw Python statements.
+- Move ALL CSS into a single helper like:
+
+- `def inject_css(): st.markdown("""<style> ... </style>""", unsafe_allow_html=True)`
+- Call `inject_css()` once near the top (after imports and `st.set_page_config`).
+
+✅ Result: no `NameError: display is not defined` and no “CSS lines in Python scope”.
 
 ---
 
-## Deliverable
-- Provide a patch (diff) or the full updated `app/ui/streamlit_app.py` (and any small helper file if you created one).
-- Explain briefly:
-  - what UI sections were changed
-  - where CSS is injected
-  - how logo fallback works
+### 2) Fix `ModuleNotFoundError: No module named 'app'`
+This happens because Streamlit’s working directory / sys.path doesn’t include the project root, so `from app.core...` fails.
+
+Implement **ONE** of the following solutions (prefer A; use B if packaging already exists):
+
+#### Option A (minimal + reliable): add project-root bootstrap to sys.path
+At the top of `app/ui/streamlit_app.py` (before `from app.core...` imports), add:
+
+- `from pathlib import Path`
+- `import sys`
+- `PROJECT_ROOT = Path(__file__).resolve().parents[2]  # .../text2sql_v2`
+- `sys.path.insert(0, str(PROJECT_ROOT))` only if not already present.
+
+Then keep the normal import:
+- `from app.core.orchestrator_facade import run_question`
+
+#### Option B (packaging): ensure `app` is a real package and install it
+- Ensure these files exist (create if missing):
+  - `app/__init__.py`
+  - `app/core/__init__.py`
+  - `app/ui/__init__.py`
+- If repo has `pyproject.toml` / `setup.py`, run editable install:
+  - `pip install -e .`
+- Then imports should work without sys.path hacks.
+
+✅ Result: Streamlit can import `app.*` when run from anywhere.
+
+---
+
+## Verification (MUST RUN and report results)
+Run from repo root: `/app1/tag5916/projects/text2sql_v2`
+
+1) Syntax check:
+- `python -m compileall app/ui/streamlit_app.py`
+
+2) Import check:
+- `python -c "import app; import app.core.orchestrator_facade; print('imports OK')"`
+
+3) Run Streamlit:
+- `.venv/bin/streamlit run app/ui/streamlit_app.py`
+  (or `python -m streamlit run app/ui/streamlit_app.py`)
+
+✅ App should load at `http://localhost:8501` without traceback.
+
+---
+
+## Output format (IMPORTANT)
+- Provide a **single patch** (diff) or edited file content for `app/ui/streamlit_app.py`
+- If you create `__init__.py` files, include them too.
+- Then list the exact commands used for verification + their outputs (short).
+- Do NOT add extra explanations beyond what’s needed.
