@@ -1,262 +1,195 @@
-# Refactor: Two‑Phase LLM Router (Plan → Tools → Answer) for Text2SQL Streamlit App
+# Text2SQL — Fix Streamlit crash: `AttributeError: 'LLMService' object has no attribute 'chat_completion'`
 
-You are GitHub Copilot working inside this repository. Implement the refactor described below **end‑to‑end** (code + tests + run verification).  
-Goal: **Every user message goes to the Chat Completion model first** to produce a **structured Plan JSON**. The app then decides whether to call tools (Azure AI Search / SQL) based on that Plan. Finally, the app calls Chat Completion again to produce the final assistant message (with tool results merged in).
+You are working inside the repo that contains the Streamlit Text2SQL app.
+
+## Goal
+When running:
+```bash
+.venv/bin/streamlit run app/ui/streamlit_app.py
+```
+and the user types **“hi”**, the app must **not crash**. It must complete the **two‑phase LLM router** flow:
+1) **Planner** LLM call returns a JSON plan (whether tools are needed).  
+2) If no tools → **Responder** LLM call returns the final assistant message.  
+   If tools → run tools → **Finalizer** LLM call returns final assistant message (using tool results).
+
+Right now it crashes at:
+- `app/core/llm_router.py` → calling `self.llm_service.chat_completion(...)`
+- But `LLMService` has **no** `chat_completion` method.
+
+## What to change (high level)
+Implement a **single, reusable** `chat_completion()` method on `LLMService` (in `app/core/llm_service.py`) and update callers (if needed) so:
+- Planner can request **JSON** outputs safely.
+- Responder/Finalizer can request **text** outputs.
+- Existing methods like `generate_sql(...)`, `extract_sql(...)`, `interpret_result(...)` keep working and ideally **reuse** the same internal OpenAI/Azure OpenAI client code path.
 
 ---
 
-## Target behavior (must match)
+## Step 1 — Locate `LLMService`
+Find the class definition:
+- `app/core/llm_service.py` (or similar)
+Search for:
+- `class LLMService:`
+- existing methods that already call the LLM (e.g., `generate_sql`, `call_llm`, `_chat`, `complete`, etc.)
 
-### 1) Always call LLM for a Plan
-When the user sends any input (including “hi”), the app must first call Chat Completion with a “planner” prompt and receive **JSON** like:
-
-```json
-{
-  "decision": "DIRECT|CLARIFY|AI_SEARCH|SQL|AI_SEARCH_AND_SQL",
-  "reason": "short rationale",
-  "clarifying_question": null,
-  "ai_search_query": null,
-  "sql_goal": null,
-  "constraints": {
-    "max_rows": 50,
-    "execution_target": "sqlite|oracle"
-  }
-}
-```
-
-### 2) App executes based on decision
-- **DIRECT**: call Chat Completion again to answer directly (no tools).
-- **CLARIFY**: return a clarification question to the UI (no tools).
-- **AI_SEARCH**: call the AI search tool, then call Chat Completion to answer using the search results.
-- **SQL**: (a) get schema context (via metadata search) if needed, (b) call Chat Completion to generate SQL, (c) run SQL tool, then call Chat Completion to answer using SQL + result.
-- **AI_SEARCH_AND_SQL**: do AI search first (or parallel if safe), then SQL path, then final answer call with everything merged.
-
-### 3) Streaming activity log
-The UI must show a **streaming activity log** while the pipeline runs (planner → search → sql generation → sql execution → final answer).  
-Each step emits `TraceEvent(stage=..., message=...)` and the UI re-renders those events live.
-
-### 4) Greeting “hi” must not hit tools
-When user says “hi/hello/thanks”, the Plan should return `decision="DIRECT"`, and the final answer should be a friendly greeting, **no SQL**, **no AI Search**.
+**Key requirement:** Do **not** duplicate LLM calling logic. Add `chat_completion()` and have existing methods reuse it (or vice‑versa).
 
 ---
 
-## Critical fixes required (based on current failures)
+## Step 2 — Add `chat_completion()` to `LLMService`
+Add this method to `LLMService` (names/fields may be adjusted to match the repo’s config/client):
 
-### A) Fix TraceEvent constructor mismatch
-Current crash: `TypeError: TraceEvent.__init__() got an unexpected keyword argument 'stage'`.
+### Required signature (recommended)
+```python
+from __future__ import annotations
 
-**Fix**: Standardize `TraceEvent` in **one place only** (`app/ui/models.py`). It must include `stage`.
+from typing import Any, Optional
 
-**Required dataclass**
-```py
-@dataclass(frozen=True)
-class TraceEvent:
-    ts_iso: str
-    stage: str
-    message: str
-    level: str = "info"  # optional, default
-    data: dict | None = None
-```
+class LLMService:
+    ...
 
-Then update **all call sites** to use exactly these field names.
-
-### B) Remove duplicate UIOptions / models drift
-If `UIOptions` exists in multiple files (e.g., `orchestrator_client.py`), remove duplicates and import from `app.ui.models` everywhere.  
-Same for `ChatMessage`, `TurnResult`/`UIRunResult`, and `TraceEvent`.
-
-### C) Ensure `from __future__ import annotations` appears only once at the top
-Some tests failed with:
-`SyntaxError: from __future__ imports must occur at the beginning of the file`.
-
-**Rule**: If present, it must be the first statement (after optional module docstring), and only once per file.
-
----
-
-## Files to refactor / create
-
-### 1) `app/ui/models.py`  (single source of truth)
-Must contain (and be used by all UI code):
-- `UIOptions`
-- `ChatMessage`
-- `TraceEvent` (with `stage`)
-- `TurnResult` (or `UIRunResult`) — pick one name and use everywhere consistently.
-
-Recommended shapes:
-
-```py
-@dataclass(frozen=True)
-class UIOptions:
-    max_rows: int = 50
-    execution_target: str = "sqlite"  # or "oracle"
-    debug_enabled: bool = False
-
-@dataclass(frozen=True)
-class ChatMessage:
-    role: str  # "user" | "assistant"
-    content: str
-    ts_iso: str
-
-@dataclass(frozen=True)
-class TurnResult:
-    assistant_message: str | None
-    clarification_question: str | None
-    sql: str | None
-    df: "pd.DataFrame | None"
-    error_message: str | None
-    debug_details: str | None
-```
-
-### 2) `app/core/plan_models.py` (new)
-Define planner output model + validation.
-- `DecisionKind` enum
-- `Plan` dataclass (or pydantic model) with fields shown in JSON.
-
-Add:
-- `Plan.from_json(text: str) -> Plan` that strictly validates and falls back safely (default to CLARIFY if invalid).
-
-### 3) `app/core/llm_router.py` (new)
-This is the orchestrator for the two-phase flow. It should implement:
-
-```py
-class LLMRouter:
-    def plan(self, user_text: str, history: list[ChatMessage], options: UIOptions, trace_cb: TraceCallback|None) -> Plan: ...
-    def answer_direct(self, user_text: str, history: list[ChatMessage], options: UIOptions, trace_cb: TraceCallback|None) -> str: ...
-    def generate_sql(self, user_text: str, history: list[ChatMessage], schema_context: str, options: UIOptions, trace_cb: TraceCallback|None) -> str: ...
-    def final_answer(self, user_text: str, history: list[ChatMessage], plan: Plan, tool_payload: dict, options: UIOptions, trace_cb: TraceCallback|None) -> str: ...
-```
-
-Implementation can reuse your existing `LLMService` if present, but keep the responsibilities clean:
-- `plan()` must return **ONLY** a Plan JSON parsed into `Plan`.
-- `answer_direct()` is a standard chat completion answer.
-- `generate_sql()` returns SQL only (or JSON with `{ "sql": "..." }`).
-- `final_answer()` returns assistant message using tool payload + plan.
-
-### 4) Tool wrappers (reuse existing services)
-Reuse:
-- `SearchService` for AI search / metadata search
-- `SQLService` for SQL execution
-
-But **move all decision logic** into the Plan + router pipeline.
-
-### 5) `app/ui/orchestrator_client.py` (refactor)
-This class should become a thin facade that calls the new router pipeline and returns `TurnResult`.
-
-Required signature:
-```py
-TraceCallback = Callable[[TraceEvent], None]
-
-class OrchestratorClient:
-    def run_turn(
+    def chat_completion(
         self,
-        user_text: str,
-        history: list[ChatMessage],
-        options: UIOptions,
-        trace_cb: TraceCallback | None = None,
-    ) -> TurnResult:
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.0,
+        max_tokens: Optional[int] = None,
+        response_format: Optional[dict[str, Any]] = None,
+        model: Optional[str] = None,
+    ) -> str:
+        """Return assistant message content as a string.
+
+        - `messages` is OpenAI-style: [{"role":"system","content":"..."}, ...]
+        - `response_format` supports JSON mode when provided (planner).
+        """
         ...
 ```
 
-### 6) `app/ui/state.py` (refactor, ensure these exist)
-Must provide:
-- `init_session_state()`
-- `get_chat_history()` / `append_chat_message()`
-- `get_trace_events()` / `append_trace_event()`
-- `get_ui_options()` / `set_ui_options()`
+### Implementation rules
+1) **Reuse existing client/config.**  
+   If `LLMService` already has something like `self.client` / `self.azure_client` / `self.cfg`, use that.
+2) **Return string content only** (router parses JSON itself).
+3) **Support JSON mode** for planner:
+   - For OpenAI/Azure OpenAI: pass `response_format={"type": "json_object"}` when the router asks for it.
+4) Add minimal, safe error handling:
+   - If the response has no choices or no content, raise a clear exception (so trace shows a real problem).
 
-Implementation must store keys in `st.session_state`:
-- `"messages"`: list[ChatMessage]
-- `"trace_events"`: list[TraceEvent]
-- `"ui_options"` or separate keys for `max_rows`, `execution_target`, `debug_enabled`
+### Example implementation (OpenAI python SDK 1.x style)
+**IMPORTANT:** This is a template. You must adapt to how your repo creates the client and stores config.
+```python
+def chat_completion(
+    self,
+    messages: list[dict[str, str]],
+    *,
+    temperature: float = 0.0,
+    max_tokens: int | None = None,
+    response_format: dict[str, Any] | None = None,
+    model: str | None = None,
+) -> str:
+    mdl = model or getattr(self.cfg, "llm_model", None) or getattr(self.cfg, "model", None)
+    if not mdl:
+        raise ValueError("No model configured for LLMService (cfg.llm_model/cfg.model is missing).")
 
-### 7) `app/ui/streamlit_app.py` (refactor)
-Must:
-- Render transcript from `get_chat_history()`
-- On input: append user message immediately; then call orchestrator once per input
-- Provide a `trace_cb` that appends trace events and live-renders activity log (via placeholder container)
-- Render SQL + dataframe (if present) under assistant message
-- Show errors safely (no stack trace unless debug enabled)
+    kwargs: dict[str, Any] = {
+        "model": mdl,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    if response_format is not None:
+        kwargs["response_format"] = response_format
 
----
+    # Use the same client you already use for generate_sql()
+    resp = self.client.chat.completions.create(**kwargs)
 
-## Planner + SQL generation prompts (must be deterministic & strict)
+    try:
+        content = resp.choices[0].message.content
+    except Exception as e:
+        raise RuntimeError(f"LLM response missing content/choices: {e}") from e
 
-### Planner prompt rules
-- Output **valid JSON only** (no markdown).
-- Must set `decision` to one of the allowed values.
-- For greetings/smalltalk/thanks/help: choose `DIRECT`.
-- For ambiguous: choose `CLARIFY` and ask one short question.
-- For data questions requiring DB: choose `SQL` (or `AI_SEARCH_AND_SQL` if schema is needed).
-- Do not hallucinate table names; if unknown, set `sql_goal` and rely on schema search later.
+    if not content:
+        raise RuntimeError("LLM response content is empty.")
+    return content
+```
 
-### SQL generation prompt rules
-- Output either raw SQL only, or JSON with `{ "sql": "..." }` (choose ONE approach and implement matching parser).
-- Must respect `options.max_rows` (add `LIMIT` for sqlite, `FETCH FIRST n ROWS ONLY` for Oracle where appropriate).
-- Never do destructive statements (no DROP/DELETE/UPDATE/INSERT).
-- If schema context is insufficient, do not guess; return a clarification request instead.
-
----
-
-## Pipeline algorithm (OrchestratorClient.run_turn)
-
-Pseudo:
-
-1. `trace("planner", "Deciding whether tools are needed...")`
-2. `plan = router.plan(...)`
-3. if `plan.decision == CLARIFY`: return TurnResult(clarification_question=...)
-4. if DIRECT:
-   - `trace("llm", "Answering directly...")`
-   - `answer = router.answer_direct(...)`
-   - return TurnResult(assistant_message=answer)
-5. else:
-   - tool_payload = {}
-   - if AI_SEARCH in decision:
-       `trace("ai_search", "Searching...")`
-       tool_payload["ai_search"] = search_service.search(plan.ai_search_query, ...)
-       `trace("ai_search_result", "Search complete")`
-   - if SQL in decision:
-       `trace("schema", "Gathering schema context...")`
-       schema_ctx = search_service.search_metadata(user_text, ...)
-       `trace("sql_generate", "Generating SQL...")`
-       sql = router.generate_sql(user_text, history, schema_ctx, options, trace_cb)
-       `trace("sql_execute", "Executing SQL...")`
-       sql_result = sql_service.execute_sql(sql)
-       tool_payload["sql"] = { "sql": sql, "rows": sql_result.rows, "columns": sql_result.columns, "row_count": sql_result.row_count }
-   - `trace("final", "Composing final answer...")`
-   - answer = router.final_answer(user_text, history, plan, tool_payload, options, trace_cb)
-   - return TurnResult(assistant_message=answer, sql=sql, df=df_if_any)
+If your repo uses **AzureOpenAI**, the call is typically the same shape; only client initialization differs.
+Do NOT re-initialize the client if it already exists.
 
 ---
 
-## Tests (pytest) — required
-Add/adjust tests to prevent regressions:
+## Step 3 — Ensure router uses `chat_completion()` correctly
+Open:
+- `app/core/llm_router.py`
 
-1. **Planner JSON parsing**: invalid JSON => falls back to CLARIFY.
-2. **Greeting**: “hi” results in Plan decision DIRECT and no tool calls.
-3. **TraceEvent signature**: constructing TraceEvent with `stage=` works.
-4. **Import smoke test**: importing `app.ui.streamlit_app` does not raise.
+You should see something like:
+```python
+plan_json = self.llm_service.chat_completion(...)
+```
+Make sure the **planner** call passes JSON mode:
+```python
+plan_json = self.llm_service.chat_completion(
+    messages,
+    temperature=0.0,
+    response_format={"type": "json_object"},
+)
+```
+And responder/finalizer calls do **not** require JSON mode (unless you intentionally want structured output).
 
-Use monkeypatch to stub LLM calls and tool calls; do not hit network.
-
----
-
-## Definition of Done
-- `pytest -q` passes.
-- `streamlit run app/ui/streamlit_app.py` loads without exceptions.
-- Typing “hi”:
-  - shows planner + answer traces
-  - returns a friendly greeting
-  - does **not** call SQL or AI search
-- Data question:
-  - shows traces: planner → (ai_search/schema) → sql_generate → sql_execute → final
-  - shows SQL + dataframe when available
+**Do not rename router methods.** Fix must be minimal and forward-compatible.
 
 ---
 
-## Implementation notes / guardrails
-- Prefer **one canonical model set** in `app/ui/models.py`.
-- Make parsing strict and safe; never crash the app due to bad LLM JSON.
-- Keep changes minimal but consistent; remove duplicate dataclasses.
-- Keep logs/trace text short; avoid leaking secrets in trace messages.
-- Preserve existing public APIs unless they are clearly broken; if you must rename, update all call sites + tests.
+## Step 4 — Add a small unit test (no network calls)
+We want to prevent this exact regression (missing method) in the future.
 
-Now implement the full refactor.
+Create or update a test such as:
+- `app/ui/test_llm_service_contract.py` or `tests/test_llm_service_contract.py`
+
+### Test requirements
+- Must not call the network.
+- Just confirms the method exists and can be called when client is stubbed.
+
+Example:
+```python
+def test_llm_service_has_chat_completion():
+    from app.core.llm_service import LLMService
+
+    svc = LLMService.__new__(LLMService)  # bypass __init__ if it needs secrets
+    assert hasattr(svc, "chat_completion"), "LLMService must expose chat_completion()"
+```
+
+Better (if you can inject client/config):
+- instantiate normally with a dummy config
+- monkeypatch `svc.client.chat.completions.create` to return a fake response
+
+---
+
+## Step 5 — Verify end-to-end
+Run:
+```bash
+.venv/bin/pytest -q
+.venv/bin/streamlit run app/ui/streamlit_app.py
+```
+Then type: **hi**
+
+Expected:
+- Activity log shows planner step(s).
+- No crash.
+- If planner decides no tools: responder returns a friendly greeting.
+- If planner decides tools: it calls tools, then finalizer returns merged answer.
+
+---
+
+## Acceptance criteria (must all pass)
+- ✅ `pytest -q` passes.
+- ✅ Streamlit app starts without crashing.
+- ✅ Typing “hi” does **not** trigger tool execution for SQL/AI Search (planner should decide `decision="respond"`).
+- ✅ Planner uses JSON response format; router parses it safely.
+- ✅ No duplicate LLM call logic added (single source of truth is `LLMService.chat_completion`).
+
+---
+
+## Notes (do not skip)
+- Keep `from __future__ import annotations` at the **very top** of any file that uses it (no blank code before it).
+- If there are multiple `LLMService` definitions or a legacy file, consolidate to one and update imports, but keep changes minimal.
+- If config keys differ (e.g., `cfg.openai_model`, `cfg.azure_openai_deployment`), adapt the method accordingly and keep the router code stable.
