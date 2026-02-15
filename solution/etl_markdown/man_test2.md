@@ -1,118 +1,71 @@
-COPILOT PROMPT — Step 1 (TD-themed UI shell + hook to existing orchestrator)
+COPILOT PROMPT — Fix Streamlit crash on TD logo (PIL.UnidentifiedImageError)
+
+Context
+- Streamlit crashes at startup when rendering the logo.
+- Error: `PIL.UnidentifiedImageError: cannot identify image file <_io.BytesIO object ...>`
+- Failing line is in `app/ui/streamlit_app.py` around the `st.image(...)` call for `LOGO_PATH`.
 
 Goal
-- Build a Streamlit UI with a TD-like look (white + TD green, clean “cards”, TD logo).
-- UI must call the existing end-to-end pipeline (your Query Orchestrator) and display:
-  1) the generated SQL
-  2) the query result grid
-  3) any errors in a user-friendly way
-- Add an inline “Debug panel” section, but it must be DISABLED/HIDDEN unless DEBUG=true.
+- Streamlit must NEVER crash because of the logo.
+- If the logo is missing/invalid/unreadable, show a clean text fallback (“TD”) and continue rendering the app.
+- Keep TD theme (white + green). No secrets printed.
 
-Constraints
-- Do NOT change core logic unless required for the UI integration.
-- Avoid new libraries unless necessary. If Streamlit is not allowed in this environment, stop and report the install error (don’t switch frameworks silently).
-- Never print secrets from .env.
+Step 1 — Validate the asset (do this in terminal)
+1) Confirm the file exists and its size is not zero:
+   - `ls -l assets/td_logo.png`
+2) Identify file type:
+   - `file assets/td_logo.png`
+3) Quick PIL verification:
+   - `python -c "from PIL import Image; p='assets/td_logo.png'; im=Image.open(p); im.verify(); print('OK')"`
 
-What to implement
+If any command fails, assume the logo file is invalid.
 
-A) Dependencies
-1) Check if streamlit is available:
-   - `python -c "import streamlit; print(streamlit.__version__)"`
-2) If missing, add it to requirements.txt and install into the current venv:
-   - Update requirements.txt (append `streamlit`)
-   - Install: `pip install -r requirements.txt`
-3) Re-run the import check above.
+Step 2 — Patch Streamlit to load logo safely (code change)
+In `app/ui/streamlit_app.py`:
 
-B) New files/folders
-Create these files if they don’t exist:
-1) `app/ui/__init__.py`
-2) `app/ui/streamlit_app.py`
-3) `.streamlit/config.toml`  (Streamlit theme file)
-4) `assets/td_logo.png` (placeholder ok; if not available, UI should fall back to a text header “TD”)
+A) Add imports (if not present):
+- `import io`
+- `from PIL import Image, UnidentifiedImageError`
 
-C) Theme (TD-ish)
-In `.streamlit/config.toml` set:
-- base = "light"
-- background = white
-- primary color = TD green (use a constant in UI too so it’s easy to tweak)
-- clean typography (default is fine)
-Also inject small CSS in the app to create “card” containers:
-- rounded corners, subtle border, padding
-- do NOT over-style
+B) Create a helper function (new function) near the top:
+- Name: `render_td_logo(logo_path: Path, width: int = 48) -> None`
+- Behavior:
+  1) If `logo_path` does not exist OR size is 0 → render fallback header:
+     - `st.markdown("<div class='td-brand'>TD</div>", unsafe_allow_html=True)`
+     - return
+  2) Try to load with PIL and pass a PIL Image to Streamlit:
+     - `img = Image.open(logo_path)`
+     - `st.image(img, width=width)`
+  3) Catch `(UnidentifiedImageError, OSError, ValueError)` and fallback to “TD” text (same as above) without raising.
 
-D) UI behavior (Streamlit)
-In `app/ui/streamlit_app.py` implement:
-1) Header
-   - TD logo (if file exists) + title (“Text2SQL”)
-2) Main input card
-   - Text area: user question
-   - Button: “Run”
-   - Optional controls (safe defaults):
-     - Result limit (default 50, slider)
-     - “Show SQL” toggle (on by default)
-3) Results card
-   - Show generated SQL (plain text, no markdown fences)
-   - Show results in a grid (Streamlit dataframe/grid)
-   - If result is empty: show the existing “0 rows fallback” message (whatever the orchestrator returns) and suggestions.
-4) Error handling card
-   - Catch exceptions and show:
-     - Short error summary (1–2 lines)
-     - A “Copy diagnostics” multi-line text block (ONLY when DEBUG=true) that includes:
-       - exception type + message
-       - stack trace
-       - last generated SQL (if available)
-       - model/deployment name (non-secret)
-       - timestamps/timings (if available)
+C) Replace the direct `st.image(...)` call
+- Wherever you currently call `st.image(str(LOGO_PATH), width=48)` (or similar), replace it with:
+  - `render_td_logo(LOGO_PATH, width=48)`
 
-E) Integration point (IMPORTANT)
-- Do NOT re-implement the pipeline in UI.
-- Find the existing “single entry point” that the CLI uses (the code called by `python -m app.main_cli "question"`).
-- Create ONE function that UI calls, for example:
+D) Add minimal CSS for the fallback “TD” badge (inside your existing CSS block)
+- Add a class `.td-brand` with:
+  - TD green background
+  - white text
+  - padding + border radius
+  - bold font
+  - inline-block display
 
-  Function (add ONLY if missing):
-  - `app/core/orchestrator_facade.py`
-    - `def run_question(question: str, *, limit: int | None = None) -> QueryResult:`
-    - This should call the same orchestrator used by CLI and return the same QueryResult structure (or a thin wrapper).
-  - If QueryResult already exists, reuse it.
+IMPORTANT
+- Do NOT change any orchestrator/SQL logic in this step.
+- Only fix logo rendering so the app starts reliably.
 
-Required return structure (must be accessible to UI)
-- QueryResult must provide (directly or via fields):
-  - `sql: str`
-  - `rows: list[dict] | pandas.DataFrame | None`
-  - `row_count: int`
-  - `warnings: list[str]` (for 0-rows suggestions)
-  - `debug: dict` (optional; only populated/used when DEBUG=true)
-  - `error: str | None` (optional; if you prefer not raising)
+Step 3 — Re-run Streamlit (terminal)
+- `/app1/tag5916/projects/text2sql_v2/.venv/bin/streamlit run app/ui/streamlit_app.py`
 
-If the current code doesn’t expose these cleanly:
-- Do the smallest refactor needed so BOTH CLI and Streamlit use the same “run_question” function.
-
-F) Debug mode rules
-- Read DEBUG from env/config (already exists in your project).
-- If DEBUG != true:
-  - Hide/disable the debug panel entirely.
-  - Do not show stack traces.
-- If DEBUG == true:
-  - Show the inline debug panel (expander is fine).
-  - Show “Copy diagnostics”.
-
-G) Run commands (acceptance)
-1) Start UI:
-   - `streamlit run app/ui/streamlit_app.py`
-2) Test query that returns rows:
-   - “show me 10 rows from v_dlv_dep_prty_clr”
-3) Test query that returns 0 rows to trigger fallback:
-   - “show me the list of all clients who are based in usa”
-4) Verify:
-   - UI looks TD-ish (white + green, clean cards, logo/title)
-   - No markdown fences in SQL
-   - Results show in grid
-   - Debug panel hidden when DEBUG is false
-   - Debug panel appears when DEBUG=true
+Acceptance Criteria
+- Streamlit starts without crashing even if `assets/td_logo.png` is invalid.
+- Header shows either the image OR the “TD” badge.
+- App loads to the point where the main input card is visible.
 
 Output to paste back to me
-- The terminal output of:
-  1) the streamlit import/version check
-  2) `streamlit run ...` startup logs
-- A screenshot of the Streamlit page (main + results)
-- If any error occurs, paste the full stack trace
+- The results of:
+  - `ls -l assets/td_logo.png`
+  - `file assets/td_logo.png`
+  - the PIL verify command output (OK or error)
+- The Streamlit startup output (first ~30 lines)
+- A screenshot of the running UI header (logo or TD badge)
