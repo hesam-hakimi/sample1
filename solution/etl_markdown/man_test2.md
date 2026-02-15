@@ -47,7 +47,7 @@ Create/ensure these functions exist and are used **in this order**:
 - Must run **before** importing internal `app.*` modules that may fail in Streamlit.
 
 #### `inject_css() -> None`
-- Inject all CSS inside **one** `st.markdown(\"\"\"<style>...</style>\"\"\", unsafe_allow_html=True)` call.
+- Inject all CSS inside **one** `st.markdown("""<style>...</style>""", unsafe_allow_html=True)` call.
 - Do **not** leave stray CSS lines in Python scope.
 - Ensure CSS does **not** hide the main area. Specifically, do NOT set:
   - `.main { display:none; }`
@@ -129,7 +129,7 @@ Rule: If the question is general (“what is…”, help, non-table question), d
 2. Find any conditions gating main rendering (e.g., `if not indexes: ...`).
    - Ensure chat renders regardless; show warning inside chat area if prerequisites missing.
 3. Add a temporary visible marker at the top of main:
-   - `st.write(\"[DEBUG] main rendered\")`
+   - `st.write("[DEBUG] main rendered")`
    - If you still don’t see it, CSS is hiding content—fix CSS.
 4. Ensure `render_chat_main()` is called on every script run.
 5. Ensure `st.chat_input()` is not inside a condition that might skip.
