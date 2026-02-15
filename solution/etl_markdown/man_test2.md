@@ -1,361 +1,200 @@
-# Text2SQL Streamlit Chat — Fix “Hi triggers search” + Make Activity Log Stream/Fade
+# Prompt for Copilot/Codex: Fix failing pytest `test_get_ui_options_returns_instance`
 
-Use this prompt in **GitHub Copilot Chat** (in-repo) so Copilot makes **exact changes only** (no redesign).  
-Goal: make the app behave like a **collaborative chat UI** where **AI Search** and **SQL execution** behave like **tools** that are invoked **only when needed**, and the **Activity Log streams step-by-step updates** (with a simple fade effect for older steps).
+## Context
+You are working in repo `text2sql_v2`. Running tests shows **one failing test**:
 
----
+- `app/ui/test_state.py::test_get_ui_options_returns_instance`
+- Failure symptom: when the test sets `st.session_state["max_rows"] = 77` (and other keys), `get_ui_options()` still returns defaults (e.g., `max_rows=50`), so the assertion `assert options.max_rows == 77` fails.
 
-## What is broken now
+This indicates `get_ui_options()` is **not reading Streamlit session state correctly** (common causes: importing `session_state` directly, caching a reference, or always returning `DEFAULT_UI_OPTIONS`).
 
-1. When the user types **“hi”**, the app behaves like it’s a data/SQL question and triggers **metadata search + SQL**.
-2. The **Activity Log** shows a batch list; you want it to behave like a **stream**: intent → (fade) → tool call → (fade) → tool result → (fade) → …
-3. The architecture must be consistent with the “tools” concept:
-   - **AI Search** and **SQL** are *tools*
-   - The system decides whether to call them (deterministic for greetings/help/thanks)
-   - For “smalltalk”, respond without search/sql
+## Goal
+Make **all tests pass** (`pytest -q`), specifically:
+- `get_ui_options()` must return a **UIOptions instance**
+- It must honor **valid values** from `st.session_state`
+- It must **sanitize invalid values** (fall back to defaults)
+- It must be compatible with monkeypatching in tests
 
----
+## Non-negotiable API / Signatures (do not change)
+Keep these names and signatures as-is (because UI + tests depend on them):
 
-## Acceptance criteria (must pass)
-
-### A) Greeting behavior
-- Input: `hi` / `hello` / `hey` / `thanks` / `thank you` / `help`
-- Output:
-  - Assistant responds with a **friendly chat answer** (no metadata dump, no SQL)
-  - Activity log shows something like:
-    - `[intent] Intent detected: greeting (search=False, sql=False)`
-    - `[respond] Responding without tools`
-- **No AI Search call**
-- **No SQL generation/execution**
-- UI still shows chat transcript and activity stream.
-
-### B) Data-question behavior
-- Input: “show me 10 rows from v_dlv_dep_prty_clr” (or similar)
-- Output:
-  - Activity log streams steps in order: intent → search (optional) → prompt build → sql generated → validated → executed → result summary
-  - Results are shown in the chat (assistant message) and optionally as grid below.
-  - AI Search is only invoked if the decision says it’s needed.
-
-### C) Activity log streaming + fade
-- New steps appear live while the assistant is “thinking”.
-- Older steps are still visible but **faded** (lower opacity) so the log feels like a stream.
-- Keep it simple: CSS opacity + rerender; no complex JS.
-
-### D) Strict structure rule
-Implement the **exact class + method signatures** below.  
-Do **not** invent new architecture. You may add small helper functions, but the public API must match.
-
----
-
-## Required files and exact structures
-
-### 1) `app/ui/models.py` (dataclasses + typing)
-Ensure these exist (or match if they already exist). Do not rename.
-
-```python
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Any, Callable, Literal, Optional
-
-Role = Literal["user", "assistant", "system"]
-
+### `app/ui/models.py`
+```py
 @dataclass(frozen=True)
 class UIOptions:
-    max_rows: int = 50
-    execution_target: Literal["sqlite", "oracle"] = "sqlite"
-    debug_enabled: bool = False
-
-@dataclass
-class ChatMessage:
-    role: Role
-    content: str
-    ts_iso: str
-
-TraceKind = Literal[
-    "intent",
-    "tool_call",
-    "tool_result",
-    "prompt_build",
-    "sql_generated",
-    "sql_sanitized",
-    "sql_validated",
-    "sql_executing",
-    "sql_result",
-    "respond",
-    "error",
-]
-
-@dataclass
-class TraceEvent:
-    kind: TraceKind
-    message: str
-    ts_iso: str
-    payload: Optional[dict[str, Any]] = None
-
-@dataclass
-class TurnResult:
-    assistant_message: Optional[str] = None
-    clarification_question: Optional[str] = None
-    sql: Optional[str] = None
-    df: Any = None  # typically pandas.DataFrame
-    error_message: Optional[str] = None
-    debug_details: Optional[str] = None
-    trace_events: list[TraceEvent] = None
+    max_rows: int
+    execution_target: Literal["sqlite", "oracle"]  # oracle is placeholder
+    debug_enabled: bool
 ```
 
-Notes:
-- `TurnResult.trace_events` must default to an empty list safely (use `None` then set `[]` in `__post_init__`).
-- Keep imports minimal; do not force pandas import at module import time if it causes issues.
+### `app/ui/state.py`
+```py
+DEFAULT_UI_OPTIONS: UIOptions
+
+def get_ui_options() -> UIOptions:
+    ...
+```
+
+> You may add helper functions in `state.py`, but do **not** change the public signatures above.
 
 ---
 
-### 2) `app/ui/search_decider.py` (deterministic tool gating)
-Create/ensure these exact structures:
-
-```python
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Literal
-from app.ui.models import ChatMessage
-
-Intent = Literal["greeting", "help", "thanks", "data_query", "general_chat"]
-
-@dataclass(frozen=True)
-class SearchDecision:
-    intent: Intent
-    use_ai_search: bool
-    use_sql: bool
-    reason: str
-
-class SearchDecider:
-    def decide(self, user_text: str, history: list[ChatMessage]) -> SearchDecision:
-        ...
+## Root cause to fix
+The test does:
+```py
+monkeypatch.setattr(st, "session_state", {})
+st.session_state["max_rows"] = 77
+...
+options = get_ui_options()
+assert options.max_rows == 77
 ```
+This will only work if `get_ui_options()` reads **`streamlit.session_state` dynamically via `import streamlit as st`**.
 
-#### Deterministic rules (must implement)
-- If `user_text` matches greeting (case-insensitive): `hi`, `hello`, `hey`, `good morning`, `good afternoon`, `good evening`
-  - `intent="greeting"`, `use_ai_search=False`, `use_sql=False`
-- If it matches thanks: `thanks`, `thank you`, `thx`
-  - `intent="thanks"`, `use_ai_search=False`, `use_sql=False`
-- If it matches help: `help`, `?`, `what can you do`, `examples`
-  - `intent="help"`, `use_ai_search=False`, `use_sql=False`
-- Otherwise default:
-  - `intent="data_query"` **if** it contains strong data hints like: `select`, `from`, `table`, `rows`, `columns`, `schema`, known table prefix patterns (`v_`, etc.)
-  - Else: `intent="general_chat"` with `use_ai_search=False`, `use_sql=False`
-
-Important:
-- **Do NOT call AI Search for general chat**.
-- AI Search should be used only when a query needs schema discovery / table mapping.
+If `state.py` does any of these, the monkeypatch won’t work and the test will fail:
+- `from streamlit import session_state` (captures reference)
+- `from streamlit.runtime.state import SessionState` (captures implementation)
+- caching `session_state` into a module global
+- returning `DEFAULT_UI_OPTIONS` without checking session state
 
 ---
 
-### 3) `app/ui/orchestrator_facade.py` (single entry point per turn)
-Implement/ensure:
-
-```python
-from __future__ import annotations
-from typing import Callable, Optional
-from app.ui.models import UIOptions, ChatMessage, TurnResult, TraceEvent
-from app.ui.search_decider import SearchDecider
-
-TraceCallback = Callable[[TraceEvent], None]
-
-class OrchestratorFacade:
-    def run_chat_turn(
-        self,
-        user_text: str,
-        history: list[ChatMessage],
-        options: UIOptions,
-        trace_cb: Optional[TraceCallback] = None,
-    ) -> TurnResult:
-        ...
-```
-
-#### Required behavior inside `run_chat_turn`
-1. Call `SearchDecider().decide(user_text, history)` first.
-2. Emit trace event:
-   - kind=`"intent"`
-   - message like: `Intent detected: {intent} (search={use_ai_search}, sql={use_sql})`
-3. If `intent in {"greeting","help","thanks","general_chat"}`:
-   - Emit trace event kind=`"respond"` message=`"Responding without tools"`
-   - Return `TurnResult(assistant_message=...)` with a friendly response.
-   - **Do not** call AI Search, SQL generation, SQL execution.
-4. If `intent == "data_query"`:
-   - Tool-like flow:
-     - (optional) AI Search for metadata only when `use_ai_search=True`
-     - prompt build
-     - call LLM to produce SQL
-     - sanitize/validate
-     - execute SQL
-     - send *result summary* back to LLM to produce final assistant answer
-   - Emit trace events for each step using the `trace_cb`.
-
-Important:
-- Keep the existing back-end logic, but ensure it is **gated** by `SearchDecision`.
-
----
-
-### 4) `app/ui/activity_stream.py` (live stream + fade rendering)
-Implement/ensure:
-
-```python
-from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Optional
-from app.ui.models import TraceEvent
-
-@dataclass
-class ActivityStream:
-    max_events: int = 50
-    events: list[TraceEvent] = field(default_factory=list)
-
-    def add(self, ev: TraceEvent) -> None:
-        ...
-
-    def clear(self) -> None:
-        ...
-
-    def render_html(self) -> str:
-        ...
-```
-
-Rules:
-- `add()` appends and trims to `max_events`.
-- `render_html()` returns HTML with newest event normal opacity and older events “faded”.
-- Do **not** include raw user data; only the trace event message.
-- HTML can be used via `st.markdown(html, unsafe_allow_html=True)`.
-
-Suggested fade approach:
-- last event: `opacity:1`
-- older: `opacity:0.35`
-- add a small CSS transition.
-
----
-
-### 5) `app/ui/state.py` (no `pass`, never return None)
-Fix any leftover `pass` methods and ensure these exist and always return defaults:
-
-```python
-from __future__ import annotations
-from typing import List
+## Required implementation behavior
+### 1) Always import streamlit as a module (important for monkeypatch)
+In `app/ui/state.py` (module scope):
+```py
 import streamlit as st
-from app.ui.models import ChatMessage, TraceEvent, UIOptions
-from app.ui.activity_stream import ActivityStream
-
-DEFAULT_UI_OPTIONS = UIOptions()
-
-def get_ui_options() -> UIOptions: ...
-def set_ui_options(opts: UIOptions) -> None: ...
-
-def get_chat_history() -> list[ChatMessage]: ...
-def append_chat_message(msg: ChatMessage) -> None: ...
-def clear_chat() -> None: ...
-
-def get_activity_stream() -> ActivityStream: ...
-def append_trace_event(ev: TraceEvent) -> None: ...
-def clear_trace_events() -> None: ...
 ```
 
-Implementation rules:
-- `get_chat_history()` must initialize `st.session_state["messages"]` to `[]` if missing/None.
-- `get_activity_stream()` must initialize a single `ActivityStream` object in session_state.
-- Never return `None` for lists/objects.
-- No UI rendering in this file.
+### 2) `get_ui_options()` must:
+- Read `st.session_state` safely (even if empty or missing)
+- Look for these keys (exact names):
+  - `"max_rows"` → int
+  - `"execution_target"` → `"sqlite"` or `"oracle"`
+  - `"debug_enabled"` → bool
+- Validate/sanitize:
+  - `max_rows` must be `int` and **> 0** (you can also enforce an upper bound like 500/1000 if you want)
+  - `execution_target` must be allowed
+  - `debug_enabled` must be bool
+- If invalid/missing, fall back to `DEFAULT_UI_OPTIONS.<field>`
+- Return a new `UIOptions(...)` instance
+
+### 3) Optional but recommended
+Write sanitized values back into `st.session_state` so the UI stays consistent. This won’t break tests.
 
 ---
 
-### 6) `app/ui/streamlit_app.py` (chat-first rendering + live stream)
-Required ordering rules:
-1. `import streamlit as st` must be present before any `st.*` usage.
-2. `st.set_page_config(...)` must be called **once** inside `main()` before rendering.
-3. Ensure `bootstrap_project_root()` is called before `from app... import ...` (only if needed for imports).
+## Exact patch to implement (copy/paste friendly)
+Open `app/ui/state.py` and ensure you have something like this (adapt only if your file already has overlapping helpers):
 
-Implement these functions:
+```py
+from __future__ import annotations
 
-```python
-def bootstrap_project_root() -> None: ...
-def inject_css() -> None: ...
-def init_session_state() -> None: ...
-def render_sidebar() -> None: ...
-def render_chat_main(orchestrator) -> None: ...
-def main() -> None: ...
+from typing import Any, Optional
+import streamlit as st
+
+from app.ui.models import UIOptions
+
+DEFAULT_UI_OPTIONS = UIOptions(
+    max_rows=50,
+    execution_target="sqlite",
+    debug_enabled=False,
+)
+
+_ALLOWED_EXEC_TARGETS = {"sqlite", "oracle"}
+
+def _coerce_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):  # bool is int subclass, exclude it
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+def _coerce_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    return None
+
+def _coerce_exec_target(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value in _ALLOWED_EXEC_TARGETS:
+        return value
+    return None
+
+def get_ui_options() -> UIOptions:
+    """Return UI options from Streamlit session state. Never returns None."""
+    ss = getattr(st, "session_state", None)
+    if ss is None:
+        ss = {}
+
+    # max_rows
+    raw_max_rows = ss.get("max_rows", DEFAULT_UI_OPTIONS.max_rows) if hasattr(ss, "get") else DEFAULT_UI_OPTIONS.max_rows
+    max_rows = _coerce_int(raw_max_rows)
+    if max_rows is None or max_rows <= 0:
+        max_rows = DEFAULT_UI_OPTIONS.max_rows
+
+    # execution_target
+    raw_target = ss.get("execution_target", DEFAULT_UI_OPTIONS.execution_target) if hasattr(ss, "get") else DEFAULT_UI_OPTIONS.execution_target
+    execution_target = _coerce_exec_target(raw_target) or DEFAULT_UI_OPTIONS.execution_target
+
+    # debug_enabled
+    raw_debug = ss.get("debug_enabled", DEFAULT_UI_OPTIONS.debug_enabled) if hasattr(ss, "get") else DEFAULT_UI_OPTIONS.debug_enabled
+    debug_enabled = _coerce_bool(raw_debug)
+    if debug_enabled is None:
+        debug_enabled = DEFAULT_UI_OPTIONS.debug_enabled
+
+    options = UIOptions(
+        max_rows=max_rows,
+        execution_target=execution_target,  # type: ignore[arg-type] if Literal complains
+        debug_enabled=debug_enabled,
+    )
+
+    # Optional: persist sanitized values for the UI
+    try:
+        st.session_state["max_rows"] = options.max_rows
+        st.session_state["execution_target"] = options.execution_target
+        st.session_state["debug_enabled"] = options.debug_enabled
+    except Exception:
+        pass
+
+    return options
 ```
 
-#### Streaming behavior requirement
-- Create a container for Activity Log (e.g., `activity_placeholder = st.empty()` or inside an expander).
-- Pass a `trace_cb` into `orchestrator.run_chat_turn(...)` that:
-  1) appends to session activity stream (`append_trace_event(ev)`), and
-  2) re-renders the activity placeholder immediately with fade HTML (`activity_placeholder.markdown(...)`).
-
-This produces “stream-like” updates as the script runs.
-
-#### Chat transcript
-- Use `st.chat_message(role)` for each message.
-- Use `st.chat_input(...)` at bottom.
-- When user submits, append user message, call orchestrator once, then append assistant message, then `st.rerun()`.
-
-#### IMPORTANT UI fix: “Hi triggers search”
-Once `SearchDecider` is wired, the transcript for “hi” must show only greeting response.
+### Important notes
+- **Do not** use `from streamlit import session_state`
+- If you already have `DEFAULT_UI_OPTIONS` defined elsewhere, keep its values but ensure behavior matches the test.
+- If `UIOptions.execution_target` is a `Literal[...]`, you may need a small `# type: ignore[arg-type]` on assignment.
 
 ---
 
-## Extra UX: “fade then replace” (simple and safe)
-You asked: “intent shows first, then fades, then search shows, then fades…”
+## Verification steps (must do)
+Run these commands and confirm results:
 
-Implement as:
-- Keep all events, but older ones are rendered with lower opacity.
-- The newest event is highlighted (normal opacity).
-- That visually gives the “fade” effect without timers or JS.
-
-If you want “auto-hide” later, add a “Show last N events” slider in sidebar (optional).
-
----
-
-## What to change right now (based on your current screenshots)
-
-1. **Your app is calling AI search for “HI”** → this means `SearchDecider` is not used, or it defaults to data_query.
-   - Implement deterministic greeting detection and wire it at the start of `run_chat_turn()`.
-2. **Activity Log is appended but not streamed** → ensure trace callback updates a placeholder while the turn runs.
-3. **Keep the tool-flow only for `intent="data_query"`**.
-
----
-
-## Tests (must add)
-Create `tests/test_search_decider.py`:
-
-- `hi` → use_ai_search False, use_sql False
-- `help` → False/False
-- `thanks` → False/False
-- `show me 10 rows from v_dlv_dep_prty_clr` → intent data_query and (likely) use_sql True
-
-Run:
 ```bash
-python -m compileall app/ui
-pytest -q
+# 1) Run only failing test
+.venv/bin/pytest -q app/ui/test_state.py::test_get_ui_options_returns_instance
+
+# 2) Run full suite
+.venv/bin/pytest -q
 ```
 
----
-
-## Verification commands (must include in your PR output)
-```bash
-python -m compileall app/ui
-pytest -q
-.venv/bin/streamlit run app/ui/streamlit_app.py
-```
+Expected:
+- `test_get_ui_options_returns_instance` passes
+- All tests pass (`0 failed`)
 
 ---
 
-## Deliverables (Copilot must produce)
-1. Updated files implementing the exact structures above.
-2. Tests passing.
-3. A short “What changed” summary:
-   - greeting behavior fixed (no tools)
-   - streamed activity log with fade
-   - tool gating implemented via SearchDecider + OrchestratorFacade
+## If it still fails
+Do this investigation and fix accordingly (do not stop at guessing):
+1. Open `app/ui/test_state.py` and confirm the expected keys and values.
+2. Add temporary debug prints in `get_ui_options()` to log what it reads from session state (remove prints before final commit).
+3. Search for any `from streamlit import session_state` patterns:
+   ```bash
+   rg -n "from\s+streamlit\s+import\s+session_state|session_state\s*=|SessionState" app/ui
+   ```
+   Replace those usages with `import streamlit as st` + `st.session_state`.
 
 ---
 
-## IMPORTANT: Do not redesign
-- No new UI layout frameworks.
-- No random refactor.
-- Only implement what’s listed with the stated signatures and behavior.
+## Deliverables
+- Updated `app/ui/state.py` (or the correct file where `get_ui_options()` lives)
+- All tests passing (`pytest -q`)
+- No signature changes to `UIOptions` or `get_ui_options()`
