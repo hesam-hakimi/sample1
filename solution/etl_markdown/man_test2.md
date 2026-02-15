@@ -1,330 +1,213 @@
-# Text2SQL UI — Fix `get_trace_events` NameError + Validate Trace/Activity Architecture
+# Text2SQL UI – Fix `__future__` Import Error + Consistency Checklist
 
-This guide fixes the current Streamlit crash:
+**Current blocker you’re seeing**
 
-> `NameError: name 'get_trace_events' is not defined`
-
-…and ensures the **trace/activity pipeline** is implemented consistently across files (UI → state → activity stream), with **explicit function/class signatures** so Copilot can’t “guess” wrong symbols.
-
----
-
-## 0) What’s happening (root cause)
-
-`app/ui/streamlit_app.py` calls `get_trace_events()` (seen in the traceback), but:
-
-- the function is **not imported** in `streamlit_app.py`, and/or
-- the function is **not implemented** (or not exported) in `app/ui/state.py`.
-
-So Streamlit reaches runtime and fails immediately during render.
-
----
-
-## 1) Target architecture (must match across files)
-
-### 1.1 Canonical models (already in your plan)
-In `app/ui/models.py` (or wherever you placed them), these must exist:
-
-```python
-from dataclasses import dataclass
-from typing import Any, Literal, Optional
-
-@dataclass
-class UIOptions:
-    max_rows: int = 50
-    execution_target: str = "sqlite"
-    debug_enabled: bool = False
-
-@dataclass
-class ChatMessage:
-    role: Literal["user", "assistant"]
-    content: str
-    ts_iso: Optional[str] = None
-
-@dataclass
-class TraceEvent:
-    event_type: str           # e.g. "intent", "tool_call", "tool_result", ...
-    message: str              # human-friendly text
-    ts_iso: Optional[str] = None
-    level: str = "info"       # "info" | "warning" | "error"
-    data: Optional[Any] = None
-
-@dataclass
-class TurnResult:
-    assistant_message: Optional[str] = None
-    clarification_question: Optional[str] = None
-    sql: Optional[str] = None
-    df: Any = None
-    error_message: Optional[str] = None
-    debug_details: Optional[str] = None
+```
+SyntaxError: from __future__ imports must occur at the beginning of the file
+File: app/ui/state.py (line ~10)
 ```
 
-If any of these classes have different names/fields in your repo, **standardize now** (or update all imports consistently).
+This is happening while running `pytest` (e.g., `app/ui/test_state.py` imports `app.ui.state`), so tests fail before they even execute.
 
 ---
 
-## 2) Fix: implement + import `get_trace_events`
+## 1) Root cause (what’s actually wrong)
 
-### 2.1 Required session-state keys
-Your Streamlit session must keep these keys (minimum):
+Python requires any `from __future__ import ...` statements to appear **before any other non‑docstring statements** in a module.
 
-- `messages: list[ChatMessage]`
-- `trace_events: list[TraceEvent]`
-- `debug_enabled: bool`
-- (optional) `ui_options: UIOptions`
+Allowed before the `__future__` import:
+- A **module docstring** (triple-quoted string at top)
+- **Comments** (recommended)
+- `# -*- coding: utf-8 -*-` encoding header (rare nowadays)
 
-You already fixed `init_session_state()`—now we make sure trace functions are present and used everywhere.
+**Not allowed** before the `__future__` import:
+- Any `import ...`
+- Any assignments / constants
+- Any function / class definitions
+- Any other executable statements
+
+What usually triggers this in your case:
+- Copilot inserted **multiple** `from __future__ import annotations` lines,
+- and at least one of them is **not at the top** (e.g., after `import streamlit as st`), which breaks module import.
 
 ---
 
-## 3) Update `app/ui/state.py`
+## 2) Fix (do this first)
 
-### 3.1 Add/confirm these signatures (DO NOT CHANGE NAMES)
+### 2.1 Edit `app/ui/state.py`
 
-**`app/ui/state.py` must export:**
+**Goal:** Ensure there is **exactly one** `from __future__ import annotations`, and it is at the very top (after optional module docstring/comments).
 
+**Expected file header pattern (example):**
 ```python
+\"\"\"UI session-state helpers for the Streamlit Text2SQL app.\"\"\"
+
 from __future__ import annotations
 
-from typing import List
+from dataclasses import dataclass
+from typing import Any, Optional, List, Dict
+import os
+
 import streamlit as st
-
-from app.ui.models import ChatMessage, TraceEvent, UIOptions
-
-DEFAULT_UI_OPTIONS = UIOptions(
-    max_rows=50,
-    execution_target="sqlite",
-    debug_enabled=False,
-)
-
-def init_session_state() -> None:
-    """Initialize Streamlit session state keys if missing."""
-    if "messages" not in st.session_state or st.session_state["messages"] is None:
-        st.session_state["messages"] = []
-    if "trace_events" not in st.session_state or st.session_state["trace_events"] is None:
-        st.session_state["trace_events"] = []
-    if "debug_enabled" not in st.session_state:
-        st.session_state["debug_enabled"] = False
-
-def get_chat_history() -> List[ChatMessage]:
-    """Return chat history from session state. Never returns None."""
-    init_session_state()
-    return st.session_state["messages"]
-
-def append_chat_message(msg: ChatMessage) -> None:
-    """Append a message to chat history in session state."""
-    init_session_state()
-    st.session_state["messages"].append(msg)
-
-def clear_chat() -> None:
-    """Clear chat history (and optionally trace)."""
-    init_session_state()
-    st.session_state["messages"] = []
-    # keep trace if you want; otherwise clear too:
-    # st.session_state["trace_events"] = []
-
-def get_trace_events() -> List[TraceEvent]:
-    """Return trace events from session state. Never returns None."""
-    init_session_state()
-    return st.session_state["trace_events"]
-
-def append_trace_event(ev: TraceEvent) -> None:
-    """Append a trace event to session state."""
-    init_session_state()
-    st.session_state["trace_events"].append(ev)
-
-def clear_trace_events() -> None:
-    """Clear trace events."""
-    init_session_state()
-    st.session_state["trace_events"] = []
-
-def get_ui_options() -> UIOptions:
-    """
-    Return UIOptions derived from session_state and env.
-    Must sanitize invalid session_state values.
-    """
-    init_session_state()
-    # NOTE: keep your existing sanitize logic that made tests pass.
-    opts = DEFAULT_UI_OPTIONS
-
-    max_rows = st.session_state.get("max_rows", opts.max_rows)
-    if not isinstance(max_rows, int) or max_rows <= 0:
-        max_rows = opts.max_rows
-
-    execution_target = st.session_state.get("execution_target", opts.execution_target)
-    if not isinstance(execution_target, str) or not execution_target:
-        execution_target = opts.execution_target
-
-    debug_enabled = st.session_state.get("debug_enabled", opts.debug_enabled)
-    if not isinstance(debug_enabled, bool):
-        debug_enabled = opts.debug_enabled
-
-    return UIOptions(
-        max_rows=max_rows,
-        execution_target=execution_target,
-        debug_enabled=debug_enabled,
-    )
 ```
 
-**Important**
-- `get_trace_events()` and `append_trace_event()` must **always** call `init_session_state()` so they never return `None`.
-- Keep your stricter test-compliant `get_ui_options()` logic (above is a safe example).
+### 2.2 What to change exactly
+
+1. **Open** `app/ui/state.py`
+2. **Search** for `from __future__ import annotations`
+3. Do both:
+   - Keep **only one** occurrence
+   - Move that one occurrence to the very top (after module docstring if present)
+4. Ensure there are **no imports** (like `import streamlit as st`) before the `__future__` import.
+5. Save the file.
+
+> Tip: If you want a module docstring, it must be the very first statement. The `__future__` import must come right after the docstring.
 
 ---
 
-## 4) Update `app/ui/streamlit_app.py` (fix the NameError)
+## 3) Verification (must pass)
 
-### 4.1 Ensure these imports exist
-At the top of `app/ui/streamlit_app.py` (inside your current import section), import the missing symbol(s):
+Run these commands from repo root:
 
-```python
-from app.ui.state import (
-    init_session_state,
-    get_chat_history,
-    append_chat_message,
-    get_trace_events,         # ✅ REQUIRED
-    append_trace_event,       # ✅ REQUIRED (if used by trace_cb)
-    get_ui_options,
-    clear_chat,
-    DEFAULT_UI_OPTIONS,
-)
-```
-
-### 4.2 Ensure render uses the function (not a missing local name)
-Where you currently do:
-
-```python
-events = get_trace_events()
-```
-
-that will now resolve correctly.
-
----
-
-## 5) Trace streaming behavior (fade + step-by-step)
-
-You want the activity panel to behave like a stream:
-
-- show “Intent…”
-- then fade it
-- show “Searching…”
-- fade it
-- etc.
-
-Streamlit can’t “fade” existing rendered text unless you **re-render the panel** with different opacity. The simplest stable approach:
-
-### 5.1 Store event timestamps + render with “age-based opacity”
-In your trace renderer (e.g. `app/ui/components/trace.py`), apply opacity based on recency:
-
-- newest event = 1.0 opacity
-- older events gradually reduced (0.6, 0.4, 0.2)
-
-Example renderer:
-
-```python
-import streamlit as st
-from app.ui.models import TraceEvent
-
-def render_trace_panel(events: list[TraceEvent], enabled: bool) -> None:
-    if not enabled:
-        return
-
-    st.markdown("### Activity Log")
-    n = len(events)
-    for i, ev in enumerate(events):
-        age = (n - 1) - i
-        opacity = max(0.2, 1.0 - 0.15 * age)
-        st.markdown(
-            f"<div style='opacity:{opacity}; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;'>"
-            f"• [{ev.event_type}] {ev.message}"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-```
-
-This meets your “fade older items” requirement without timers.
-
-### 5.2 If you want true “live streaming” while the model runs
-Use a placeholder and update it inside the callback:
-
-- create `panel = st.empty()`
-- each time a trace event arrives, re-render the list into the placeholder
-
-You must keep all events in `st.session_state["trace_events"]`.
-
----
-
-## 6) Tool-gating for greetings (“hi” should not call AI Search)
-
-You already added a `SearchDecider`. The rule must be deterministic:
-
-- greetings/help/thanks → **no tool call**, respond directly
-- only if user asks about data or schema → run tool chain (AI Search + SQL)
-
-In orchestrator pseudocode:
-
-```python
-decision = search_decider.decide(user_text, history)
-
-if decision.kind == "NO_TOOLS":
-    return TurnResult(assistant_message=decision.reply)
-```
-
-Also append trace:
-
-```python
-append_trace_event(TraceEvent(event_type="intent", message=f"Intent detected: {decision.intent_label}"))
-```
-
----
-
-## 7) Add a “smoke test” to prevent these NameErrors
-
-Create: `app/ui/test_streamlit_import.py`
-
-```python
-def test_streamlit_app_imports():
-    import app.ui.streamlit_app  # noqa: F401
-```
-
-This catches missing imports like `get_trace_events` before runtime.
-
----
-
-## 8) Verification checklist (must pass)
-
-Run:
-
+### 3.1 Compile-time check (fast)
 ```bash
-.venv/bin/pytest -q
-.venv/bin/streamlit run app/ui/streamlit_app.py
+python -m compileall app/ui -q
 ```
+If this fails, you still have an import-time issue.
 
-Expected:
-- ✅ Pytest passes
-- ✅ Streamlit loads without NameError
-- ✅ “hi” produces a friendly assistant response with **no** tool call
-- ✅ Activity log shows events in order; older events appear faded (if enabled)
-
----
-
-## 9) If you still see `NameError` after this
-
-Search for the symbol:
-
+### 3.2 Unit tests
 ```bash
-grep -R "get_trace_events" -n app/ui
+pytest -q
 ```
+Expected: all tests pass.
 
-Common causes:
-- typo like `get_trace_event` vs `get_trace_events`
-- import shadowed by another local function
-- circular import (fix by importing only inside functions that need it)
+### 3.3 Run Streamlit
+```bash
+streamlit run app/ui/streamlit_app.py
+```
+Expected: app loads and chat UI renders.
 
 ---
 
-## Summary of the minimal fix
+## 4) Prevent this from coming back (recommended)
 
-1. Implement `get_trace_events()` (and related trace helpers) in `app/ui/state.py`.
-2. Import `get_trace_events` in `app/ui/streamlit_app.py`.
-3. Add an import smoke test so this never happens again.
+### 4.1 Rule of thumb for Copilot
+Whenever Copilot suggests adding `from __future__ import annotations`:
+- **Do it only once per file**
+- Put it at the **top**
+- Never add it in the middle of a file
+
+### 4.2 Alternative (if you want to avoid `__future__` entirely)
+Instead of `from __future__ import annotations`, you can:
+- Use **string annotations**:
+  ```python
+  def render_chat_main(orchestrator: "OrchestratorClient") -> None:
+      ...
+  ```
+- Or use `typing.TYPE_CHECKING` + local imports.
+
+But since you already started using `__future__`, the simplest is: **keep one at the top**.
+
+---
+
+## 5) Consistency checklist (architecture you want)
+
+This section helps you ensure “all files and implementation are the same as what you want”.
+
+### 5.1 Tool-gating requirement (Search vs No Search)
+**Expected behavior:**
+- Greeting/smalltalk/help/thanks (e.g., `"hi"`, `"hello"`, `"thanks"`, `"help"`) should **NOT** call:
+  - Azure AI Search
+  - SQL generation/execution
+- It should produce a friendly assistant message only.
+
+**Implementation pattern:**
+- `SearchDecider.decide(user_text: str, history: list[ChatMessage], options: UIOptions) -> SearchDecision`
+- `SearchDecision` should allow at least:
+  - `NO_TOOLS` (greetings/smalltalk/help)
+  - `USE_SEARCH_AND_SQL` (real data questions)
+  - `ASK_CLARIFICATION` (missing table/time filters, etc.)
+
+**Acceptance criteria:**
+- Input `"hi"` ⇒ `SearchDecision.NO_TOOLS` (no search, no SQL)
+- Input `"show me top 10 customers by balance"` ⇒ `USE_SEARCH_AND_SQL`
+
+### 5.2 Activity log streaming requirement (“step shows, then fades, then next step…”)
+What Streamlit can do reliably:
+- Append trace events as they occur (via callback)
+- Render newest event at full opacity, older events faded (CSS)
+- Optionally show `st.toast(...)` for ephemeral “fade away” feel
+
+**Recommended UX compromise (works well):**
+- Activity panel shows a list:
+  - newest event: opacity 1.0
+  - older events: opacity 0.4–0.6
+- Also show `st.toast()` for each new event (auto disappears)
+
+**Acceptance criteria:**
+- When running a real question, activity events show in order:
+  1) intent detected  
+  2) (if needed) search tool called  
+  3) prompt build  
+  4) SQL generated  
+  5) SQL validated  
+  6) SQL executed  
+  7) results returned  
+- New events appear without waiting for the whole turn to finish.
+
+### 5.3 Session-state function signatures (must exist and be imported)
+Your Streamlit entrypoint should **only** call functions that exist in `state.py` (or wherever your state helpers live).
+
+At minimum, you should have helpers like:
+
+```python
+def init_session_state() -> None: ...
+def get_chat_history() -> list[ChatMessage]: ...
+def append_chat_message(msg: ChatMessage) -> None: ...
+
+def get_trace_events() -> list[TraceEvent]: ...
+def append_trace_event(ev: TraceEvent) -> None: ...
+def clear_trace_events() -> None: ...
+
+def get_ui_options() -> UIOptions: ...
+def set_ui_options(options: UIOptions) -> None: ...
+```
+
+**Acceptance criteria:**
+- `streamlit run app/ui/streamlit_app.py` produces **no NameError** for missing state functions.
+- `pytest -q` passes.
+
+---
+
+## 6) If you want a Copilot “do this now” patch prompt (copy/paste)
+
+Use this exact prompt in Copilot Chat (in repo root):
+
+> **Prompt to Copilot:**
+> 1) Fix `SyntaxError: from __future__ imports must occur at the beginning of the file` in `app/ui/state.py`.  
+>    - Ensure there is exactly one `from __future__ import annotations` and it is the first import in the file (after optional module docstring/comments only).  
+>    - Remove any duplicate `from __future__ ...` lines.  
+> 2) Do not change public function signatures.  
+> 3) Run `python -m compileall app/ui -q` and `pytest -q`; include the results.  
+> 4) Then run `streamlit run app/ui/streamlit_app.py` and confirm the page loads without NameError.
+
+---
+
+## 7) Quick troubleshooting
+
+### Still seeing the same SyntaxError?
+- You still have an `import` / assignment before the `__future__` import.
+- Or you have a second `from __future__` later in the file (remove it).
+
+### Tests pass but Streamlit fails with NameError (e.g., `get_trace_events` not defined)
+- That’s a **separate** missing symbol issue.
+- Fix by adding the function in `state.py` **or** importing it correctly in `streamlit_app.py`.
+
+---
+
+### Done criteria for this step
+✅ `python -m compileall app/ui -q` passes  
+✅ `pytest -q` passes  
+✅ `streamlit run app/ui/streamlit_app.py` loads without SyntaxError/NameError
+
 
