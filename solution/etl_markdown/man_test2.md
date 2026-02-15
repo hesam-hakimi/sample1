@@ -1,190 +1,182 @@
-# Prompt: Fix Streamlit crash — `NameError: name 'OrchestratorClient' is not defined` (and validate type-hint safety)
+# Fix Streamlit crash: `NameError: init_session_state is not defined` (and keep architecture consistent)
 
-You are working in repo **text2sql_v2**. The Streamlit UI crashes at import time with:
-
-- `NameError: name 'OrchestratorClient' is not defined`
-- Trace points to: `app/ui/streamlit_app.py`, around the function signature:
-  - `def render_chat_main(orchestrator: OrchestratorClient) -> None:`
-
-This happens because **Python evaluates annotations at function definition time** (unless postponed), and `OrchestratorClient` is **not in scope** at that moment (it’s imported only inside `main()` or later).
-
-Your job:
-1) Fix the crash in a **clean, production-grade** way.
-2) Validate that **no other file** has the same “runtime-evaluated type hint” problem.
-3) Keep runtime imports minimal (avoid circular import traps).
-4) Run tests + a Streamlit smoke run to confirm.
+Use this prompt in **GitHub Copilot Chat / Codex** inside your repo.
 
 ---
 
-## Constraints
+## Context
 
-- **Do not** change public behavior of the app.
-- **Do not** remove useful typing; make it safe.
-- Keep existing architecture (SearchDecider / OrchestratorFacade / ActivityStream etc.) intact.
-- Prefer changes that prevent this class of error from recurring.
+- Streamlit crashes with: **`NameError: name 'init_session_state' is not defined`** in `app/ui/streamlit_app.py`.
+- This happened after refactoring UI/state helpers into separate modules.
+- **Pytest passes**, but Streamlit fails at runtime → this is a missing symbol / wiring issue (tests didn’t cover Streamlit import/run).
 
 ---
 
-## Step 1 — Fix `OrchestratorClient` NameError in `app/ui/streamlit_app.py`
+## Goal
 
-### Option A (preferred): Postpone evaluation of all annotations in the module
+1. `streamlit run app/ui/streamlit_app.py` works (no NameError).
+2. `pytest -q` remains green.
+3. Session-state helpers exist **exactly once** (single source of truth) and are imported correctly.
+4. No architecture regressions: Streamlit UI calls state/helpers; state module owns session keys.
 
-1) Edit `app/ui/streamlit_app.py`
-2) Ensure the very first import is:
+---
+
+## Required public API (signatures must match)
+
+These functions must exist and be callable (no `pass` placeholders):
+
+### `app/ui/state.py`
+- `def init_session_state() -> None:`
+- `def get_chat_history() -> list["ChatMessage"]:`
+- `def append_chat_message(msg: "ChatMessage") -> None:`
+- `def clear_chat() -> None:`
+- `def get_trace_events() -> list["TraceEvent"]:`
+- `def append_trace_event(ev: "TraceEvent") -> None:`
+- `def get_ui_options() -> "UIOptions":`
+
+And constants:
+- `DEFAULT_UI_OPTIONS: UIOptions`
+
+### `app/ui/streamlit_app.py`
+- `def main() -> None:`
+- Must call, in order: `bootstrap_project_root()`, `inject_css()`, `init_session_state()`, `render_sidebar()`, create orchestrator, then `render_chat_main(orchestrator)`.
+
+---
+
+## What to change (do this exactly)
+
+### Step 1 — Find the failing callsite
+In `app/ui/streamlit_app.py`, locate where `init_session_state()` is called (likely inside `main()`).
+
+- Confirm there is **no local definition** `def init_session_state(...):` in this file anymore.
+- That’s why Python raises NameError.
+
+### Step 2 — Make `init_session_state` come from the state module (recommended)
+Make `app/ui/state.py` the **single source of truth** for session-state keys.
+
+In `app/ui/streamlit_app.py`, add an import near the other state imports:
 
 ```python
-from __future__ import annotations
+from app.ui.state import init_session_state
 ```
 
-> It must appear at the top of the file (after an optional module docstring, before other imports).
+(or import it alongside the other helpers you already import from `app.ui.state`)
 
-3) Keep `OrchestratorClient` imported where you want it at runtime (it can remain inside `main()`), but **typing will now be safe**.
-
-### Option B: Use `TYPE_CHECKING` + forward reference string (also good)
-
-If you don’t want `__future__` for some reason, then:
-
-1) At the top of `app/ui/streamlit_app.py`, add:
+Then keep the call as:
 
 ```python
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from app.ui.orchestrator_client import OrchestratorClient
+init_session_state()
 ```
 
-2) Change the function signature to a string annotation:
+✅ This fixes the NameError while keeping your architecture clean.
+
+> Alternative is `import app.ui.state as state` then call `state.init_session_state()`. Either is fine—pick one style and use it consistently.
+
+### Step 3 — Ensure `init_session_state()` is actually implemented (idempotent)
+In `app/ui/state.py`, implement:
 
 ```python
-def render_chat_main(orchestrator: "OrchestratorClient") -> None:
-    ...
+def init_session_state() -> None:
+    """Initialize Streamlit session state keys if missing."""
 ```
 
-This avoids importing `OrchestratorClient` at import time and prevents runtime NameError.
+**Rules:**
+- Must be **idempotent** (safe to call multiple times).
+- Must not wipe existing chat unless explicitly requested (e.g., via `clear_chat()`).
+- Should initialize these keys if missing:
+  - `"messages"`: list[ChatMessage]
+  - `"activity"` (or `"trace_events"` depending on your chosen name): list[TraceEvent]
+  - `"debug_enabled"`: bool
+  - any state your ActivityStream needs (e.g., `"last_toast_idx"`)
 
-✅ Either Option A or B is acceptable. **Option A is simpler and prevents future similar issues in this file.**
-
----
-
-## Step 2 — Confirm the runtime import plan is correct
-
-In `app/ui/streamlit_app.py` ensure:
-
-- `OrchestratorClient` (or facade client) is instantiated **inside** `main()`:
+Example structure (adjust key names to match your repo, but keep behavior):
 
 ```python
-from app.ui.orchestrator_client import OrchestratorClient
-orchestrator = OrchestratorClient()
-```
-
-- `render_chat_main(orchestrator)` is called after that.
-- No module-level code executes `OrchestratorClient()` on import.
-
----
-
-## Step 3 — Validate other modules for the same problem
-
-Search the repo for type hints that reference names **not imported in that module**.
-
-Run these searches (or equivalent):
-
-- Look for annotations referencing OrchestratorClient:
-  - `OrchestratorClient`
-- More generally search for patterns like:
-  - `: SomeClass`
-  - `-> SomeClass`
-  - where `SomeClass` is not imported.
-
-Checklist:
-1) Any file that has a function signature referencing a class **only imported inside a function** is a candidate for this NameError.
-2) Fix using one of:
-   - `from __future__ import annotations`
-   - `TYPE_CHECKING` + `"ForwardRef"`
-   - replace with a protocol/interface type (only if you already have one)
-   - `Any` as a last resort (avoid if possible)
-
-**Apply the same safe pattern consistently** across `app/ui/*.py`.
-
----
-
-## Step 4 — Add a guardrail (recommended)
-
-To prevent repeats, do this:
-
-- Add `from __future__ import annotations` to all UI modules that are Streamlit entrypoints or likely to have runtime imports (at least `app/ui/streamlit_app.py`, optionally others in `app/ui/`).
-
-This is safe in Python 3.11 and reduces annotation-related import-time failures.
-
----
-
-## Step 5 — Verify with commands
-
-### 5.1 Unit tests
-Run:
-
-```bash
-.venv/bin/pytest -q
-```
-
-All tests must pass.
-
-### 5.2 Streamlit smoke test
-Run:
-
-```bash
-.venv/bin/streamlit run app/ui/streamlit_app.py
-```
-
-Acceptance criteria:
-- App loads with no red traceback.
-- The “Text2SQL Chat” page renders.
-- Chat input works.
-- Activity log still updates.
-
----
-
-## Deliverables
-
-When you implement the fix, provide:
-
-1) A short explanation of **why** the NameError happened (annotation evaluation) and what you changed.
-2) Exact code diff (or file patches) for `app/ui/streamlit_app.py`.
-3) List of any other files you updated for annotation safety.
-4) Proof steps you ran:
-   - pytest output summary
-   - Streamlit start confirmation (no crash)
-
----
-
-## Quick expected patch (example)
-
-If using Option A, the top of `app/ui/streamlit_app.py` should look like:
-
-```python
-from __future__ import annotations
-
-import sys
-from pathlib import Path
 import streamlit as st
-...
+
+def init_session_state() -> None:
+    if "messages" not in st.session_state or st.session_state["messages"] is None:
+        st.session_state["messages"] = []
+    if "trace_events" not in st.session_state or st.session_state["trace_events"] is None:
+        st.session_state["trace_events"] = []
+    if "debug_enabled" not in st.session_state:
+        st.session_state["debug_enabled"] = False
 ```
 
-and you can keep:
+### Step 4 — Ensure no circular imports
+`app/ui/state.py` **must not import** `app/ui/streamlit_app.py` (directly or indirectly).
+
+If you need types (`ChatMessage`, `TraceEvent`, `UIOptions`), import them from `app/ui/models.py`:
 
 ```python
-def render_chat_main(orchestrator: OrchestratorClient) -> None:
-    ...
+from app.ui.models import ChatMessage, TraceEvent, UIOptions
 ```
 
-because the annotation is now postponed.
+If runtime import causes cycles, use:
+
+```python
+from __future__ import annotations
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from app.ui.models import ChatMessage, TraceEvent, UIOptions
+```
+
+But in most cases, importing models into state is fine.
+
+### Step 5 — (Optional but strongly recommended) Add a Streamlit smoke test
+Your tests passed but Streamlit failed. Add a small test to prevent this regression.
+
+Create `app/ui/test_streamlit_import.py`:
+
+```python
+def test_streamlit_app_imports():
+    import app.ui.streamlit_app  # noqa: F401
+```
+
+This doesn’t run Streamlit UI, but it catches import-time NameErrors and missing symbols.
 
 ---
 
-## If anything is unclear
+## Verification checklist (must run these)
 
-If you need more context, request:
-- The **top 60 lines** of `app/ui/streamlit_app.py`
-- The `app/ui/orchestrator_client.py` class signature
-- Any other file where `OrchestratorClient` is used in type hints
+1. **Unit tests**
+```bash
+pytest -q
+```
 
-But do **not** guess. Confirm with the actual code.
+2. **Run Streamlit**
+```bash
+streamlit run app/ui/streamlit_app.py
+```
+
+3. **Sanity check in browser**
+- Page loads
+- “Text2SQL Chat” header renders
+- Typing `hi` adds a user message and assistant reply (even if it’s a basic greeting)
+
+---
+
+## Deliverables you must produce
+
+1. A git-style patch or commit modifying:
+   - `app/ui/streamlit_app.py` (import fix)
+   - `app/ui/state.py` (implement `init_session_state`)
+   - (optional) `app/ui/test_streamlit_import.py` (smoke test)
+2. A short “What changed / Why” summary.
+3. Paste the final versions of any modified functions (especially `init_session_state`) in the chat so I can verify signatures.
+
+---
+
+## Hard constraints (do NOT violate)
+
+- Do **not** rename existing public functions that other files already import.
+- Do **not** change function signatures listed above.
+- Do **not** remove the existing SearchDecider / OrchestratorFacade design (if present).
+- Keep behavior backward compatible: don’t wipe existing session messages on load.
+
+---
+
+## If you hit another NameError after this
+Repeat the same pattern:
+- Find missing symbol → decide single source of truth → import it explicitly → add a smoke test that imports the file.
+
