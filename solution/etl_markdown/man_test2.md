@@ -1,165 +1,112 @@
-# Copilot Prompt — Fix Streamlit UI: blank main page (render chat in main area)
+# Prompt: Fix `NameError: name 'st' is not defined` in `app/ui/streamlit_app.py`
 
-## Goal
-Your Streamlit app currently renders the **sidebar** (“Data source & Session”) but the **main page is blank**.  
-Update the UI so the **main area always shows a chat interface** where the **user + agent collaborate**.
+You are working in the repo **text2sql_v2**. Running the Streamlit UI fails immediately with:
 
-The chat must:
-- Show a running **chat transcript** (user + assistant messages).
-- Include a **chat input** at the bottom.
-- Stream an **activity / thought-process log** (e.g., “Deciding if search is needed…”, “Fetching from AI Search…”, “Reviewing table schema…”, “Running SQL…”, “Summarizing results…”).
-- When SQL returns rows, the **dataset preview must be sent back into the LLM** so the assistant can explain/summarize in chat (do not only show a dataframe without assistant commentary).
+- **NameError: name `st` is not defined**
+- It happens at/near the very top of `app/ui/streamlit_app.py` where `st.set_page_config(...)` is called.
 
-**Important:** Do not “redesign” the product. Implement the required structure + methods and make the chat appear in main content reliably.
+This is a **runtime import/ordering bug**, not a design change request.
 
 ---
 
-## Context / Symptom
-- Page loads (no crash), sidebar is visible.
-- Main content area is empty/blank.
-- Expected: chat on main page.
+## Objective
 
-This symptom usually means one of these is happening:
-- `st.stop()` / early `return` occurs after sidebar render, before main render.
-- Main render is inside a condition that isn’t met (e.g., “metadata loaded” / “index selected”).
-- Custom CSS hides main container (e.g., `display:none`, `height:0`, overlay).
-- Main UI is written into an `st.empty()` placeholder that is never filled.
+1. Fix the crash so the Streamlit app loads.
+2. Preserve the **chat-first UI architecture** already implemented (chat transcript, chat input, streaming activity log).
+3. Do **minimal, surgical changes** (do not redesign the UI; do not add new features).
 
 ---
 
-## Files to inspect (do NOT guess—inspect repo)
-1. `app/ui/streamlit_app.py` (primary)
-2. Any helpers referenced by the UI (existing in repo if present):
-   - `app/ui/chat_models.py`
-   - `app/ui/activity_stream.py`
-   - `app/ui/search_decider.py`
-3. Orchestrator entrypoint used by UI:
-   - `app/core/orchestrator_facade.py` (or equivalent)
+## Constraints
+
+- Do not remove the chat UI code that was recently added (e.g., `render_chat_main(...)`, activity log, `run_chat_turn`, etc.).
+- Do not introduce new frameworks.
+- Keep Streamlit usage idiomatic:
+  - `st.set_page_config(...)` must be called **once per page run**, and it must execute **after `import streamlit as st`** and before other Streamlit calls.
+- Ensure the file can be imported/executed without relying on side effects from other modules.
 
 ---
 
-## Required UI architecture (implement exactly)
-### 1) `app/ui/streamlit_app.py`
-Create/ensure these functions exist and are used **in this order**:
+## Root Cause (what to look for)
 
-#### `bootstrap_project_root() -> None`
-- Ensures project root is in `sys.path` so imports like `from app.core...` work reliably when Streamlit runs.
-- Must run **before** importing internal `app.*` modules that may fail in Streamlit.
+This error means **`st` is referenced before it is defined**. Typical causes:
 
-#### `inject_css() -> None`
-- Inject all CSS inside **one** `st.markdown("""<style>...</style>""", unsafe_allow_html=True)` call.
-- Do **not** leave stray CSS lines in Python scope.
-- Ensure CSS does **not** hide the main area. Specifically, do NOT set:
-  - `.main { display:none; }`
-  - `.block-container { height: 0; overflow: hidden; }`
-  - overlays with `position: fixed` covering the page.
-
-#### `init_session_state() -> None`
-Must set defaults so the UI never crashes and never becomes blank due to missing state:
-- `st.session_state.messages: list[dict]` (each dict at least `{role, content}`)
-- `st.session_state.activity: list[str]`
-- `st.session_state.debug_enabled: bool` (default `False`)
-- Any UI options should always have a default object/dict (never `None`).
-
-#### `render_sidebar() -> None`
-- Keep your existing sidebar controls (indexes list, refresh metadata, download json, clear chat).
-- **Do not** call `st.stop()` in the sidebar logic.
-- If something is missing (no indexes, metadata not loaded), show a warning in sidebar but continue rendering main chat.
-
-#### `render_chat_main(orchestrator) -> None`
-This is the key fix:
-- Must ALWAYS render something in the main area on every run:
-  - Title/header (e.g., “Text2SQL Chat”)
-  - Chat transcript
-  - Chat input
-  - Activity panel (expander / status component)
-
-Pseudo-UI requirements:
-- Show transcript with `st.chat_message(role)` for each message.
-- If transcript is empty, add an initial assistant greeting message (“Hi — ask me a question…”).
-- Add `st.chat_input(...)` at bottom for user input.
-- The activity log must update while processing a turn (streaming).
-
-#### `main() -> None`
-Must follow this high-level order:
-
-1) `st.set_page_config(...)`
-2) `bootstrap_project_root()`
-3) Import internal modules (orchestrator, helpers)
-4) `inject_css()`
-5) `init_session_state()`
-6) `render_sidebar()`
-7) `render_chat_main(orchestrator)`  ✅ this must run unconditionally
+- `import streamlit as st` is missing.
+- `import streamlit as st` exists, but it’s *below* `st.set_page_config(...)` or inside a function, while `st.set_page_config(...)` runs at module import time.
+- A refactor moved `st.set_page_config(...)` above imports or into a block that runs before the import.
 
 ---
 
-## Required backend contract (UI ↔ orchestrator)
-### 2) Orchestrator method (create if missing; otherwise adapt)
-In `app/core/orchestrator_facade.py`, expose a single UI-friendly entrypoint:
+## Required Fix (Implementation Details)
 
-#### `run_chat_turn(user_text: str, *, max_rows: int, debug: bool) -> dict`
-Return a dict with:
-- `assistant_text: str` (final assistant message)
-- `activity: list[str]` (ordered log lines for UI streaming)
-- Optional `sql: str`
-- Optional `rows: list[dict]` (preview rows)
-- Optional `columns: list[str]`
-- Optional `error: str`
+### Step 1 — Open and inspect
+- Open `app/ui/streamlit_app.py`.
+- Confirm where `st.set_page_config(...)` is called.
+- Confirm whether `import streamlit as st` exists and where it is located.
 
-**Critical requirement:** If `rows` is present, the orchestrator must pass a compact preview (e.g., first 10–50 rows) into the LLM so the assistant message includes an explanation/summary, not just raw rows.
+### Step 2 — Ensure correct import order (must do)
+Reorder the top of `app/ui/streamlit_app.py` to the following pattern:
 
----
+1. Optional future import (if used):
+   - `from __future__ import annotations`
+2. Standard library imports (`os`, `sys`, `pathlib`, `typing`, etc.)
+3. **Project-root bootstrap** (if you are using one) that modifies `sys.path`
+4. **`import streamlit as st`**
+5. Then call `st.set_page_config(...)`
 
-## “Search or not” decision requirement
-### 3) Deterministic search decision
-Implement (or confirm) a function used by the orchestrator:
+> **Important:** If your code currently calls `st.set_page_config(...)` at module top-level, keep it there — but only *after* `import streamlit as st`.  
+> If `st.set_page_config(...)` is called inside `main()`, ensure `import streamlit as st` is at file top-level anyway (simplest, safest).
 
-#### `decide_use_search(user_text: str) -> tuple[bool, str]`
-Returns:
-- `use_search: bool`
-- `reason: str` (must be appended to activity log)
+### Step 3 — Keep `main()` and rendering flow intact
+- Ensure there is a `main()` that orchestrates:
+  - page config (if not already done at top-level),
+  - sidebar rendering,
+  - `render_chat_main(orchestrator)` (or similar),
+  - activity log expander.
+- Ensure the file ends with `main()` being executed once.
+  - Avoid double-execution (don’t call `main()` twice; don’t call it both with and without `if __name__ == "__main__":`).
 
-Rule: If the question is general (“what is…”, help, non-table question), do NOT hit AI Search. If the question needs schema/metadata/table discovery, DO use search.
+### Step 4 — Don’t break the imports of other modules
+Your repo likely has modules like:
+- `app/core/orchestrator_facade.py`
+- `app/ui/activity_stream.py`
+- `app/ui/chat_models.py`
+- `app/ui/search_decider.py`
 
----
-
-## How to fix the blank main page (explicit steps)
-1. In `app/ui/streamlit_app.py`, **find any `st.stop()` or early `return`** before the main render.
-   - Replace with warnings + continue.
-2. Find any conditions gating main rendering (e.g., `if not indexes: ...`).
-   - Ensure chat renders regardless; show warning inside chat area if prerequisites missing.
-3. Add a temporary visible marker at the top of main:
-   - `st.write("[DEBUG] main rendered")`
-   - If you still don’t see it, CSS is hiding content—fix CSS.
-4. Ensure `render_chat_main()` is called on every script run.
-5. Ensure `st.chat_input()` is not inside a condition that might skip.
+Do **not** change their APIs unless you find an actual import error.
 
 ---
 
-## Acceptance criteria
-- Opening the app shows:
-  - Sidebar controls on left
-  - Chat UI in main area (always visible)
-- Sending a message:
-  - Adds user message to transcript
-  - Shows assistant streaming activity log while processing
-  - Shows assistant answer in chat
-  - If SQL executed and rows returned:
-    - UI can display a dataframe preview
-    - Assistant message includes a summary derived from those rows
+## Verification (run these commands)
+
+Use the venv Python and venv Streamlit **explicitly**:
+
+```bash
+# From repo root
+/app1/tag5916/projects/text2sql_v2/.venv/bin/python -m compileall app/ui/streamlit_app.py
+
+# Start the UI
+/app1/tag5916/projects/text2sql_v2/.venv/bin/streamlit run app/ui/streamlit_app.py
+```
+
+**Expected result:**
+- No `NameError`.
+- Page renders with chat area visible in the **main panel** (not blank).
+- Sidebar can exist, but main panel must show chat transcript + input.
 
 ---
 
-## Verification commands
-Run these and paste any errors if they occur:
-- `python -m compileall app/ui/streamlit_app.py`
-- `streamlit run app/ui/streamlit_app.py`
-- Open the Local URL and confirm chat appears in main.
+## Deliverables
+
+1. A patch to `app/ui/streamlit_app.py` that fixes the crash.
+2. Brief note in the PR/commit message explaining:
+   - `st` was used before import,
+   - import order fixed.
 
 ---
 
-## If you need more context
-If you cannot find where main content is being suppressed, ask me to paste:
-- `app/ui/streamlit_app.py` (entire file)
-- Any helper imported by it (`activity_stream.py`, `chat_models.py`, `search_decider.py`)
-- The orchestrator entrypoint (`app/core/orchestrator_facade.py`)
+## Definition of Done
+
+- `streamlit_app.py` runs without exceptions.
+- Chat UI is visible in the main page immediately on load.
+- No unrelated refactors or UI redesigns were introduced.
