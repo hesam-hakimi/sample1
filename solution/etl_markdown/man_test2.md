@@ -1,83 +1,65 @@
-# Text2SQL Streamlit Chat UI — Fix tool-selection + streaming Activity Log (Copilot Prompt)
+# Text2SQL Streamlit Chat — Fix “Hi triggers search” + Make Activity Log Stream/Fade
 
-## Goal
-Update the existing **Streamlit chat-first UI** so that:
-
-1) **Greeting / small-talk (e.g., “hi”) does NOT trigger AI Search or SQL.**  
-2) **AI Search and SQL act like tools** the LLM *may* call **only when needed**.  
-3) The **Activity Log streams step-by-step** during execution, and **each step “fades”** (use Streamlit toasts for fade-out), while also keeping a persistent log in the page.  
-4) The **assistant response + results** always appear in the chat area (not only in terminal logs).  
-5) Preserve the overall architecture and UI (chat-first); do **not redesign** the app.
-
-You must implement this with **explicit classes, methods, and signatures** as defined below. Don’t invent new names unless required by missing code; if you must add a new file, follow the naming and signatures exactly.
+Use this prompt in **GitHub Copilot Chat** (in-repo) so Copilot makes **exact changes only** (no redesign).  
+Goal: make the app behave like a **collaborative chat UI** where **AI Search** and **SQL execution** behave like **tools** that are invoked **only when needed**, and the **Activity Log streams step-by-step updates** (with a simple fade effect for older steps).
 
 ---
 
-## Current observed issues (from screenshots)
-- Typing **“HI”** triggers:
-  - metadata search
-  - SQL generation/execution
-  - “Rows returned …”
-  Even though this should be a pure greeting.
-- Activity log is shown as a static list. Desired: stream steps in sequence with a fade effect (“Intent → fades → tool call → fades → …”).
+## What is broken now
+
+1. When the user types **“hi”**, the app behaves like it’s a data/SQL question and triggers **metadata search + SQL**.
+2. The **Activity Log** shows a batch list; you want it to behave like a **stream**: intent → (fade) → tool call → (fade) → tool result → (fade) → …
+3. The architecture must be consistent with the “tools” concept:
+   - **AI Search** and **SQL** are *tools*
+   - The system decides whether to call them (deterministic for greetings/help/thanks)
+   - For “smalltalk”, respond without search/sql
 
 ---
 
-## Non-negotiable behavior requirements
+## Acceptance criteria (must pass)
 
-### A) Small-talk must short-circuit tools
-If user text is **greeting / small talk / thanks / pleasantry**, the assistant must:
-- respond directly (friendly short response),
-- **no AI Search**, **no SQL**,
-- activity log shows:
-  - `[intent] greeting`
-  - `[decision] skip_tools`
-  - optionally `[assistant] responded`
+### A) Greeting behavior
+- Input: `hi` / `hello` / `hey` / `thanks` / `thank you` / `help`
+- Output:
+  - Assistant responds with a **friendly chat answer** (no metadata dump, no SQL)
+  - Activity log shows something like:
+    - `[intent] Intent detected: greeting (search=False, sql=False)`
+    - `[respond] Responding without tools`
+- **No AI Search call**
+- **No SQL generation/execution**
+- UI still shows chat transcript and activity stream.
 
-Examples that must skip tools:
-- "hi", "hello", "hey", "good morning"
-- "thanks", "thank you"
-- "how are you"
-- "who are you"
-- "help" (should show usage examples, not search)
+### B) Data-question behavior
+- Input: “show me 10 rows from v_dlv_dep_prty_clr” (or similar)
+- Output:
+  - Activity log streams steps in order: intent → search (optional) → prompt build → sql generated → validated → executed → result summary
+  - Results are shown in the chat (assistant message) and optionally as grid below.
+  - AI Search is only invoked if the decision says it’s needed.
 
-### B) LLM decides tool usage for real questions
-For non-trivial prompts (data questions), the system should decide whether to call:
-- **AI Search** (metadata search)
-- **SQL generation/execution**
-as tools, based on context + chat history.
+### C) Activity log streaming + fade
+- New steps appear live while the assistant is “thinking”.
+- Older steps are still visible but **faded** (lower opacity) so the log feels like a stream.
+- Keep it simple: CSS opacity + rerender; no complex JS.
 
-Important: This is “tool use”, not a hard-coded pipeline that always searches.
-
-### C) Activity Log must “stream” and “fade”
-Implement **two layers**:
-1) **Transient steps**: show each event as a **toast** (`st.toast(...)`) so it fades automatically.
-2) **Persistent log**: keep a chronological activity panel (e.g., inside an expander or a section) showing the full history.
-
-Avoid repeating the same toast on reruns; each toast should show once per event id.
-
-### D) No chain-of-thought disclosure
-Do not print hidden reasoning. Activity log entries must be **short operational steps** like:
-- “Intent: greeting”
-- “Tool call: search metadata indexes”
-- “Tool result: 12 tables found”
-- “SQL generated”
-- “SQL executing…”
-- “Rows returned: 4”
+### D) Strict structure rule
+Implement the **exact class + method signatures** below.  
+Do **not** invent new architecture. You may add small helper functions, but the public API must match.
 
 ---
 
-## Required architecture (classes + signatures)
+## Required files and exact structures
 
-### 1) Data models
-Create/ensure these dataclasses exist (preferred in `app/ui/models.py` or your existing equivalent).
+### 1) `app/ui/models.py` (dataclasses + typing)
+Ensure these exist (or match if they already exist). Do not rename.
 
 ```python
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
-@dataclass
+Role = Literal["user", "assistant", "system"]
+
+@dataclass(frozen=True)
 class UIOptions:
     max_rows: int = 50
     execution_target: Literal["sqlite", "oracle"] = "sqlite"
@@ -85,278 +67,295 @@ class UIOptions:
 
 @dataclass
 class ChatMessage:
-    role: Literal["user", "assistant", "system"]
+    role: Role
     content: str
     ts_iso: str
 
+TraceKind = Literal[
+    "intent",
+    "tool_call",
+    "tool_result",
+    "prompt_build",
+    "sql_generated",
+    "sql_sanitized",
+    "sql_validated",
+    "sql_executing",
+    "sql_result",
+    "respond",
+    "error",
+]
+
 @dataclass
 class TraceEvent:
-    event_id: str              # unique per event
-    kind: str                  # "intent" | "decision" | "tool_call" | "tool_result" | "sql" | "error" | ...
-    message: str               # short display string
+    kind: TraceKind
+    message: str
     ts_iso: str
-    transient: bool = True     # if True, show as toast + also append to persistent log
     payload: Optional[dict[str, Any]] = None
 
 @dataclass
 class TurnResult:
-    assistant_message: str = ""
-    clarification_question: str = ""
-    sql: str = ""
-    df: Any = None             # typically pandas.DataFrame, but keep Any
-    error_message: str = ""
-    debug_details: Optional[dict[str, Any]] = None
+    assistant_message: Optional[str] = None
+    clarification_question: Optional[str] = None
+    sql: Optional[str] = None
+    df: Any = None  # typically pandas.DataFrame
+    error_message: Optional[str] = None
+    debug_details: Optional[str] = None
+    trace_events: list[TraceEvent] = None
 ```
 
-### 2) Intent & tool decision
-Create/ensure file: `app/ui/search_decider.py`
+Notes:
+- `TurnResult.trace_events` must default to an empty list safely (use `None` then set `[]` in `__post_init__`).
+- Keep imports minimal; do not force pandas import at module import time if it causes issues.
+
+---
+
+### 2) `app/ui/search_decider.py` (deterministic tool gating)
+Create/ensure these exact structures:
 
 ```python
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional
-from app.ui.models import ChatMessage, UIOptions
+from typing import Literal
+from app.ui.models import ChatMessage
 
-@dataclass
+Intent = Literal["greeting", "help", "thanks", "data_query", "general_chat"]
+
+@dataclass(frozen=True)
 class SearchDecision:
-    intent: str                 # "greeting" | "smalltalk" | "data_question" | "unknown"
-    needs_search: bool
-    needs_sql: bool
-    reason: str                 # short explanation (NOT chain-of-thought)
+    intent: Intent
+    use_ai_search: bool
+    use_sql: bool
+    reason: str
 
 class SearchDecider:
-    def decide(self, user_text: str, history: list[ChatMessage], options: UIOptions) -> SearchDecision:
+    def decide(self, user_text: str, history: list[ChatMessage]) -> SearchDecision:
         ...
 ```
 
-**Rules inside `decide(...)`:**
-- Implement a **fast deterministic intent check** FIRST (regex/keyword).
-  - If greeting/small-talk/help/thanks → return `needs_search=False`, `needs_sql=False`
-- For other cases:
-  - Use a **light LLM call** (or existing orchestrator LLM) to classify:
-    - intent
-    - needs_search
-    - needs_sql
-  - The LLM must output strict JSON (validated).
+#### Deterministic rules (must implement)
+- If `user_text` matches greeting (case-insensitive): `hi`, `hello`, `hey`, `good morning`, `good afternoon`, `good evening`
+  - `intent="greeting"`, `use_ai_search=False`, `use_sql=False`
+- If it matches thanks: `thanks`, `thank you`, `thx`
+  - `intent="thanks"`, `use_ai_search=False`, `use_sql=False`
+- If it matches help: `help`, `?`, `what can you do`, `examples`
+  - `intent="help"`, `use_ai_search=False`, `use_sql=False`
+- Otherwise default:
+  - `intent="data_query"` **if** it contains strong data hints like: `select`, `from`, `table`, `rows`, `columns`, `schema`, known table prefix patterns (`v_`, etc.)
+  - Else: `intent="general_chat"` with `use_ai_search=False`, `use_sql=False`
 
-### 3) Tools
-Create/ensure tools are isolated behind classes (in `app/core/tools.py` or `app/ui/tools.py` — choose one location and keep it consistent):
+Important:
+- **Do NOT call AI Search for general chat**.
+- AI Search should be used only when a query needs schema discovery / table mapping.
 
-```python
-class MetadataSearchTool:
-    def search(self, query: str, options: UIOptions) -> dict:
-        \"\"\"Return metadata docs, tables, columns, etc.\"\"\"
-        ...
+---
 
-class SQLExecutorTool:
-    def execute(self, sql: str, options: UIOptions):
-        \"\"\"Execute SQL against sqlite/oracle and return a DataFrame-like object.\"\"\"
-        ...
-```
-
-### 4) Orchestrator facade (single entrypoint per chat turn)
-Create/ensure file: `app/ui/orchestrator_facade.py`
+### 3) `app/ui/orchestrator_facade.py` (single entry point per turn)
+Implement/ensure:
 
 ```python
 from __future__ import annotations
-from app.ui.models import ChatMessage, UIOptions, TurnResult, TraceEvent
+from typing import Callable, Optional
+from app.ui.models import UIOptions, ChatMessage, TurnResult, TraceEvent
+from app.ui.search_decider import SearchDecider
+
+TraceCallback = Callable[[TraceEvent], None]
 
 class OrchestratorFacade:
-    def __init__(self, *, search_tool, sql_tool, llm_client, search_decider):
-        ...
-
     def run_chat_turn(
         self,
         user_text: str,
         history: list[ChatMessage],
         options: UIOptions,
-        trace_cb,
+        trace_cb: Optional[TraceCallback] = None,
     ) -> TurnResult:
-        \"\"\"
-        Main pipeline for ONE user turn.
-        Emits TraceEvent via trace_cb(event).
-        Must NOT always call AI search.
-        \"\"\"
         ...
 ```
 
-**Behavior inside `run_chat_turn(...)`:**
-- 1) Call `search_decider.decide(...)`
-  - Emit trace events:
-    - kind="intent"
-    - kind="decision"
-- 2) If greeting/small-talk/help/thanks:
-  - Generate assistant message directly (no tools)
-  - Return TurnResult(assistant_message=...)
-- 3) Else:
-  - If `needs_search`:
-    - call `MetadataSearchTool.search(...)`
-    - emit `tool_call` and `tool_result` trace events
-  - If `needs_sql`:
-    - call LLM to generate SQL, using any retrieved metadata context
-    - emit `sql` trace events
-    - execute SQL via `SQLExecutorTool.execute(...)`
-    - emit rows-returned event
-  - Compose final assistant message (should be shown in chat).
+#### Required behavior inside `run_chat_turn`
+1. Call `SearchDecider().decide(user_text, history)` first.
+2. Emit trace event:
+   - kind=`"intent"`
+   - message like: `Intent detected: {intent} (search={use_ai_search}, sql={use_sql})`
+3. If `intent in {"greeting","help","thanks","general_chat"}`:
+   - Emit trace event kind=`"respond"` message=`"Responding without tools"`
+   - Return `TurnResult(assistant_message=...)` with a friendly response.
+   - **Do not** call AI Search, SQL generation, SQL execution.
+4. If `intent == "data_query"`:
+   - Tool-like flow:
+     - (optional) AI Search for metadata only when `use_ai_search=True`
+     - prompt build
+     - call LLM to produce SQL
+     - sanitize/validate
+     - execute SQL
+     - send *result summary* back to LLM to produce final assistant answer
+   - Emit trace events for each step using the `trace_cb`.
 
-### 5) Activity stream storage
-Create/ensure file: `app/ui/activity_stream.py`
+Important:
+- Keep the existing back-end logic, but ensure it is **gated** by `SearchDecision`.
+
+---
+
+### 4) `app/ui/activity_stream.py` (live stream + fade rendering)
+Implement/ensure:
 
 ```python
 from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Optional
 from app.ui.models import TraceEvent
 
+@dataclass
 class ActivityStream:
-    def __init__(self):
-        self.events: list[TraceEvent] = []
+    max_events: int = 50
+    events: list[TraceEvent] = field(default_factory=list)
 
-    def append(self, ev: TraceEvent) -> None:
-        self.events.append(ev)
+    def add(self, ev: TraceEvent) -> None:
+        ...
 
-    def all(self) -> list[TraceEvent]:
-        return list(self.events)
+    def clear(self) -> None:
+        ...
+
+    def render_html(self) -> str:
+        ...
 ```
 
-Store the ActivityStream in **Streamlit session_state** so it survives reruns.
+Rules:
+- `add()` appends and trims to `max_events`.
+- `render_html()` returns HTML with newest event normal opacity and older events “faded”.
+- Do **not** include raw user data; only the trace event message.
+- HTML can be used via `st.markdown(html, unsafe_allow_html=True)`.
 
-### 6) Streamlit UI must render chat + stream toasts
-File: `app/ui/streamlit_app.py`
+Suggested fade approach:
+- last event: `opacity:1`
+- older: `opacity:0.35`
+- add a small CSS transition.
 
-**Hard requirements:**
-- Ensure `import streamlit as st` exists at the top.
-- Ensure `main()` exists and is called.
-- Ensure the main area **always** renders:
-  - Title/header
-  - Chat transcript (st.chat_message)
-  - Chat input at bottom (st.chat_input)
-  - Activity Log panel (persistent) + toasts for new events
+---
 
-#### Required helper signatures inside `streamlit_app.py`
+### 5) `app/ui/state.py` (no `pass`, never return None)
+Fix any leftover `pass` methods and ensure these exist and always return defaults:
+
 ```python
+from __future__ import annotations
+from typing import List
+import streamlit as st
+from app.ui.models import ChatMessage, TraceEvent, UIOptions
+from app.ui.activity_stream import ActivityStream
+
+DEFAULT_UI_OPTIONS = UIOptions()
+
+def get_ui_options() -> UIOptions: ...
+def set_ui_options(opts: UIOptions) -> None: ...
+
+def get_chat_history() -> list[ChatMessage]: ...
+def append_chat_message(msg: ChatMessage) -> None: ...
+def clear_chat() -> None: ...
+
+def get_activity_stream() -> ActivityStream: ...
+def append_trace_event(ev: TraceEvent) -> None: ...
+def clear_trace_events() -> None: ...
+```
+
+Implementation rules:
+- `get_chat_history()` must initialize `st.session_state["messages"]` to `[]` if missing/None.
+- `get_activity_stream()` must initialize a single `ActivityStream` object in session_state.
+- Never return `None` for lists/objects.
+- No UI rendering in this file.
+
+---
+
+### 6) `app/ui/streamlit_app.py` (chat-first rendering + live stream)
+Required ordering rules:
+1. `import streamlit as st` must be present before any `st.*` usage.
+2. `st.set_page_config(...)` must be called **once** inside `main()` before rendering.
+3. Ensure `bootstrap_project_root()` is called before `from app... import ...` (only if needed for imports).
+
+Implement these functions:
+
+```python
+def bootstrap_project_root() -> None: ...
+def inject_css() -> None: ...
 def init_session_state() -> None: ...
 def render_sidebar() -> None: ...
-def render_chat_main(orchestrator: OrchestratorFacade) -> None: ...
-def render_activity_panel() -> None: ...
-def emit_toast_once(ev: TraceEvent) -> None: ...
+def render_chat_main(orchestrator) -> None: ...
 def main() -> None: ...
 ```
 
-**Toast dedupe rule:**
-- Create `st.session_state["seen_toast_ids"] = set()`
-- If `ev.event_id` in set → do not toast again.
+#### Streaming behavior requirement
+- Create a container for Activity Log (e.g., `activity_placeholder = st.empty()` or inside an expander).
+- Pass a `trace_cb` into `orchestrator.run_chat_turn(...)` that:
+  1) appends to session activity stream (`append_trace_event(ev)`), and
+  2) re-renders the activity placeholder immediately with fade HTML (`activity_placeholder.markdown(...)`).
 
-**Streaming/fade effect:**
-- For each new TraceEvent appended during a turn, call `emit_toast_once(ev)` immediately.
-- Persist the event into ActivityStream and show it in `render_activity_panel()`.
+This produces “stream-like” updates as the script runs.
 
----
+#### Chat transcript
+- Use `st.chat_message(role)` for each message.
+- Use `st.chat_input(...)` at bottom.
+- When user submits, append user message, call orchestrator once, then append assistant message, then `st.rerun()`.
 
-## UX details to implement (exactly)
-
-### 1) Greeting turn should look like this:
-User types: “HI”
-
-Chat:
-- user bubble: HI
-- assistant bubble: “Hi! Ask me a question about your data (or type ‘help’ for examples).”
-
-Activity toasts (fade):
-- “Intent: greeting”
-- “Decision: skip tools”
-
-Persistent Activity panel shows same entries.
-
-### 2) Real data question should show multi-step streaming:
-Example: “Show me 10 rows from v_dlv_dep_prty_clr”
-
-Toasts (fade, in order):
-- “Intent: data question”
-- “Decision: needs SQL” (and needs_search only if required)
-- If search:
-  - “Tool call: search metadata”
-  - “Tool result: found 3 relevant tables”
-- “SQL generated”
-- “SQL executing…”
-- “Rows returned: 10”
-
-Chat should show:
-- assistant message (explanation + next suggestions)
-- SQL card
-- Results grid
+#### IMPORTANT UI fix: “Hi triggers search”
+Once `SearchDecider` is wired, the transcript for “hi” must show only greeting response.
 
 ---
 
-## Fixes you must make based on the code screenshots
+## Extra UX: “fade then replace” (simple and safe)
+You asked: “intent shows first, then fades, then search shows, then fades…”
 
-### A) `main()` not defined / `st` not defined regressions
-- Ensure `import streamlit as st` is present before calling `st.*`
-- Ensure `def main(): ...` exists **above** any usage `main()` call
-- Ensure `if __name__ == "__main__" or "streamlit" in sys.argv[0]: main()` is at the bottom (or simpler: just call `main()`)
+Implement as:
+- Keep all events, but older ones are rendered with lower opacity.
+- The newest event is highlighted (normal opacity).
+- That visually gives the “fade” effect without timers or JS.
 
-### B) `st.set_page_config` placement
-- Call `st.set_page_config(...)` near the start of `main()` **only once**.
-- Do not call it at module import time *before* `import streamlit as st`.
-
-### C) Chat history storage must be real (no `pass`)
-In `app/ui/state.py` (or wherever you store session state), ensure these are implemented:
-
-```python
-def get_chat_history() -> list[ChatMessage]: ...
-def append_chat_message(msg: ChatMessage) -> None: ...
-def get_trace_events() -> list[TraceEvent]: ...
-def append_trace_event(ev: TraceEvent) -> None: ...
-```
-
-No `pass` allowed in the final implementation.
+If you want “auto-hide” later, add a “Show last N events” slider in sidebar (optional).
 
 ---
 
-## Tests (required)
-Create tests (pytest) for `SearchDecider.decide(...)`:
+## What to change right now (based on your current screenshots)
 
-- “hi” → intent greeting, needs_search False, needs_sql False
-- “help” → intent help (or smalltalk), needs_search False, needs_sql False
-- “show me 10 rows from table_x” → needs_sql True
-- “what columns does table_x have” → needs_search True (sql optional depending on your design)
-
-Tests must be deterministic; for LLM classification path, mock the LLM client.
+1. **Your app is calling AI search for “HI”** → this means `SearchDecider` is not used, or it defaults to data_query.
+   - Implement deterministic greeting detection and wire it at the start of `run_chat_turn()`.
+2. **Activity Log is appended but not streamed** → ensure trace callback updates a placeholder while the turn runs.
+3. **Keep the tool-flow only for `intent="data_query"`**.
 
 ---
 
-## Acceptance checklist (must pass)
-- [ ] Typing “hi” does NOT call metadata search or SQL.
-- [ ] Activity log shows “Intent: greeting” then “Decision: skip tools” as toasts that fade.
-- [ ] Chat always shows assistant response bubble.
-- [ ] For real questions, tool calls happen only when needed.
-- [ ] Activity log persistent panel retains all events; toasts show only once.
-- [ ] No `pass` remains in state/chat functions.
-- [ ] Unit tests for SearchDecider pass.
+## Tests (must add)
+Create `tests/test_search_decider.py`:
 
----
+- `hi` → use_ai_search False, use_sql False
+- `help` → False/False
+- `thanks` → False/False
+- `show me 10 rows from v_dlv_dep_prty_clr` → intent data_query and (likely) use_sql True
 
-## Implementation guidance (do not skip)
-1) Start by making `SearchDecider` deterministic for greetings/help/thanks.
-2) Update `OrchestratorFacade.run_chat_turn` to obey `SearchDecision` (skip tools).
-3) Ensure Streamlit UI:
-   - appends user message
-   - calls orchestrator once per input
-   - appends assistant message
-   - shows toasts for each TraceEvent
-4) Ensure ActivityStream is stored in session_state so it survives reruns.
-5) Add/adjust tests and run them.
-
----
-
-## Commands to verify locally
-Run these and paste outputs back if anything fails:
-
+Run:
 ```bash
-python -m compileall app/ui/streamlit_app.py app/ui/search_decider.py app/ui/orchestrator_facade.py
+python -m compileall app/ui
 pytest -q
-streamlit run app/ui/streamlit_app.py
 ```
 
 ---
 
-## If you need more context
-If anything is unclear, ask me for **one** missing file at a time (e.g., `app/ui/orchestrator_facade.py`, `app/ui/state.py`, `app/ui/search_decider.py`) and I will paste it. Do not guess large missing modules.
+## Verification commands (must include in your PR output)
+```bash
+python -m compileall app/ui
+pytest -q
+.venv/bin/streamlit run app/ui/streamlit_app.py
+```
+
+---
+
+## Deliverables (Copilot must produce)
+1. Updated files implementing the exact structures above.
+2. Tests passing.
+3. A short “What changed” summary:
+   - greeting behavior fixed (no tools)
+   - streamed activity log with fade
+   - tool gating implemented via SearchDecider + OrchestratorFacade
+
+---
+
+## IMPORTANT: Do not redesign
+- No new UI layout frameworks.
+- No random refactor.
+- Only implement what’s listed with the stated signatures and behavior.
