@@ -1,204 +1,153 @@
-# Copilot Prompt — Backend-first: Event Streaming + Tests (UI comes later)
+# Copilot Prompt — Step: Frontend Streamlit UI (TD theme + event stream)
 
-> **Do NOT implement any Streamlit/UI changes in this step.**  
-> Focus on backend reliability + test coverage. After this passes, we will wire the same event stream into the UI.
+You are working in repo **text2sql_v2**. Backend now supports **structured event logs** during execution (planner → ai_search → prompt → llm → sql_sanitize → sql_execute → fallback / clarify / error). The CLI smoke tests pass.
 
-## Goal
-
-1) Add a **structured activity/event stream** to the backend that captures progress like:
-
-- deciding whether tools are needed  
-- calling AI Search  
-- building prompt  
-- generating SQL  
-- sanitizing SQL (remove markdown fences)  
-- validating SQL (basic)  
-- executing SQL  
-- **0-row fallback** diagnostics  
-- errors/retries (max 5) decisions
-
-2) Add **tests** to verify the stream + critical behaviors.
-
-## Constraints (must follow)
-
-- **No new agent frameworks** (keep it lightweight, pure Python).  
-- Keep existing public APIs working; add new optional params rather than breaking changes.  
-- Avoid new heavy dependencies. Use `pytest` if already present; otherwise add it.  
-- Logging must be **structured** (events), not just `print()`.
-
-## Quick repo scan (do this first)
-
-Search the repo for these files/classes and note current signatures:
-- `app/main_cli.py` (CLI entry)
-- `app/core/llm_service.py` (LLM calls + response_format handling)
-- `app/core/sql_service.py` (SQLite execution)
-- `app/core/query_orchestrator.py` OR `app/core/orchestrator.py` OR similar (router/orchestrator)
-- `app/core/query_result.py` (already introduced for 0-row fallback)
-- `app/core/ai_search_service.py` or similar (Azure AI Search tool integration)
-
-If some names differ, **adapt the changes to the actual structure** but keep the intent.
+**Goal (this step):** Upgrade the Streamlit UI to:
+1) look modern with **TD-like white + green** styling, clean cards, optional TD logo  
+2) support a **chat experience** (user asks, assistant answers)  
+3) show an **Activity Log** panel that **streams live events** (e.g., “planning… calling AI search… generating SQL… executing…”)  
+4) allow **debug mode**: Activity Log visible only when debug is ON  
+5) support **keyboard shortcut** for submit (Enter) and allow newline with Shift+Enter  
+6) fix the issue where UI shows **“(No assistant message returned)”** after user says “hi” (must always return a friendly assistant response)
 
 ---
 
-## New backend types to add (signatures)
-
-### 1) `app/core/events.py`
-
-Create these types:
-
-**`LogEvent` (dataclass)**
-- `ts: datetime` (UTC)
-- `stage: str`  (examples: `planner`, `ai_search`, `prompt`, `llm`, `sql_sanitize`, `sql_validate`, `sql_execute`, `fallback`, `retry`, `error`)
-- `message: str`
-- `level: str` (one of: `info`, `warning`, `error`)
-- `data: dict | None` (optional structured payload)
-
-**`EventSink` (protocol / interface)**
-- `emit(self, event: LogEvent) -> None`
-
-**`NullEventSink`**
-- does nothing
-
-**`ListEventSink`**
-- stores events in-memory for tests (`events: list[LogEvent]`)
-
-Optionally add:
-- `emit_info(stage, message, data=None)`
-- `emit_warn(...)`
-- `emit_error(...)`
-
-### 2) Extend `QueryResult` (or create a wrapper response)
-
-You already have `QueryResult`. Update it (non-breaking) to include:
-
-- `assistant_message: str | None`  (final user-facing response)
-- `sql: str | None`
-- `rows: list[dict] | None`  (or your existing format)
-- `row_count: int | None`
-- `events: list[LogEvent]`  (copy from sink at end)
-
-If you cannot safely change `QueryResult`, create a new dataclass (e.g., `OrchestratorResponse`) with the fields above and return that from the orchestrator **without breaking existing callers**.
+## Constraints
+- Keep Streamlit (no heavy UI frameworks).
+- Add dependencies only if absolutely necessary (prefer stdlib + existing deps).
+- No secrets in code. Keep using `.env` via existing config loader.
+- Do not redesign backend router/orchestrator—UI should be a thin consumer.
 
 ---
 
-## Orchestrator changes (core of this step)
+## A) UI layout + styling (TD theme)
+Update: `app/ui/streamlit_app.py`
 
-Find the function that handles a user question end-to-end (router/orchestrator). Update it so:
+**Header**
+- Title: “Text2SQL Chat”
+- Optional logo: if `app/ui/assets/td_logo.png` exists, show it; otherwise skip.
 
-### A) It accepts an optional event sink
-Add a parameter:
-- `event_sink: EventSink | None = None`
-and inside do:
-- `sink = event_sink or NullEventSink()`
-
-### B) Emit events at each step
-Emit at least:
-
-1. `planner` — received question
-2. `planner` — deciding tools needed
-3. `ai_search` — if called: query + number of docs returned
-4. `prompt` — building prompt (DO NOT log secrets)
-5. `llm` — calling LLM, and LLM returned (include model/deployment name if safe)
-6. `sql_sanitize` — before/after sanitization (do not log huge SQL; truncate)
-7. `sql_validate` — validation success/fail reason
-8. `sql_execute` — execution started + completed, include row_count
-9. `fallback` — only when row_count == 0: discovered likely filter columns + top values
-10. `error` — exceptions with safe message
-11. `retry` — when you decide to retry (max 5), include reason + attempt number
-
-### C) Fix “hi” / smalltalk producing no assistant message
-If the user says something like `hi`, `hello`, `help`:
-- return a friendly assistant_message and emit `planner` event
-- do **not** attempt SQL execution
-This should prevent the UI from showing “(No assistant message returned)”.
-
-### D) SQL sanitization must be centralized
-Ensure the final SQL passed to SQLite never contains:
-- triple backticks
-- leading “```sql”
-- trailing “```”
-Emit a `sql_sanitize` event showing that sanitization happened.
-
-### E) Retry logic (model decides based on error)
-Implement a retry loop (max 5):
-- If LLM or tool call fails with a transient-ish error (timeout, rate limit, connection error), emit `retry` and retry.
-- If SQL execution fails due to obvious SQL syntax issues, emit `error`, then:
-  - call LLM once to “repair SQL” using the error message and schema context
-  - emit `retry`
-- Always stop after 5 attempts and return a helpful assistant_message.
+**Theme**
+- White background, TD-green accent (use a single constant like `TD_GREEN = "#00A94F"` or similar).
+- Use `st.markdown(<style>, unsafe_allow_html=True)` + CSS for:
+  - chat bubbles (user vs assistant)
+  - clean cards (border, subtle shadow, rounded corners)
+  - activity log lines (small monospace + muted)
 
 ---
 
-## CLI wiring (backend-only)
+## B) Chat state + message rendering
+Keep history in `st.session_state`:
+- `messages`: list of `{"role": "user"|"assistant", "content": str}`
+- `activity`: list of log lines (strings) OR event objects (then format at render time)
 
-Update `app/main_cli.py` so that:
-- It creates a `ListEventSink`
-- Passes it into orchestrator
-- Prints events to console as they happen (or at end)
-  - Format: `[stage] message` (keep it short)
-- If assistant_message is empty/None, print a safe default.
+Create helper functions (these signatures must exist for future edits):
 
-> Keep CLI backwards compatible: existing command `python -m app.main_cli "question"` should still work.
+```python
+def init_state() -> None: ...
+def render_header() -> None: ...
+def render_messages(messages: list[dict]) -> None: ...
+def render_activity_log(activity: list[str], enabled: bool) -> None: ...
+def append_message(role: str, content: str) -> None: ...
+```
 
----
-
-## Tests (must add)
-
-Create/extend tests under `tests/` using `pytest`.
-
-### Test 1 — events are emitted for a normal query
-- Use a **FakeLLM** that returns SQL like: `SELECT 1 as x LIMIT 1;`
-- Use a **FakeSQLService** that returns 1 row
-- Assert:
-  - returned `assistant_message` is not empty
-  - events include stages: `planner`, `llm`, `sql_sanitize`, `sql_execute`
-
-### Test 2 — markdown fences are stripped
-- FakeLLM returns:
-  - ```sql
-    SELECT 1;
-    ```
-- Assert SQL passed to executor has no backticks and no “sql” fence.
-
-### Test 3 — 0-row fallback emits diagnostics
-- FakeSQLService returns 0 rows
-- Ensure `fallback` stage event exists and includes some `data` payload (e.g. `candidate_filters`, `top_values`)
-- Ensure assistant_message includes a helpful explanation + suggestion
-
-### Test 4 — “hi” returns assistant message and no SQL execution
-- Input: `hi`
-- Assert assistant_message is not empty
-- Assert no `sql_execute` event exists
-
-> If you already have a dependency injection approach, use it. If not, minimally refactor orchestrator to accept `llm_service` and `sql_service` as optional parameters to enable fakes in tests.
+**Fix “No assistant message returned”**
+- Every user input MUST result in an assistant message.
+- If backend returns empty/None, show fallback:
+  “Hi! Ask me a question about your data, or type ‘help’ for examples.”
 
 ---
 
-## Verification commands (run locally)
+## C) Streaming Activity Log from backend events
+Wire Streamlit to show events as they arrive.
 
-1) Run tests:
-- `pytest -q`
+Implement:
 
-2) Run CLI:
-- `python -m app.main_cli "hi"`
-- `python -m app.main_cli "show me 10 rows from v_dlv_dep_prty_clr"`
+```python
+def format_event_line(event: object) -> str:
+    """Convert backend event objects/dicts/strings into one log line."""
 
-Expected:
-- assistant_message printed
-- event log shows meaningful stages
-- no crashes
+def run_chat_turn(user_text: str, debug: bool) -> None:
+    """Runs one chat turn: streams events to Activity Log and appends final assistant message."""
+```
+
+**Event format compatibility**
+Backend may emit:
+- dataclass objects (with `.type`/`.message` or similar)
+- dicts (keys like `type`, `message`)
+- strings
+
+Formatter must handle all 3 safely (never crash).
+
+**Streaming**
+- Use `st.empty()` placeholders to incrementally update the Activity Log panel while the backend runs.
+
+Recommended log line format:
+- `[{type}] {message}`
 
 ---
 
-## Deliverables for this step
+## D) Input UX + keyboard shortcut
+- Default: `st.chat_input()` (Enter submits).
+- If multiline needed: add a toggle to switch to `st.text_area()` + “Send”.
+- Debug toggle in sidebar: Activity Log hidden when debug OFF.
 
-- `app/core/events.py` added
-- orchestrator updated to accept `event_sink` and emit events
-- `QueryResult` (or new response) includes `events`
-- CLI prints/logs events and never returns empty assistant message
-- tests added and passing
+---
 
-When done, paste:
+## Backend integration (thin)
+UI should call ONE backend entrypoint used by CLI (preferred).
+If a tiny adapter is needed, add:
+
+File: `app/ui/ui_backend_adapter.py`
+
+```python
+from collections.abc import Iterator
+from typing import Any
+
+def run_request_stream(user_text: str) -> Iterator[Any]:
+    """Yield events during execution; last yield may be the final result event."""
+
+def extract_final_assistant_text(events: list[Any]) -> str:
+    """Return the assistant text from accumulated events/results."""
+```
+
+Keep adapter minimal (call existing orchestrator/router).
+
+---
+
+## Tests (required before manual UI testing)
+Create: `tests/test_ui_event_formatting.py`
+
+Test cases:
+- `format_event_line()` handles:
+  - dict event with `type` + `message`
+  - dataclass event with `.type`/`.message`
+  - string event
+  - unknown object → safe string (no crash)
+- core logic never returns empty assistant message (fallback is used)
+
+If you add the adapter, test `extract_final_assistant_text()` too.
+
+---
+
+## Manual verification (Copilot must run + paste outputs)
+1) `pytest -q`
+2) `.venv/bin/streamlit run app/ui/streamlit_app.py`
+3) In UI:
+- send `hi` → assistant replies (not empty)
+- send `show me 10 rows from v_dlv_dep_prty_clr`
+  - assistant responds with results summary
+  - Activity Log streams events when Debug ON
+
+---
+
+## Acceptance Criteria
+- TD-styled UI (white/green, clean cards).
+- Assistant message is NEVER empty.
+- Activity Log streams and can be hidden with Debug toggle.
+- No heavy deps added.
+- `pytest -q` passes.
+
+Now implement, run verification commands, and paste:
 - `pytest -q` output
-- output of the 2 CLI commands above
-- a short list of files changed
+- Streamlit startup output + one interaction log
