@@ -1,112 +1,133 @@
 # Prompt: Fix `NameError: name 'st' is not defined` in `app/ui/streamlit_app.py`
 
-You are working in the repo **text2sql_v2**. Running the Streamlit UI fails immediately with:
+## Context (what you must fix)
+Running Streamlit fails immediately with:
 
-- **NameError: name `st` is not defined**
-- It happens at/near the very top of `app/ui/streamlit_app.py` where `st.set_page_config(...)` is called.
+- `NameError: name 'st' is not defined`
+- Trace points to `app/ui/streamlit_app.py`, line where `st.set_page_config(...)` is called.
 
-This is a **runtime import/ordering bug**, not a design change request.
+From the provided code screenshot, `st.set_page_config(...)` is executed **before** `import streamlit as st`, so `st` is undefined.
 
----
+## Goal
+1. **Fix the crash** by ensuring `streamlit` is imported *before any usage* of `st`.
+2. Keep the existing architecture (chat-first UI, activity log, sidebar).
+3. Ensure the main page **always shows the chat** (header + messages + input) in the main area.
+4. Keep the `sys.path` bootstrap behavior so `from app...` imports work when launched via Streamlit.
 
-## Objective
-
-1. Fix the crash so the Streamlit app loads.
-2. Preserve the **chat-first UI architecture** already implemented (chat transcript, chat input, streaming activity log).
-3. Do **minimal, surgical changes** (do not redesign the UI; do not add new features).
-
----
-
-## Constraints
-
-- Do not remove the chat UI code that was recently added (e.g., `render_chat_main(...)`, activity log, `run_chat_turn`, etc.).
-- Do not introduce new frameworks.
-- Keep Streamlit usage idiomatic:
-  - `st.set_page_config(...)` must be called **once per page run**, and it must execute **after `import streamlit as st`** and before other Streamlit calls.
-- Ensure the file can be imported/executed without relying on side effects from other modules.
+## Constraints (important)
+- Do **not** redesign the UI or add new features beyond what’s necessary to fix the crash and keep chat visible.
+- Prefer minimal, deterministic changes.
+- Maintain one authoritative entrypoint flow: `main()` → bootstrap → theme/css → session state → sidebar → chat main.
+- `st.set_page_config(...)` must be called **exactly once** and **after** `import streamlit as st`, and **before** other Streamlit UI calls.
 
 ---
 
-## Root Cause (what to look for)
-
-This error means **`st` is referenced before it is defined**. Typical causes:
-
-- `import streamlit as st` is missing.
-- `import streamlit as st` exists, but it’s *below* `st.set_page_config(...)` or inside a function, while `st.set_page_config(...)` runs at module import time.
-- A refactor moved `st.set_page_config(...)` above imports or into a block that runs before the import.
+## Files to change
+- `app/ui/streamlit_app.py` (primary)
 
 ---
 
-## Required Fix (Implementation Details)
+## Required code changes (exact expectations)
 
-### Step 1 — Open and inspect
-- Open `app/ui/streamlit_app.py`.
-- Confirm where `st.set_page_config(...)` is called.
-- Confirm whether `import streamlit as st` exists and where it is located.
+### 1) Fix import order and remove the invalid early `st` call
+In `app/ui/streamlit_app.py`:
 
-### Step 2 — Ensure correct import order (must do)
-Reorder the top of `app/ui/streamlit_app.py` to the following pattern:
+- **Remove** any top-level call like this **that appears before** `import streamlit as st`:
+  - `st.set_page_config(page_title="Text2SQL (POC)", page_icon="💡", layout="wide")`
 
-1. Optional future import (if used):
-   - `from __future__ import annotations`
-2. Standard library imports (`os`, `sys`, `pathlib`, `typing`, etc.)
-3. **Project-root bootstrap** (if you are using one) that modifies `sys.path`
-4. **`import streamlit as st`**
-5. Then call `st.set_page_config(...)`
+- Ensure imports at the top look like this (order matters):
+  1. Standard libs (`sys`, `pathlib`, etc.)
+  2. `import streamlit as st`
+  3. No `from app...` imports at module top-level if they require project-root bootstrap
 
-> **Important:** If your code currently calls `st.set_page_config(...)` at module top-level, keep it there — but only *after* `import streamlit as st`.  
-> If `st.set_page_config(...)` is called inside `main()`, ensure `import streamlit as st` is at file top-level anyway (simplest, safest).
+### 2) Keep the project-root bootstrap, but don’t block Streamlit
+Keep (or implement) a helper like:
 
-### Step 3 — Keep `main()` and rendering flow intact
-- Ensure there is a `main()` that orchestrates:
-  - page config (if not already done at top-level),
-  - sidebar rendering,
-  - `render_chat_main(orchestrator)` (or similar),
-  - activity log expander.
-- Ensure the file ends with `main()` being executed once.
-  - Avoid double-execution (don’t call `main()` twice; don’t call it both with and without `if __name__ == "__main__":`).
+- `bootstrap_project_root()` that inserts the project root into `sys.path`
 
-### Step 4 — Don’t break the imports of other modules
-Your repo likely has modules like:
-- `app/core/orchestrator_facade.py`
-- `app/ui/activity_stream.py`
-- `app/ui/chat_models.py`
-- `app/ui/search_decider.py`
+Rules:
+- It must run **before any `from app...` imports are executed**.
+- It may remain as a function and be called inside `main()` (recommended).
+- It may also be called at module load **only if** it does not depend on `app` imports.
 
-Do **not** change their APIs unless you find an actual import error.
+### 3) Call `st.set_page_config()` once, in the correct place
+Pick **one** of these acceptable patterns (do not do both):
 
----
+**Preferred pattern**
+- Inside `main()` as the first Streamlit call:
 
-## Verification (run these commands)
-
-Use the venv Python and venv Streamlit **explicitly**:
-
-```bash
-# From repo root
-/app1/tag5916/projects/text2sql_v2/.venv/bin/python -m compileall app/ui/streamlit_app.py
-
-# Start the UI
-/app1/tag5916/projects/text2sql_v2/.venv/bin/streamlit run app/ui/streamlit_app.py
+```python
+def main() -> None:
+    st.set_page_config(page_title="Text2SQL (POC)", page_icon="💡", layout="wide")
+    bootstrap_project_root()
+    ...
 ```
 
-**Expected result:**
-- No `NameError`.
-- Page renders with chat area visible in the **main panel** (not blank).
-- Sidebar can exist, but main panel must show chat transcript + input.
+Alternative pattern (also valid)
+- Top-level, but only **after** `import streamlit as st` and before any UI output:
+
+```python
+import streamlit as st
+st.set_page_config(...)
+```
+
+### 4) Make sure `main()` is always called when Streamlit runs the script
+Ensure the bottom of the file triggers `main()` under Streamlit execution:
+
+Acceptable guard examples:
+```python
+if __name__ == "__main__":
+    main()
+```
+
+or (if you must support special invocation styles):
+```python
+if __name__ == "__main__" or "streamlit" in sys.argv[0]:
+    main()
+```
+
+But:
+- If you use `"streamlit" in sys.argv[0]`, ensure `sys` is imported before this check.
+
+### 5) Ensure chat renders in main area (no blank page)
+Keep the structure already present:
+
+- `render_sidebar()`
+- `render_chat_main(orchestrator)`
+- `render_trace_panel(...)` (activity log)
+
+Guarantees:
+- `render_chat_main(...)` must always run in `main()` after session init, regardless of sidebar state.
+- If chat history is empty, insert a greeting message so the main area is not blank.
 
 ---
 
-## Deliverables
-
-1. A patch to `app/ui/streamlit_app.py` that fixes the crash.
-2. Brief note in the PR/commit message explaining:
-   - `st` was used before import,
-   - import order fixed.
+## Acceptance criteria (must pass)
+1. `python -m compileall app/ui/streamlit_app.py` succeeds (no syntax errors).
+2. `streamlit run app/ui/streamlit_app.py` starts without exceptions.
+3. Opening the app shows:
+   - A chat header/title in the main area
+   - A greeting assistant message if no history exists
+   - A chat input at the bottom (e.g., `st.chat_input(...)`)
+   - Activity log panel present (or at least not breaking rendering)
 
 ---
 
-## Definition of Done
+## Verification commands (run and paste output)
+Run from the repo root with the same venv you use for Streamlit:
 
-- `streamlit_app.py` runs without exceptions.
-- Chat UI is visible in the main page immediately on load.
-- No unrelated refactors or UI redesigns were introduced.
+```bash
+.venv/bin/python -m compileall app/ui/streamlit_app.py
+.venv/bin/streamlit run app/ui/streamlit_app.py
+```
+
+If it still fails, paste:
+- the full traceback
+- the first ~40 lines of `app/ui/streamlit_app.py` (imports + any early calls)
+- the `main()` function definition
+
+---
+
+## Notes (common pitfall to avoid)
+- Any `st.*` call above `import streamlit as st` will recreate the same `NameError`.
+- Avoid having `st.set_page_config()` twice (Streamlit can warn or behave unexpectedly).
