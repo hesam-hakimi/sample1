@@ -1,322 +1,330 @@
-# Text2SQL Streamlit UI — Fix `NameError: main is not defined` + Enforce Chat-First Architecture (Copilot Prompt)
+# Text2SQL Streamlit UI — Fix “chat input does nothing / messages not showing” + Validate Architecture
 
-> **Copy/paste this entire prompt into GitHub Copilot Chat (in your repo root).**  
-> Goal: **fix the current runtime errors** and **make sure the implementation matches the required chat-first design** (chat transcript in main area, streaming activity log, deterministic “use search?” decision, results returned to the assistant message).
+## Context / Symptom
+- The Streamlit page loads and shows **Text2SQL Chat** and **Activity Log**, but:
+  - The initial greeting message may not appear.
+  - When the user types **“hi”** (or any message), **nothing shows in the chat transcript**.
+  - Backend logs show the pipeline is running (LLM SQL extraction, execution, etc.), but UI doesn’t reflect it.
 
----
+## Most likely root cause
+This is a common Streamlit chat pattern issue:
 
-## 0) Context (what you must assume)
+1. Your code renders the chat transcript **before** reading `st.chat_input()`.
+2. When the user submits text, you **append messages to `st.session_state` after the transcript has already been rendered**.
+3. Streamlit does not automatically re-render earlier blocks inside the same run unless you:
+   - render the new message immediately in the same run **and/or**
+   - call `st.rerun()` after updating the state.
 
-- Repo has a Streamlit entrypoint: `app/ui/streamlit_app.py`
-- The app is **chat-first**:
-  - User asks a question in chat
-  - Assistant decides if **AI Search** is needed (or not) and logs steps
-  - If needed: fetch metadata / schema info (via AI Search or equivalent)
-  - Generate SQL and execute query
-  - **Return SQL + query results back into the assistant chat response**
-  - Show a **streaming activity log** (not hidden chain-of-thought; just step logs like “Deciding search…”, “Fetching metadata…”, “Generating SQL…”, “Executing…”)
-
----
-
-## 1) Immediate bug to fix (observed)
-
-### A) Current error
-`NameError: name 'main' is not defined`  
-Happens because `main()` is being called at module import time **before** `def main()` exists, or because `main` is not defined at module scope (e.g., nested/indented incorrectly), or there is a stray `main()` call above its definition.
-
-### B) Previously seen errors (must not regress)
-- `NameError: name 'st' is not defined` (Streamlit used before `import streamlit as st`)
-- `ModuleNotFoundError` import path issues (`app` not found) because project root not in `sys.path`
+Result: the user submits a message and sees nothing until a later rerun (or never, if state functions return copies / not persisted).
 
 ---
 
-## 2) Hard requirements (do not “redesign”, just implement exactly)
+## Required architecture (do NOT redesign — implement exactly these structures)
 
-### UI must always show (main area)
-1. Title/header (TD-themed is OK; minimal)
-2. Chat transcript (show at least a greeting if empty)
-3. Chat input at the bottom (`st.chat_input`)
-4. Activity log panel/expander that updates while the turn runs
-
-### “Process of thought” requirement
-- **Do NOT show hidden chain-of-thought.**
-- Instead, implement an **Activity Log** stream of deterministic steps:
-  - `Deciding whether AI search is needed...`
-  - `Using AI search: YES/NO (reason: ...)`
-  - `Fetching metadata from index ...`
-  - `Reviewing table structure ...`
-  - `Generating SQL ...`
-  - `Executing SQL ...`
-  - `Formatting results ...`
-
-### Architecture requirement
-You MUST keep these **exact module/class/function signatures** (create or adjust files as needed):
-
-#### `app/ui/models.py`
+### `app/ui/models.py`
 ```python
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
+
+Role = Literal["user", "assistant", "system"]
 
 @dataclass
 class ChatMessage:
-    role: Literal["user", "assistant"]
+    role: Role
     content: str
     ts_iso: Optional[str] = None
+    meta: dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class TraceEvent:
     ts_iso: str
-    stage: str                 # e.g. "search_decision", "search_fetch", "sql_gen", "sql_exec"
-    message: str               # human readable log line
-    data: Optional[dict[str, Any]] = None
-
-@dataclass
-class UIOptions:
-    max_rows: int = 50
-    execution_target: Literal["sqlite", "oracle"] = "oracle"  # placeholder if needed
-    debug_enabled: bool = False
-
-@dataclass
-class TurnResult:
-    assistant_message: Optional[str] = None
-    clarification_question: Optional[str] = None
-    sql: Optional[str] = None
-    df: Any = None                       # keep Any to avoid hard pandas dep here
-    error_message: Optional[str] = None
-    debug_details: Optional[dict[str, Any]] = None
+    stage: str                 # e.g. "decide_search", "fetch_metadata", "generate_sql", "execute_sql"
+    message: str               # human friendly
+    payload: dict[str, Any] = field(default_factory=dict)
 ```
 
-#### `app/ui/state.py`
+### `app/ui/state.py`
+All state functions MUST be safe (never return None) and must always persist into `st.session_state`.
+
 ```python
 from __future__ import annotations
 from typing import List
-from app.ui.models import ChatMessage, TraceEvent, UIOptions
+import streamlit as st
+from app.ui.models import ChatMessage, TraceEvent
 
-DEFAULT_UI_OPTIONS = UIOptions()
+DEFAULT_DEBUG_ENABLED = False
 
-def init_session_state() -> None: ...
-def get_chat_history() -> List[ChatMessage]: ...
-def append_chat_message(msg: ChatMessage) -> None: ...
-def clear_chat() -> None: ...
+def init_session_state() -> None:
+    if "messages" not in st.session_state or st.session_state["messages"] is None:
+        st.session_state["messages"] = []
+    if "trace_events" not in st.session_state or st.session_state["trace_events"] is None:
+        st.session_state["trace_events"] = []
+    if "debug_enabled" not in st.session_state or st.session_state["debug_enabled"] is None:
+        st.session_state["debug_enabled"] = DEFAULT_DEBUG_ENABLED
+    if "last_result" not in st.session_state:
+        st.session_state["last_result"] = None
 
-def get_trace_events() -> List[TraceEvent]: ...
-def append_trace_event(ev: TraceEvent) -> None: ...
-def clear_trace() -> None: ...
+def get_chat_history() -> List[ChatMessage]:
+    init_session_state()
+    return st.session_state["messages"]
 
-def get_ui_options() -> UIOptions: ...
-def set_ui_options(opts: UIOptions) -> None: ...
+def append_chat_message(msg: ChatMessage) -> None:
+    init_session_state()
+    st.session_state["messages"].append(msg)
+
+def clear_chat() -> None:
+    init_session_state()
+    st.session_state["messages"] = []
+
+def get_trace_events() -> List[TraceEvent]:
+    init_session_state()
+    return st.session_state["trace_events"]
+
+def append_trace_event(ev: TraceEvent) -> None:
+    init_session_state()
+    st.session_state["trace_events"].append(ev)
+
+def clear_trace() -> None:
+    init_session_state()
+    st.session_state["trace_events"] = []
 ```
 
-#### `app/ui/orchestrator_client.py`
+### `app/ui/orchestrator_client.py` (interface expectation)
+Your UI will call ONE method with this signature. Implementers can adapt internally but MUST expose it.
+
 ```python
 from __future__ import annotations
-from typing import Callable, Optional, List
-from app.ui.models import ChatMessage, TurnResult, UIOptions, TraceEvent
+from dataclasses import dataclass
+from typing import Any, Callable, Literal, Optional
 
-TraceCallback = Callable[[TraceEvent], None]
+import pandas as pd
+from app.ui.models import ChatMessage, TraceEvent
+
+@dataclass
+class UIOptions:
+    max_rows: int
+    execution_target: Literal["sqlite", "oracle"]
+    debug_enabled: bool
+
+@dataclass
+class ChatTurnResult:
+    assistant_message: Optional[str] = None
+    clarification_question: Optional[str] = None
+    sql: Optional[str] = None
+    df: Optional[pd.DataFrame] = None
+    error_message: Optional[str] = None
+    debug_details: dict[str, Any] = None
 
 class OrchestratorClient:
     def run_turn(
         self,
         user_text: str,
-        history: List[ChatMessage],
+        history: list[ChatMessage],
         options: UIOptions,
-        trace_cb: Optional[TraceCallback] = None,
-    ) -> TurnResult: ...
+        trace_cb: Optional[Callable[[TraceEvent], None]] = None,
+    ) -> ChatTurnResult:
+        ...
 ```
-
-#### `app/core/search_decider.py`
-```python
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import List
-from app.ui.models import ChatMessage
-
-@dataclass
-class SearchDecision:
-    use_search: bool
-    reason: str
-    query: str | None = None
-
-def decide_use_search(user_text: str, history: List[ChatMessage]) -> SearchDecision: ...
-```
-
-#### `app/core/orchestrator_facade.py`
-```python
-from __future__ import annotations
-from typing import Callable, Optional, List
-from app.ui.models import ChatMessage, TurnResult, UIOptions, TraceEvent
-from app.ui.orchestrator_client import TraceCallback
-
-def run_chat_turn(
-    user_text: str,
-    history: List[ChatMessage],
-    options: UIOptions,
-    trace_cb: Optional[TraceCallback] = None,
-) -> TurnResult: ...
-```
-
-#### UI components (minimal but required)
-- `app/ui/components/chat.py` → `render_header() -> None`
-- `app/ui/components/trace.py` → `render_trace_panel(events, enabled: bool) -> None`
-- `app/ui/components/results.py` → 
-  - `render_sql_card(sql: str | None) -> None`
-  - `render_results_grid(df) -> None`
-  - `render_error_card(msg: str, debug: dict | None, debug_enabled: bool) -> None`
-  - `render_explanation(text: str | None) -> None`
 
 ---
 
-## 3) Streamlit entrypoint contract (MUST DO EXACTLY)
+## REQUIRED UI behavior
+1. The **main area must always show a chat transcript**:
+   - At minimum, an assistant greeting if chat is empty.
+2. When the user submits text:
+   - The **user message must appear immediately**.
+   - The app must show an assistant response (even if response is “Search not needed, here’s why…”).
+3. An **Activity Log** panel must always be visible and update during processing:
+   - Example stages: deciding search, fetching AI Search, reviewing schema, generating SQL, executing SQL.
+4. The **dataset/results** must come back to the assistant and be shown **in the chat flow** (not just a separate silent table).
+
+---
+
+## Fix to implement (Streamlit chat rendering pattern)
 
 ### File: `app/ui/streamlit_app.py`
-Implement this exact top-level flow:
+Implement the chat like this:
 
-#### Required functions
+#### A) Always render history first
+- Ensure the greeting exists in session state BEFORE rendering.
+
+#### B) Read `st.chat_input(...)`
+- When user submits:
+  - Render the user bubble immediately with `st.chat_message("user")`
+  - Call orchestrator
+  - Render assistant bubble immediately with `st.chat_message("assistant")`
+  - Persist both messages into session_state
+  - Call `st.rerun()` at the end to ensure the transcript shows consistently
+
+### Reference implementation (what Copilot should create)
+> Keep your existing helpers, but the logic MUST follow this order.
+
 ```python
-from __future__ import annotations
+import datetime
+import streamlit as st
+
+from app.ui.state import (
+    init_session_state,
+    get_chat_history,
+    append_chat_message,
+    get_trace_events,
+    append_trace_event,
+)
+from app.ui.models import ChatMessage, TraceEvent
+from app.ui.orchestrator_client import UIOptions, OrchestratorClient
+
+def render_chat_main(orchestrator: OrchestratorClient) -> None:
+    init_session_state()
+
+    st.title("Text2SQL Chat")
+
+    # 1) Ensure greeting exists BEFORE rendering transcript
+    messages = get_chat_history()
+    if not messages:
+        append_chat_message(ChatMessage(
+            role="assistant",
+            content="Hi! Ask me a question about your data (or say 'help' to see examples).",
+            ts_iso=datetime.datetime.utcnow().isoformat()
+        ))
+        messages = get_chat_history()
+
+    # 2) Render transcript
+    for msg in messages:
+        with st.chat_message(msg.role):
+            st.markdown(msg.content)
+
+    # 3) Input
+    user_text = st.chat_input("Type your question and press Enter…")
+    if not user_text:
+        return
+
+    # 4) Render user message IMMEDIATELY in same run
+    ts = datetime.datetime.utcnow().isoformat()
+    with st.chat_message("user"):
+        st.markdown(user_text)
+    append_chat_message(ChatMessage(role="user", content=user_text, ts_iso=ts))
+
+    # 5) Activity log placeholder (updates while running)
+    activity_placeholder = st.empty()
+
+    def trace_cb(ev: TraceEvent) -> None:
+        append_trace_event(ev)
+        # Re-render the activity log live
+        events = get_trace_events()
+        with activity_placeholder.container():
+            st.subheader("Activity Log")
+            for e in events[-50:]:
+                st.write(f"• [{e.stage}] {e.message}")
+
+    # 6) Orchestrate + render assistant message IMMEDIATELY
+    with st.chat_message("assistant"):
+        with st.spinner("Assistant is thinking..."):
+            options = UIOptions(max_rows=50, execution_target="sqlite", debug_enabled=st.session_state.get("debug_enabled", False))
+            history = get_chat_history()
+
+            # IMPORTANT: do not pass a COPY unless orchestrator expects it.
+            # If you pass a copy, the orchestrator will not see appended messages.
+            result = orchestrator.run_turn(user_text=user_text, history=history, options=options, trace_cb=trace_cb)
+
+        # Render assistant text
+        if result.error_message:
+            st.error(result.error_message)
+            assistant_text = f"Error: {result.error_message}"
+        elif result.clarification_question:
+            st.markdown(result.clarification_question)
+            assistant_text = result.clarification_question
+        else:
+            assistant_text = result.assistant_message or "(No assistant message returned)"
+            st.markdown(assistant_text)
+
+        # Render SQL + results as part of assistant message
+        if result.sql:
+            st.code(result.sql, language="sql")
+        if result.df is not None:
+            st.dataframe(result.df)
+
+    # Persist assistant message at the end
+    append_chat_message(ChatMessage(role="assistant", content=assistant_text, ts_iso=datetime.datetime.utcnow().isoformat()))
+
+    # 7) Force re-render so transcript is consistent
+    st.rerun()
+```
+
+---
+
+## Critical correctness checks (Copilot MUST verify)
+
+### 1) No duplicate `st.set_page_config()`
+- `st.set_page_config()` must be called **once** near the top-level execution path.
+- If you call it twice, Streamlit will throw warnings/errors in some versions.
+
+### 2) Bootstrap `sys.path` BEFORE any `from app...` imports
+If you must modify `sys.path` for Streamlit, do it at the top before importing your own packages:
+
+```python
+import sys
 from pathlib import Path
 
-def bootstrap_project_root() -> Path: ...
-def inject_css() -> None: ...
-def init_session_state() -> None: ...
-def render_sidebar() -> None: ...
-def render_chat_main(orchestrator) -> None: ...
-def main() -> None: ...
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 ```
 
-#### **Non-negotiable ordering**
-1. `bootstrap_project_root()` must run before any `import app.*`
-2. `import streamlit as st` must happen before any `st.*`
-3. `main()` must be defined **before** it is called
-4. Only call `main()` inside the bottom guard:
+Then import `streamlit` and your `app.*` modules.
 
-```python
-if __name__ == "__main__":
-    main()
-```
+### 3) State functions must NOT return None
+- `get_chat_history()` must always return a list (possibly empty).
+- `append_chat_message()` must always append to the same list stored in `st.session_state`.
 
-✅ **Remove** any stray `main()` calls above the definition.  
-✅ **Remove** any weird guard like `or "streamlit" in sys.argv[0]` (it can cause unexpected execution ordering).
+### 4) “hi” should not silently become SQL (optional but recommended)
+If your product requirement says: “Sometimes search/SQL is not needed,” then implement a simple decision step:
 
----
+- If input is small talk (“hi”, “hello”), respond conversationally and **do not** run SQL.
+- Log a trace event: `[decide_search] Search not needed for greeting/small talk.`
 
-## 4) Exact fix you must implement now (to eliminate `main` / ordering bugs)
+Where to put this:
+- Inside orchestrator `run_turn()` (preferred).
+- Or in UI before calling orchestrator (acceptable, but keep logic centralized if possible).
 
-### Step 1 — Make `streamlit_app.py` safe and deterministic
-- At the very top:
-  - `import sys`
-  - `from pathlib import Path`
-- Define and immediately call `bootstrap_project_root()` **before** importing any `app.*` modules.
-- Then `import streamlit as st`
-- Then define all functions (`inject_css`, `render_sidebar`, `render_chat_main`, `main`)
-- Only then call `main()` in the bottom guard.
-
-### Step 2 — Ensure `set_page_config` is correct
-- Call `st.set_page_config(...)` **once**, at the beginning of `main()`.
-- Do not call `st.set_page_config` at module import time.
-
-### Step 3 — Ensure chat is never blank
-In `render_chat_main(...)`:
-- Always render transcript:
-  - If history is empty, append a greeting assistant message
-- Always render `st.chat_input(...)`
-- When user submits input:
-  - append the user message
-  - run orchestrator
-  - append assistant/clarification message
-  - render SQL + results below the assistant message (cards/grid)
-  - render activity log panel (always visible or in expander)
-
-### Step 4 — Stream activity log while running
-Inside the “user submitted input” branch:
-- Create a placeholder: `trace_placeholder = st.empty()`
-- Define a `trace_cb(ev)` that:
-  - appends to session state
-  - re-renders the trace panel into the placeholder **during execution**
-- Pass `trace_cb` into `orchestrator.run_turn(...)`
+### 5) Activity log must update during processing
+- Use an `st.empty()` placeholder and update it from `trace_cb`.
+- Keep it to last N events (e.g., 50) to avoid slow rendering.
 
 ---
 
-## 5) Orchestrator behavior (minimum acceptable)
+## Verification steps (commands)
+From repo root:
 
-Implement `app/core/orchestrator_facade.run_chat_turn(...)` so the turn does:
-
-1. Emit TraceEvent: “Deciding whether AI search is needed”
-2. Call `decide_use_search(...)`
-3. Emit TraceEvent: “Using AI search: YES/NO (reason...)”
-4. If YES:
-   - Fetch metadata (stub allowed, but must be cleanly structured and logged)
-5. Generate SQL (stub allowed if your engine already exists; otherwise call your existing pipeline)
-6. Execute SQL and return dataframe
-7. Compose `assistant_message` summarizing what happened and key findings
-8. Return `TurnResult(sql=..., df=..., assistant_message=...)`
-9. On exceptions:
-   - return `TurnResult(error_message=..., debug_details=...)`
-   - also log a TraceEvent with stage `"error"`
-
----
-
-## 6) Verification checklist (you MUST run + report)
-
-### Commands
+1) Syntax check:
 ```bash
-# 1) Syntax check
-python -m compileall app/ui/streamlit_app.py
-
-# 2) Import check (should not execute main at import time)
-python -c "import app.ui.streamlit_app as m; print('import ok')"
-
-# 3) Start app
-streamlit run app/ui/streamlit_app.py
+.venv/bin/python -m compileall app/ui/streamlit_app.py app/ui/state.py app/ui/models.py
 ```
 
-### Expected behavior
-- No `NameError: main is not defined`
-- Main page shows:
-  - Title
-  - Chat transcript (greeting)
-  - Chat input
-  - Activity Log panel/expander
-- On a question:
-  - Activity log updates while running
-  - Assistant responds in chat
-  - SQL and results appear under assistant response
-
----
-
-## 7) Unit tests you must add (small but mandatory)
-
-Create: `tests/test_search_decider.py`
-- Tests for `decide_use_search`:
-  - trivial greeting → `use_search=False`
-  - table/schema question → `use_search=True` (or your chosen heuristic) with reason
-  - make decision deterministic
-
-Run:
+2) Run Streamlit (always use venv binary):
 ```bash
-pytest -q
+.venv/bin/streamlit run app/ui/streamlit_app.py
 ```
 
----
-
-## 8) Deliverables (do not skip)
-
-1. Updated `app/ui/streamlit_app.py` fixing ordering + main call
-2. Ensure all required modules exist with the exact signatures above
-3. `tests/test_search_decider.py` passing
-4. A short “What changed” summary in the PR/commit message
+3) In the browser:
+- You should immediately see an assistant greeting.
+- Type `hi`
+  - You must see a **user bubble** with `hi`.
+  - You must see an **assistant bubble** replying.
+  - The activity log should show at least one event (even if “search not needed”).
 
 ---
 
-## 9) If anything is missing
-If you cannot implement because a referenced module does not exist, you MUST:
-- create it with the required signature, minimal working implementation, and TODO markers
-- do NOT leave imports broken
-- do NOT redesign the UI
+## Deliverables Copilot must produce
+1. Updated `app/ui/streamlit_app.py` implementing the fixed chat rendering pattern (immediate render + `st.rerun()`).
+2. Verified `app/ui/state.py` returns lists, never None, and persists state correctly.
+3. Verified `app/ui/models.py` includes `ChatMessage` and `TraceEvent` and matches signatures.
+4. (Optional) Add a minimal unit test for `state.py` state initialization (if your repo already has a test harness).
 
 ---
 
-### Start now
-Implement the fixes, run the verification commands, and ensure the UI shows chat in the main area.
+## If anything is unclear / missing
+Copilot must **not guess** filenames or move modules around.
+If imports don’t match the repo, it must:
+1) Search the repo for the actual module paths (`app/ui/state.py`, `app/ui/models.py`, etc.)
+2) Update imports to match the existing structure while keeping the exact function/class signatures specified above.
