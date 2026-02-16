@@ -1,349 +1,285 @@
 ---
-name: text2sql-ui-td-and-pii-metadata-fix
-description: >
-  Fix the PII/metadata experience end-to-end: ensure PII questions route to Azure AI Search (metadata indexes),
-  return user-friendly answers (no raw SQL/QueryResult dumps), and upgrade the Streamlit UI to a modern
-  TD-like theme with an Activity Log event stream. Add backend tests first, then wire into frontend.
+name: Fix PII/Metadata AI Search results (backend + tests)
+description: |
+  Fix the backend so questions like "which fields have PII information" return REAL results from Azure AI Search
+  (meta_data_field index), instead of returning "No results found". Add robust tests so this never regresses.
 argument-hint: |
-  You are in repo: text2sql_v2
-  Run from repo root.
-  Key files likely involved (adjust if paths differ):
-    - app/main_cli.py
-    - app/core/orchestrator.py (or router/orchestrator facade)
-    - app/core/ai_search_service.py
-    - app/ui/streamlit_app.py
-    - app/ui/* (ui models/adapters)
-  Existing Azure AI Search indexes in UI:
-    - meta_data_field
-    - meta_data_table
-    - meta_data_relationship
-
-tools:
-  - terminal (pytest, streamlit run)
-  - filesystem (read/write/search)
-  - python (unit tests)
+  Run this as a single Copilot task in the repo root. You must inspect the current code and indexes in config.
+  Do NOT change UI yet; fix backend first, verify via CLI, then we will wire to Streamlit.
+tools: ["Repo file search/edit", "pytest", "python -m app.main_cli"]
 handsoffs:
-  - label: optional-design-review
-    agent: reviewer
-    prompt: >
-      Review the UI/CSS changes for maintainability and accessibility, and ensure debug-only details are not shown to end users.
-    send: >
-      Provide a short review + list of improvements (no code changes unless critical).
+  - label: "If blocked by Azure AI Search creds"
+    agent: "User"
+    prompt: "Ask me for the missing env vars (endpoint/index/key or MSI settings) and show the exact error."
+    send: "Only if you cannot run a smoke query without credentials."
 ---
 
-# Goal
+# Context / Problem
 
-When a user asks a PII/metadata question (e.g. “show me columns that have PII information”):
-1) The system must route to **AI Search metadata** (NOT SQL execution).
-2) It must return **user-friendly output** (e.g., a list/table of fields + short explanation), and **never** dump raw SQL or `QueryResult(...)` into the chat.
-3) If no metadata is found, ask a **clarifying question** that helps the user succeed (e.g., “Do you mean fields marked Confidential?”).
-4) The Streamlit UI must look **modern, TD-like (white/green)** and show:
-   - Chat bubbles
-   - Activity Log that streams events (debug-only)
-   - A grid/table for metadata hits
+## Current behavior
+- CLI routes PII questions to `ai_search`, but the final answer is still: **no PII columns found** (even though we have test/sample metadata).
+- UI sometimes still runs SQL/fallback for PII questions (we will fix UI later), but **first** backend must reliably return metadata hits.
 
-**Important:** Implement and verify backend tests first. Then wire into Streamlit.
+## Expected behavior
+For user questions like:
+- “show me the columns that have PII information”
+- “which fields are confidential / sensitive / personal data”
+- “PII fields in v_dlv_dep_prty_clr”
+the app should:
+1) route to **AI Search metadata** (NOT SQL),
+2) query the correct index (default: `meta_data_field`),
+3) return a **user-friendly list** of matching fields (table + column + business name + security/classification),
+4) ask a clarifying question only when necessary (e.g., user asked “PII fields” but wants a specific table).
+
+## Acceptance Criteria
+- ✅ CLI: `python -m app.main_cli "show me the columns that have PII information"` returns a list (not "no results") **when metadata exists**.
+- ✅ If metadata truly doesn’t exist, assistant asks a friendly clarification (scope/table) without crashing.
+- ✅ No SQL is generated/executed for metadata/PII requests (and `QueryResult.sql` may be `None`).
+- ✅ New tests cover:
+  - metadata route chosen,
+  - AI search query builder behavior (PII synonyms),
+  - result parsing,
+  - user-friendly response formatting,
+  - no “re.search(None)” / TypeErrors when `sql is None`,
+  - error-handling when AI Search returns 0 hits or raises.
+- ✅ Existing behavior for SQL questions remains unchanged.
 
 ---
 
-# A) Diagnose the current behavior (must do before coding)
+# Step-by-step implementation plan
 
-From the screenshots:
-- CLI logs show routing to `[ai_search]` with `Generated SQL: None` ✅ (routing is correct)
-- Streamlit Activity Log still shows `llm generated SQL` + `sql_execute` for PII questions ❌ (frontend is calling a different code path or fallback logic is incorrect)
-- AI Search is returning **0 hits** (or hits aren’t being parsed/mapped to output).
+## Step 0 — Reproduce & capture
+1) Run:
+```bash
+.venv/bin/python -m app.main_cli "show me the columns that have PII information"
+```
+2) Confirm from the **events** that planner chooses `ai_search` and that SQL is not executed.
+3) If SQL is executed anyway, the routing is wrong (see Step 2).
 
-So we need to:
-1) **Unify the entrypoint** used by CLI + Streamlit so behavior cannot diverge.
-2) Make AI Search queries for PII **robust** (synonyms + index schema aware).
-3) Ensure UI shows only `assistant_message` + optional metadata table, never raw objects.
+Save the full CLI output in the PR description.
 
 ---
 
-# B) Data models (signatures must exist)
+## Step 1 — Verify AI Search index + data is actually present
+We must distinguish “code bug” vs “index empty”.
 
-Create or extend models so the UI can render metadata results cleanly.
+1) Locate config for AI Search:
+- `AZURE_SEARCH_ENDPOINT`
+- `AZURE_SEARCH_KEY` OR MSI configuration
+- index names: `meta_data_field`, `meta_data_table`, `meta_data_relationship`
 
-## 1) app/core/metadata_types.py (new)
+2) Add (or run) a small smoke helper **without changing app behavior**:
+- File: `scripts/debug_ai_search_metadata.py`
+- It should:
+  - connect to the configured index (default `meta_data_field`)
+  - run a very broad query (e.g., `search_text="*"`, `top=3`)
+  - print the number of docs returned and one sample doc keys
 
-```python
-from __future__ import annotations
+Example skeleton (adjust to your SDK usage):
+```py
+def smoke_query(index_name: str) -> dict:
+    # return {"index": index_name, "count": <int>, "sample_keys": [...]}  # no secrets printed
+```
+
+3) If the index is empty, we need a seeding path (Step 1B).
+
+### Step 1B — If index is empty: create a seeder (dev-only)
+Create:
+- `scripts/seed_meta_data_field_from_sqlite.py`
+
+Behavior:
+- read from local sqlite metadata sources if available, OR accept a small hardcoded list (safe demo)
+- upload docs into `meta_data_field`
+- deterministic doc IDs
+- include fields needed for search: `schema`, `table`, `column`, `business_name`, `description`, `security` (or `classification`), plus an aggregated `content` field for full-text search
+
+This is dev/demo-only. Guard with an explicit flag/env var:
+- `ALLOW_AI_SEARCH_SEED=1`
+
+Add README snippet in script header.
+
+---
+
+## Step 2 — Fix routing: metadata/PII must be AI-search-only
+Where to look (expected):
+- `app/core/planner*.py` (or similar) — plan classification
+- `app/core/orchestrator*.py` — executes plan steps
+- `app/main_cli.py` — prints events + final answer
+
+Goal:
+- Introduce an explicit plan type:
+  - `plan.intent = "metadata"` (or `task_type="metadata_lookup"`)
+  - `plan.tool = "ai_search"`
+  - `plan.sql_required = False`
+
+### Required signatures (adjust names to your repo)
+Add/update in `planner_types.py`:
+```py
+from dataclasses import dataclass
+from typing import Literal, Optional
+
+@dataclass
+class Plan:
+    intent: Literal["sql", "metadata", "chitchat", "help"]
+    requires_sql: bool
+    requires_ai_search: bool
+    metadata_query: Optional["MetadataQuery"] = None
+```
+
+Add/update a `MetadataQuery`:
+```py
+from dataclasses import dataclass
+from typing import Literal, Optional
+
+@dataclass
+class MetadataQuery:
+    scope: Literal["all", "table"]
+    table: Optional[str]
+    tags: list[str]  # e.g. ["pii", "confidential"]
+    raw_user_question: str
+```
+
+In orchestrator:
+- If `intent == "metadata"`:
+  - call AI Search
+  - **do not** call LLM-to-SQL or sqlite execute
+  - format response for user
+  - return `QueryResult(sql=None, rows=[], ...)` or a `MetadataResult` (preferred)
+
+---
+
+## Step 3 — Fix AI Search query building for “PII”
+Most likely root cause: search uses a literal `"pii"` term but your metadata uses values like `"Confidential"` and business names like `"Customer Email Address"`.
+
+Implement a query builder that expands synonyms.
+
+### Create a single source of truth
+File: `app/core/metadata_query_builder.py`
+
+Signature:
+```py
+def build_pii_metadata_search(user_text: str) -> dict:
+    """Returns a dict with search_text, filters, fields, top."""
+```
+
+Rules:
+- If user mentions PII/sensitive/confidential/personal:
+  - include synonyms and common PII tokens in `search_text`:
+    - `pii OR "personal data" OR confidential OR sensitive OR email OR address OR phone OR name`
+- Prefer filtering by classification if field exists:
+  - `security eq 'Confidential'` OR `classification eq 'Confidential'`
+  - but only if the index schema supports that field (see Step 1 smoke doc keys)
+- If user names a table (exact or fuzzy), add a filter:
+  - `table eq 'v_dlv_dep_prty_clr'`
+
+Also add **fallback strategy**:
+1) try vector/semantic (if implemented)
+2) else try full-text on `content`
+3) else try `search_text="*"` with filter by security/confidential
+
+Return top 50.
+
+---
+
+## Step 4 — Parse hits and return user-friendly answer
+Define a dataclass:
+File: `app/core/metadata_types.py`
+```py
 from dataclasses import dataclass
 from typing import Optional
 
-@dataclass(frozen=True)
+@dataclass
 class MetadataHit:
     schema: Optional[str]
     table: Optional[str]
     column: Optional[str]
     business_name: Optional[str]
     description: Optional[str]
-    data_type: Optional[str]
-    security: Optional[str]          # e.g., Confidential / Public / Restricted
-    source_index: str                # e.g., meta_data_field
+    security: Optional[str]
     score: Optional[float] = None
 ```
 
-## 2) Extend QueryResult (existing)
-
-Wherever `QueryResult` lives (looks like `app/core/query_result.py`), ensure it has:
-
-```python
-from dataclasses import dataclass, field
-from typing import Any, Optional
-
-@dataclass
-class QueryResult:
-    sql: Optional[str] = None
-    rows: list[dict[str, Any]] = field(default_factory=list)
-    row_count: int = 0
-    columns: list[str] = field(default_factory=list)
-    execution_ms: float = 0.0
-    error: Optional[str] = None
-
-    # user-facing
-    assistant_message: str = ""
-
-    # debug / trace
-    events: list[Any] = field(default_factory=list)
-
-    # NEW: metadata results (AI Search)
-    metadata_hits: list["MetadataHit"] = field(default_factory=list)
-    route: str = ""   # "sql" | "ai_search" | "clarify" | "smalltalk"
+AI search service signature:
+File: `app/core/ai_search_service.py`
+```py
+class AiSearchService:
+    def search_metadata_fields(self, q: MetadataQuery) -> list[MetadataHit]:
+        ...
 ```
 
-**Rules:**
-- `assistant_message` must never be empty at the end of a turn.
-- For PII/metadata route, `sql` must remain `None` and `rows` should remain empty.
-
----
-
-# C) Unify backend entrypoint (critical best practice)
-
-Create a single streaming entrypoint used by BOTH CLI and Streamlit.
-
-## app/core/orchestrator_facade.py (new or refactor existing)
-
-```python
-from __future__ import annotations
-from typing import Any, Callable, Iterator, Optional
-from app.core.query_result import QueryResult
-
-TraceCallback = Callable[[Any], None]
-
-def run_turn(
-    user_text: str,
-    *,
-    trace: Optional[TraceCallback] = None,
-) -> QueryResult:
-    ...
+Response formatting:
+File: `app/core/metadata_presenter.py`
+```py
+def format_pii_metadata_answer(hits: list[MetadataHit], q: MetadataQuery) -> str:
+    """User-facing only. No SQL. No internal tool names."""
 ```
 
-If you already have something similar, ensure BOTH:
-- `app/main_cli.py` uses `run_turn(...)`
-- `app/ui/streamlit_app.py` uses `run_turn(...)`
-
-This removes the “CLI works but UI doesn’t” drift.
-
----
-
-# D) Planner routing for PII/metadata (must be deterministic)
-
-Wherever your planner logic lives (e.g., `planner_types.py` + `llm_router.py`):
-- Add a deterministic keyword override BEFORE calling LLM planner:
-
-PII/metadata trigger words:
-- pii, personal data, confidential, sensitive, privacy, gdpr
-- “columns that have PII”, “fields that are confidential”, “show sensitive fields”
-
-Behavior:
-- If triggers match → `route="ai_search"` and `search_index="meta_data_field"` (default) unless user specifies table.
-
-Make sure this does NOT depend on the LLM planner for basic routing.
+Output rules (IMPORTANT):
+- If hits exist: show the top 10–20 as a readable list:
+  - `• <table>.<column> — <business_name> (Security: Confidential)`
+- If too many: group by table and show counts.
+- If no hits: ask a clarification question:
+  - “Do you want me to search across all tables, or a specific table/view?”
+- Never leak internal exceptions or raw SDK errors to the user.
 
 ---
 
-# E) AI Search query improvements (why you get 0 results)
+## Step 5 — Fix the specific crash: regex on None SQL
+The screenshot shows `TypeError: expected string or bytes-like object, got 'NoneType'` where code does `re.search(..., t.sql, ...)`.
 
-Main reasons for 0 hits:
-1) The index does not contain literal “PII” anywhere (common).
-2) You are searching wrong fields (or field names differ).
-3) You need `query_type="full"` for OR queries.
-4) The index is empty or you’re hitting the wrong endpoint/index.
+Where to fix:
+- `app/main_cli.py` or wherever fallback tries to parse `QueryResult.sql`
 
-## 1) Add index schema inspection (debug-only)
+Rule:
+- Any post-processing that parses SQL must guard:
+  - `if not query_result.sql: return ...` (skip SQL-based heuristics)
 
-In `app/core/ai_search_service.py` (or equivalent), add:
+Add a regression test.
 
-```python
-def get_index_fields(index_name: str) -> list[str]:
-    """Return field names for the index. Use SearchIndexClient."""
-    ...
+---
+
+# Tests (pytest)
+
+Create/extend:
+- `tests/test_metadata_routing.py`
+- `tests/test_ai_search_metadata.py`
+- `tests/test_no_sql_for_metadata.py`
+
+## Testing approach
+- Do NOT call real Azure AI Search in unit tests.
+- Mock the AI search client/service layer.
+- Provide a deterministic “hit list” including examples like:
+  - `v_dlv_dep_prty_clr.CUST_EMAIL_ADDR` (Confidential)
+  - `v_dlv_dep_prty_clr.PRIM_NM_1` (Confidential)
+
+## Must-have tests
+1) Planner routes PII question → `intent="metadata"`, `requires_ai_search=True`, `requires_sql=False`
+2) Orchestrator for metadata:
+   - calls `AiSearchService.search_metadata_fields`
+   - returns assistant message containing the field list
+   - does NOT call sql generator or sqlite executor
+3) If `AiSearchService` returns empty:
+   - assistant asks clarification
+   - no crash
+4) Regression: `QueryResult.sql=None` does not break fallback/regex code
+
+---
+
+# Verification commands
+After changes:
+```bash
+pytest -q
+.venv/bin/python -m app.main_cli "show me the columns that have PII information"
+.venv/bin/python -m app.main_cli "show me the columns that have PII information in v_dlv_dep_prty_clr"
 ```
 
-Log this to Activity Log when debug is enabled.
-
-## 2) Build a robust PII search strategy
-
-Add helper (signature must exist):
-
-```python
-def build_pii_search_text(user_text: str) -> str:
-    """Return an AI Search query string that works even if 'PII' is not present."""
-    ...
-```
-
-Recommended strategy:
-- Use synonyms + common PII indicators:
-  - confidential, restricted, personal, privacy
-  - email, phone, address, name, dob, ssn, sin
-- Prefer OR semantics via `query_type="full"`:
-  - `pii OR confidential OR personal OR email OR phone OR address OR name`
-- If results are 0, retry with broader query:
-  - `confidential OR personal OR privacy`
-- Also consider searching column/business_name/description/security fields specifically (if they exist):
-  - `search_fields=["column","business_name","description","security"]` (only if those are actual fields)
-
-## 3) Implement AI Search call
-
-```python
-from app.core.metadata_types import MetadataHit
-
-def search_pii_metadata(
-    query: str,
-    *,
-    index_name: str = "meta_data_field",
-    top: int = 50,
-) -> list[MetadataHit]:
-    ...
-```
-
-Mapping rules (defensive):
-- Use `.get()` for all fields
-- If the index has a field `@search.score`, store it in `score`
-- Always set `source_index=index_name`
-
-If 0 hits:
-- Return empty list (do not crash)
-- Let orchestrator produce a clarifying `assistant_message`
+Expected:
+- PII questions → metadata answer (list), no SQL printed, no sqlite execution.
+- SQL questions still work.
 
 ---
 
-# F) Orchestrator behavior for ai_search route (no SQL allowed)
-
-In `run_turn()` logic:
-
-1) emit event: `[planner] Received question`
-2) if route == ai_search:
-   - emit: `[ai_search] Searching metadata`
-   - call `search_pii_metadata(...)`
-   - emit: `[ai_search] Found N hits`
-
-3) If hits exist:
-   - Set `result.metadata_hits = hits`
-   - Set `result.assistant_message` to a friendly summary, e.g.:
-
-     “I found 12 fields that look sensitive/confidential. Here are the top 10.  
-      Want me to filter to a specific table or show only ‘email/phone/address’ fields?”
-
-   - Set `result.route = "ai_search"`
-   - Return immediately (do NOT call SQL generator/sanitizer/executor).
-
-4) If no hits:
-   - Set `assistant_message` to a helpful clarification:
-
-     “I couldn’t find fields explicitly labeled ‘PII’ in the metadata.  
-      Do you want me to (1) list fields marked **Confidential**, or (2) search for common PII indicators like **email/phone/address**?”
-
-   - route = "clarify"
-   - Return immediately (no SQL).
-
-Also add a guardrail:
-- If route == ai_search, assert `result.sql is None` and skip all SQL steps.
-
----
-
-# G) Backend tests (required before frontend)
-
-Create tests that prove:
-1) PII questions route to AI Search
-2) No SQL is generated/executed for ai_search route
-3) build_pii_search_text uses synonyms and OR logic
-4) assistant_message is never empty
-
-## 1) tests/test_pii_routes_to_ai_search.py
-
-- Mock planner/router so the route becomes ai_search for “PII”
-- Mock `search_pii_metadata` to return hits
-- Assert:
-  - `result.route == "ai_search"`
-  - `result.sql is None`
-  - `len(result.metadata_hits) > 0`
-  - `result.assistant_message` contains a friendly summary
-
-## 2) tests/test_pii_no_hits_clarify.py
-
-- Mock `search_pii_metadata` to return []
-- Assert:
-  - `result.route in {"clarify","ai_search"}` (depending on your naming)
-  - `assistant_message` asks a clarifying question
-  - `sql is None`
-
-## 3) tests/test_build_pii_search_text.py
-
-- Input: “show me columns with PII information”
-- Output must contain at least: `pii` and `confidential` and `email` (or your chosen list)
-- If using OR logic, assert `OR` appears.
-
-Run: `pytest -q` and ensure green.
-
----
-
-# H) Streamlit UI upgrade (TD look + metadata grid + safe chat)
-
-Update `app/ui/streamlit_app.py`:
-
-## Rendering rules
-- Chat bubble shows only:
-  - user text
-  - assistant_message
-- If `metadata_hits` present:
-  - render a table/grid (st.dataframe) with columns:
-    `schema, table, column, security, business_name, description`
-- Technical details (events, SQL, stack traces) go ONLY into Activity Log when Debug mode ON.
-- Never print `QueryResult(...)` object in chat.
-
-## TD styling
-- White background
-- TD green accents
-- Rounded chat cards
-- Sidebar for “Indexes” + Debug toggle
-
-## Keyboard
-- Use `st.chat_input()` (Enter to send)
-- Optional: Shift+Enter for newline (if you add a text area toggle)
-
----
-
-# I) Manual verification commands (Copilot must run and paste outputs)
-
-Backend (must pass first):
-1) `pytest -q`
-2) `.venv/bin/python -m app.main_cli "show me the columns that have PII information"`
-
-Frontend:
-3) `.venv/bin/streamlit run app/ui/streamlit_app.py`
-4) Ask: “show me the list of fields that have PII information”
-   - Expected: friendly response + metadata table OR clarifying question
-   - No SQL shown in chat
-   - Activity Log shows ai_search steps (debug-only)
-
----
-
-# Acceptance criteria
-
-- PII questions NEVER trigger SQL generation/execution.
-- AI Search query is robust (works even if the literal word “PII” isn’t present).
-- If no metadata is found, the assistant asks a useful clarification question.
-- Streamlit UI is TD-like and does not expose raw technical objects to end users.
-- `pytest -q` passes.
+# Notes / Guardrails
+- Keep logs/events for developer mode, but user-facing answer must be friendly and non-technical.
+- Keep changes small and isolated: query builder + presenter + routing + tests.
+- No UI changes in this step.
