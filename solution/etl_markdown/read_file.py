@@ -1,210 +1,269 @@
-import json
+# create_metadata_vector_index.py
+"""
+One-time (or occasional) admin script:
+1) Creates/updates a vector-enabled Azure AI Search index for FIELD-level metadata.
+2) Uploads documents after building a strong `content` string + `content_vector` embedding.
+
+Run:
+  python create_metadata_vector_index.py --input metadata.jsonl
+
+Input format (JSONL): one JSON object per line. Recommended keys:
+  schema_name, table_name, column_name, business_name, business_description,
+  data_type, allowed_values, notes, pii, pci, is_key, is_filter_hint, mal_code, security_classification_candidate
+"""
+
 import os
-from pathlib import Path
+import json
+import argparse
+from typing import Dict, List, Iterable, Any, Optional
 
-import pandas as pd
+from dotenv import load_dotenv
 
-EXCEL_PATH = os.getenv("RRDW_META_XLSX", "data/rrdw_meta_data.xlsx")
-OUT_DIR = Path(os.getenv("OUT_DIR", "out"))
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+from azure.identity import ManagedIdentityCredential, DefaultAzureCredential
+from azure.core.credentials import AzureKeyCredential
 
-# Your "field" sheet order MUST start exactly like this (extra columns allowed AFTER these)
-FIELD_BASE_COLUMNS_ORDERED = [
-    "MAL_CODE",
-    "SCHEMA_NAME",
-    "TABLE_NAME",
-    "COLUMN_NAME",
-    "SECURITY_CLASSIFICATION_CANDIDATE",
-    "PII",
-    "PCI",
-    "BUSINESS_NAME",
-    "BUSINESS_DESCRIPTION",
-    "DATA_TYPE",
-]
+from azure.search.documents import SearchClient
+from azure.search.documents.indexes import SearchIndexClient
+from azure.search.documents.indexes.models import (
+    SearchIndex,
+    SimpleField,
+    SearchField,
+    SearchFieldDataType,
+    VectorSearch,
+    HnswAlgorithmConfiguration,
+    VectorSearchProfile,
+)
 
-TABLE_REQUIRED = ["SCHEMA_NAME", "TABLE_NAME", "TABLE_BUSINESS_NAME", "TABLE_BUSINESS_DESCRIPTION"]
-REL_REQUIRED = ["FROM_SCHEMA", "FROM_TABLE", "TO_SCHEMA", "TO_TABLE", "JOIN_TYPE", "JOIN_KEYS"]
+# ---- Your existing embedding helper ----
+# Must expose: get_embedding(text: str) -> List[float]
+from embedding_utils import get_embedding  # <- keep your current implementation
 
-def norm_colname(c: str) -> str:
-    return str(c).strip().upper()
 
-def norm_yesno(v) -> bool:
-    s = str(v).strip().lower()
-    return s in {"yes", "y", "true", "1", "t"}
+def get_credential():
+    """
+    Prefer MSI (User-Assigned) in Azure; fall back to DefaultAzureCredential for local dev.
+    If you use API key instead, set AISEARCH_API_KEY in .env
+    """
+    api_key = os.getenv("AISEARCH_API_KEY")
+    if api_key:
+        return AzureKeyCredential(api_key)
 
-def read_sheet(xlsx: str, sheet: str) -> pd.DataFrame:
-    df = pd.read_excel(xlsx, sheet_name=sheet, dtype=str)
-    df.columns = [norm_colname(c) for c in df.columns]
-    return df.fillna("")
+    client_id = os.getenv("CLIENT_ID")  # user-assigned managed identity client id
+    if client_id:
+        return ManagedIdentityCredential(client_id=client_id)
 
-def require_cols(df: pd.DataFrame, required: list[str], sheet: str):
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"[{sheet}] Missing required columns: {missing}")
+    return DefaultAzureCredential(exclude_interactive_browser_credential=False)
 
-def validate_field_order(df: pd.DataFrame):
-    first_cols = list(df.columns[: len(FIELD_BASE_COLUMNS_ORDERED)])
-    if first_cols != FIELD_BASE_COLUMNS_ORDERED:
-        raise ValueError(
-            "[field] Column order mismatch.\n"
-            f"Expected first {len(FIELD_BASE_COLUMNS_ORDERED)} columns:\n"
-            f"{FIELD_BASE_COLUMNS_ORDERED}\n"
-            f"But got:\n{first_cols}\n"
-            "You can add new columns only AFTER these."
-        )
 
-def stable_id(*parts: str) -> str:
-    return ".".join([p.strip() for p in parts if p.strip()])
+def chunked(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, Any]]]:
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
 
-def build_field_docs(df: pd.DataFrame) -> list[dict]:
+
+def safe_bool(v: Any) -> Optional[bool]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in {"true", "1", "yes", "y"}:
+            return True
+        if s in {"false", "0", "no", "n"}:
+            return False
+    if isinstance(v, (int, float)):
+        return bool(v)
+    return None
+
+
+def build_content(doc: Dict[str, Any]) -> str:
+    """
+    The SINGLE most important thing: build a strong search string (keyword + semantic).
+    """
+    parts = []
+
+    schema = doc.get("schema_name") or ""
+    table = doc.get("table_name") or ""
+    column = doc.get("column_name") or ""
+
+    if schema or table or column:
+        parts.append(f"schema={schema} table={table} column={column}".strip())
+
+    # business meaning
+    bn = doc.get("business_name") or ""
+    bd = doc.get("business_description") or ""
+    if bn:
+        parts.append(f"business_name={bn}")
+    if bd:
+        parts.append(f"business_description={bd}")
+
+    # technical metadata
+    dt = doc.get("data_type") or ""
+    av = doc.get("allowed_values") or ""
+    notes = doc.get("notes") or ""
+    if dt:
+        parts.append(f"data_type={dt}")
+    if av:
+        parts.append(f"allowed_values={av}")
+    if notes:
+        parts.append(f"notes={notes}")
+
+    # tags as plain text so keyword search works too
+    pii = safe_bool(doc.get("pii"))
+    pci = safe_bool(doc.get("pci"))
+    is_key = safe_bool(doc.get("is_key"))
+    is_filter_hint = safe_bool(doc.get("is_filter_hint"))
+    tags = []
+    if pii is not None:
+        tags.append(f"pii={str(pii).lower()}")
+    if pci is not None:
+        tags.append(f"pci={str(pci).lower()}")
+    if is_key is not None:
+        tags.append(f"is_key={str(is_key).lower()}")
+    if is_filter_hint is not None:
+        tags.append(f"is_filter_hint={str(is_filter_hint).lower()}")
+    if tags:
+        parts.append("tags: " + " ".join(tags))
+
+    # optional compliance/security
+    sc = doc.get("security_classification_candidate") or ""
+    if sc:
+        parts.append(f"security_classification_candidate={sc}")
+
+    return "\n".join([p for p in parts if p]).strip()
+
+
+def normalize_doc(raw: Dict[str, Any], idx: int) -> Dict[str, Any]:
+    # Stable, deterministic id if not provided
+    schema = raw.get("schema_name") or ""
+    table = raw.get("table_name") or ""
+    column = raw.get("column_name") or ""
+    rid = raw.get("id") or f"{schema}.{table}.{column}".strip(".") or f"row_{idx}"
+
+    doc = {
+        "id": str(rid),
+
+        "schema_name": schema or None,
+        "table_name": table or None,
+        "column_name": column or None,
+
+        "business_name": raw.get("business_name") or None,
+        "business_description": raw.get("business_description") or None,
+
+        "data_type": raw.get("data_type") or None,
+        "allowed_values": raw.get("allowed_values") or None,
+        "notes": raw.get("notes") or None,
+
+        "mal_code": raw.get("mal_code") or None,
+        "security_classification_candidate": raw.get("security_classification_candidate") or None,
+
+        "pii": safe_bool(raw.get("pii")),
+        "pci": safe_bool(raw.get("pci")),
+        "is_key": safe_bool(raw.get("is_key")),
+        "is_filter_hint": safe_bool(raw.get("is_filter_hint")),
+    }
+
+    content = build_content(doc)
+    doc["content"] = content
+    doc["content_vector"] = get_embedding(content)
+    return doc
+
+
+def create_or_update_index(index_client: SearchIndexClient, index_name: str, vector_dim: int) -> None:
+    fields = [
+        SimpleField(name="id", type=SearchFieldDataType.String, key=True, filterable=True, sortable=False),
+
+        # Hybrid retrieval anchor (keyword)
+        SearchField(name="content", type=SearchFieldDataType.String, searchable=True),
+
+        # Vector field (semantic)
+        SearchField(
+            name="content_vector",
+            type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+            searchable=True,
+            vector_search_dimensions=vector_dim,
+            vector_search_profile_name="vector-profile",
+        ),
+
+        # Structured metadata for select/filter/formatting
+        SearchField(name="schema_name", type=SearchFieldDataType.String, filterable=True, facetable=True, sortable=True),
+        SearchField(name="table_name", type=SearchFieldDataType.String, filterable=True, facetable=True, sortable=True),
+        SearchField(name="column_name", type=SearchFieldDataType.String, filterable=True, facetable=True, sortable=True),
+
+        SearchField(name="business_name", type=SearchFieldDataType.String, searchable=True),
+        SearchField(name="business_description", type=SearchFieldDataType.String, searchable=True),
+
+        SearchField(name="data_type", type=SearchFieldDataType.String, filterable=True, facetable=True),
+        SearchField(name="allowed_values", type=SearchFieldDataType.String, searchable=True),
+        SearchField(name="notes", type=SearchFieldDataType.String, searchable=True),
+
+        SearchField(name="mal_code", type=SearchFieldDataType.String, filterable=True),
+        SearchField(name="security_classification_candidate", type=SearchFieldDataType.String, filterable=True),
+
+        SimpleField(name="pii", type=SearchFieldDataType.Boolean, filterable=True, facetable=True),
+        SimpleField(name="pci", type=SearchFieldDataType.Boolean, filterable=True, facetable=True),
+        SimpleField(name="is_key", type=SearchFieldDataType.Boolean, filterable=True, facetable=True),
+        SimpleField(name="is_filter_hint", type=SearchFieldDataType.Boolean, filterable=True, facetable=True),
+    ]
+
+    vector_search = VectorSearch(
+        algorithms=[HnswAlgorithmConfiguration(name="hnsw")],
+        profiles=[VectorSearchProfile(name="vector-profile", algorithm_configuration_name="hnsw")],
+    )
+
+    index = SearchIndex(name=index_name, fields=fields, vector_search=vector_search)
+    index_client.create_or_update_index(index)
+
+
+def load_jsonl(path: str) -> List[Dict[str, Any]]:
     docs = []
-    for _, r in df.iterrows():
-        schema = r["SCHEMA_NAME"].strip()
-        table = r["TABLE_NAME"].strip()
-        col = r["COLUMN_NAME"].strip()
-        if not (schema and table and col):
-            continue
-
-        pii = norm_yesno(r.get("PII", ""))
-        pci = norm_yesno(r.get("PCI", ""))
-
-        doc = {
-            "id": stable_id("field", schema, table, col),
-            "mal_code": r.get("MAL_CODE", "").strip(),
-            "schema_name": schema,
-            "table_name": table,
-            "column_name": col,
-            "security_classification_candidate": r.get("SECURITY_CLASSIFICATION_CANDIDATE", "").strip(),
-            "pii": pii,
-            "pci": pci,
-            "business_name": r.get("BUSINESS_NAME", "").strip(),
-            "business_description": r.get("BUSINESS_DESCRIPTION", "").strip(),
-            "data_type": r.get("DATA_TYPE", "").strip(),
-            # Optional appended columns (only if you added them)
-            "is_key": norm_yesno(r.get("IS_KEY", "")) if "IS_KEY" in df.columns else False,
-            "is_filter_hint": norm_yesno(r.get("IS_FILTER_HINT", "")) if "IS_FILTER_HINT" in df.columns else False,
-            "allowed_values": r.get("ALLOWED_VALUES", "").strip() if "ALLOWED_VALUES" in df.columns else "",
-            "notes": r.get("NOTES", "").strip() if "NOTES" in df.columns else "",
-        }
-
-        # Searchable content string (for BM25/semantic + later embeddings)
-        doc["content"] = (
-            f"Schema: {schema}\n"
-            f"Table: {table}\n"
-            f"Column: {col}\n"
-            f"Business Name: {doc['business_name']}\n"
-            f"Description: {doc['business_description']}\n"
-            f"Data Type: {doc['data_type']}\n"
-            f"PII: {doc['pii']} PCI: {doc['pci']}\n"
-            f"Security: {doc['security_classification_candidate']}\n"
-            f"Allowed Values: {doc['allowed_values']}\n"
-            f"Notes: {doc['notes']}\n"
-        )
-        docs.append(doc)
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            docs.append(json.loads(line))
     return docs
 
-def build_table_docs(df: pd.DataFrame) -> list[dict]:
-    docs = []
-    for _, r in df.iterrows():
-        schema = r["SCHEMA_NAME"].strip()
-        table = r["TABLE_NAME"].strip()
-        if not (schema and table):
-            continue
-
-        doc = {
-            "id": stable_id("table", schema, table),
-            "schema_name": schema,
-            "table_name": table,
-            "table_business_name": r.get("TABLE_BUSINESS_NAME", "").strip(),
-            "table_business_description": r.get("TABLE_BUSINESS_DESCRIPTION", "").strip(),
-            "grain": r.get("GRAIN", "").strip(),
-            "primary_keys": r.get("PRIMARY_KEYS", "").strip(),
-            "default_filters": r.get("DEFAULT_FILTERS", "").strip(),
-            "notes": r.get("NOTES", "").strip(),
-        }
-        doc["content"] = (
-            f"Schema: {schema}\n"
-            f"Table: {table}\n"
-            f"Business Name: {doc['table_business_name']}\n"
-            f"Description: {doc['table_business_description']}\n"
-            f"Grain: {doc['grain']}\n"
-            f"Primary Keys: {doc['primary_keys']}\n"
-            f"Default Filters: {doc['default_filters']}\n"
-            f"Notes: {doc['notes']}\n"
-        )
-        docs.append(doc)
-    return docs
-
-def build_rel_docs(df: pd.DataFrame) -> list[dict]:
-    docs = []
-    for _, r in df.iterrows():
-        fs = r["FROM_SCHEMA"].strip()
-        ft = r["FROM_TABLE"].strip()
-        ts = r["TO_SCHEMA"].strip()
-        tt = r["TO_TABLE"].strip()
-        if not (fs and ft and ts and tt):
-            continue
-
-        doc = {
-            "id": stable_id("rel", fs, ft, "to", ts, tt),
-            "from_schema": fs,
-            "from_table": ft,
-            "to_schema": ts,
-            "to_table": tt,
-            "join_type": r.get("JOIN_TYPE", "").strip().upper(),
-            "join_keys": r.get("JOIN_KEYS", "").strip(),
-            "cardinality": r.get("CARDINALITY", "").strip(),
-            "relationship_description": r.get("RELATIONSHIP_DESCRIPTION", "").strip(),
-            "active": norm_yesno(r.get("ACTIVE", "Yes")),
-        }
-        doc["content"] = (
-            f"FROM {fs}.{ft}\n"
-            f"TO {ts}.{tt}\n"
-            f"JOIN_TYPE: {doc['join_type']}\n"
-            f"JOIN_KEYS: {doc['join_keys']}\n"
-            f"CARDINALITY: {doc['cardinality']}\n"
-            f"DESCRIPTION: {doc['relationship_description']}\n"
-        )
-        docs.append(doc)
-    return docs
-
-def write_jsonl(path: Path, docs: list[dict]):
-    with path.open("w", encoding="utf-8") as f:
-        for d in docs:
-            f.write(json.dumps(d, ensure_ascii=False) + "\n")
 
 def main():
-    if not Path(EXCEL_PATH).exists():
-        raise FileNotFoundError(f"Excel not found: {EXCEL_PATH}")
+    load_dotenv(override=True)
 
-    field_df = read_sheet(EXCEL_PATH, "field")
-    validate_field_order(field_df)
-    require_cols(field_df, FIELD_BASE_COLUMNS_ORDERED, "field")
+    aisearch_account = os.getenv("AISEARCH_ACCOUNT")
+    index_name = os.getenv("INDEX_NAME", "meta_data_field_v2")
+    vector_dim = int(os.getenv("VECTOR_DIM", "1536"))  # must match your embedding model
+    batch_size = int(os.getenv("UPLOAD_BATCH", "500"))
 
-    table_df = read_sheet(EXCEL_PATH, "table")
-    require_cols(table_df, TABLE_REQUIRED, "table")
+    if not aisearch_account:
+        raise ValueError("Missing AISEARCH_ACCOUNT in .env")
 
-    rel_df = read_sheet(EXCEL_PATH, "relationship")
-    require_cols(rel_df, REL_REQUIRED, "relationship")
+    endpoint = f"https://{aisearch_account}.search.windows.net"
+    cred = get_credential()
 
-    field_docs = build_field_docs(field_df)
-    table_docs = build_table_docs(table_df)
-    rel_docs = build_rel_docs(rel_df)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True, help="Path to metadata JSONL")
+    args = parser.parse_args()
 
-    write_jsonl(OUT_DIR / "field_docs.jsonl", field_docs)
-    write_jsonl(OUT_DIR / "table_docs.jsonl", table_docs)
-    write_jsonl(OUT_DIR / "relationship_docs.jsonl", rel_docs)
+    raw = load_jsonl(args.input)
+    normalized = [normalize_doc(r, i) for i, r in enumerate(raw)]
 
-    print("✅ Build complete")
-    print(f"- field docs: {len(field_docs)} -> {OUT_DIR/'field_docs.jsonl'}")
-    print(f"- table docs: {len(table_docs)} -> {OUT_DIR/'table_docs.jsonl'}")
-    print(f"- rel docs:   {len(rel_docs)} -> {OUT_DIR/'relationship_docs.jsonl'}")
-    if field_docs:
-        print("\nSample field doc id:", field_docs[0]["id"])
-    if table_docs:
-        print("Sample table doc id:", table_docs[0]["id"])
-    if rel_docs:
-        print("Sample rel doc id:", rel_docs[0]["id"])
+    index_client = SearchIndexClient(endpoint=endpoint, credential=cred)
+    create_or_update_index(index_client, index_name=index_name, vector_dim=vector_dim)
+
+    search_client = SearchClient(endpoint=endpoint, index_name=index_name, credential=cred)
+
+    # upload in batches
+    total = 0
+    for batch in chunked(normalized, batch_size):
+        res = search_client.upload_documents(batch)
+        # res is a list of IndexingResult
+        total += len(batch)
+        print(f"Uploaded {total}/{len(normalized)}")
+
+    print("Done.")
+    print(f"Index: {index_name}")
+    print(f"Endpoint: {endpoint}")
+
 
 if __name__ == "__main__":
     main()
