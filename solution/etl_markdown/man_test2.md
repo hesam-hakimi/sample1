@@ -1,126 +1,176 @@
 ---
-name: Text2SQL UI Agent — User-Friendly Responses (Prompt Update)
-description: >
-  Update the backend agent + UI so end users get clear, non-technical answers.
-  Hide internal SQL/latency/errors by default, but keep a developer-facing streamed log in the Activity Log panel.
-argument-hint: >
-  Copy/paste this into GitHub Copilot Chat. It instructs Copilot exactly what prompt changes to make.
-tools: []
+name: text2sql-pii-metadata-routing
+description: |
+  Fix “PII questions return no results” by routing PII/security/metadata questions to Azure AI Search (metadata index),
+  returning user-friendly answers + a grid, and adding backend tests to prevent regressions.
+argument-hint: |
+  Optional (helps accuracy): include a table/view name.
+  Examples:
+  - "PII columns in v_dlv_dep_prty_clr"
+  - "Which columns are confidential in v_dlv_dep_tran?"
+tools:
+  - repo:edit-files
+  - repo:terminal
+  - python
 handoffs:
-  - label: Backend-agent prompt update
-    agent: github-copilot
+  - label: implement
+    agent: developer
     prompt: |
-      CONTEXT
-      - This repo has a Text2SQL chat UI (Streamlit) and a backend router/planner that can:
-        1) decide whether to use AI Search (metadata) or other tools,
-        2) generate SQL,
-        3) sanitize SQL (remove markdown fences),
-        4) execute SQL in SQLite,
-        5) provide a fallback when result set is 0 rows.
-      - We already have an event stream / activity log (planner → ai_search → prompt → llm → sql_sanitize → sql_execute → fallback, etc.)
-      - Current problem: assistant responses still leak technical details (SQL timings, sanitization notes, “no rows fallback” technical phrasing).
-      - Goal: user sees business-friendly answers; technical details only appear in Activity Log (developer view).
+      You are implementing the backend fix for PII/security/metadata questions in the Text2SQL project.
 
-      WHAT TO CHANGE (PROMPTS ONLY, NO CODE UNLESS ASKED)
-      1) Update the primary assistant prompt (and any planner/system prompts if present) to enforce:
-         - User-facing messages MUST be non-technical by default.
-         - Do NOT mention:
-           * SQL statements
-           * table/view names unless user asked “what tables exist?”
-           * latency timings (ms)
-           * sanitization / markdown fences / SDK versions / stack traces
-           * internal tool names (“planner”, “sql_execute”, etc.)
-         - The UI may still display Activity Log events separately; the assistant message must not include them.
+      Context / Problem
+      - When the user asks: "show me the columns that have PII information", the system currently returns "No results found".
+      - A debug screenshot shows the AI Search tool *did* find metadata rows (Security = 'Confidential'), but the code then
+        converted those rows into a synthetic SQL statement using reserved identifiers like `Table`, causing SQLite to error
+        (`near "Table": syntax error`). That error is later surfaced as "No results found".
 
-      2) Define a strict RESPONSE CONTRACT (what the LLM should output) so the UI can render consistently.
-         - The assistant MUST always produce:
-           A) user_message: string (human-friendly)
-           B) followups: list[string] (0–5 suggested next questions)
-           C) needs_clarification: boolean
-           D) clarification_questions: list[string] (0–3), only when needs_clarification=true
-           E) safe_notes_for_logs: string (optional) — technical notes intended ONLY for Activity Log, not user chat
+      Goal
+      - PII/security/metadata questions MUST:
+        1) call Azure AI Search (metadata index)
+        2) return a user-friendly answer (no raw QueryResult repr, no stack traces)
+        3) optionally show a results grid (rows), but DO NOT try to execute synthetic SQL in SQLite.
 
-         - If your project already uses a JSON response_format:
-           * keep it compatible with existing code
-           * ensure keys above are present
-           * keep additional keys allowed but not required
+      Key Behavior Rules (tool routing)
+      - Treat these as metadata_lookup (AI Search FIRST; do not run SQL unless user explicitly asks to query data values):
+        * pii, personal info, sensitive, confidential, security classification
+        * “what does column X mean”, “definition of …”, “business meaning”
+        * “which columns”, “data dictionary”, “column descriptions”, “schema metadata”
+      - Treat these as sql_query (SQLite):
+        * aggregations, counts, sums, group by, trends, “by day”, “top N”, “filter where…”
+      - If ambiguous (no table mentioned and the result set would be huge), ask a clarifying question.
 
-      3) Update behavior for common cases:
+      REQUIRED Code Changes (do not skip)
+      1) Planner decision schema: add/confirm an explicit metadata intent.
+         - Update the planner output model to include:
+           - intent: Literal["sql_query","metadata_lookup","smalltalk","clarify"]
+           - needs_ai_search: bool
+           - needs_sqlite: bool
+           - clarifying_questions: list[str]
+           - user_facing_summary: str (short)
+         - Ensure the planner sets:
+           - intent="metadata_lookup", needs_ai_search=true, needs_sqlite=false
+           for “PII/security/metadata” queries.
 
-         CASE A — Smalltalk (“hi”, “hello”, “thanks”)
-         - user_message: friendly + suggests examples.
-         - followups: include 2–4 examples such as:
-           “What tables are available?”
-           “Show me 10 rows from <table>”
-           “Count deposits by day”
-         - Never query tools for smalltalk.
+         Suggested signature:
+         ```py
+         # app/core/planner_types.py (or similar)
+         from dataclasses import dataclass
+         from typing import Literal
 
-         CASE B — User asks “what tables are available?”
-         - user_message: list table names in bullet form (OK to show names here).
-         - Add 1–2 tips like “You can ask for a sample: ‘show me 10 rows from …’”.
+         @dataclass
+         class PlannerDecision:
+             intent: Literal["sql_query","metadata_lookup","smalltalk","clarify"]
+             needs_ai_search: bool
+             needs_sqlite: bool
+             clarifying_questions: list[str]
+             user_facing_summary: str
+         ```
+         If you already use Pydantic/BaseModel, keep style consistent.
 
-         CASE C — Query returns results (N rows)
-         - user_message should summarize results in plain language:
-           - If N is small: show a compact table-like preview (top 10 rows), with friendly column labels if available.
-           - If N is large: summarize + offer to filter / group / export.
-         - Do NOT mention execution time.
-         - Do NOT show raw SQL.
+      2) AI Search results MUST NOT be converted into SQL for SQLite execution.
+         - Implement a dedicated handler that returns QueryResult with rows/columns populated.
+         - Keep QueryResult.sql=None (or a short string like "-- metadata lookup via AI Search") for this path.
 
-         CASE D — Query returns 0 rows
-         - user_message must NOT say “0-row fallback” or “no results found” alone.
-         - Instead:
-           1) Briefly state no matching records were found for the requested filter.
-           2) Offer 2–3 actionable refinements:
-              - suggest alternative filter values discovered (e.g., “TERR_CD looks like state/province codes (NY, CA, …) rather than ‘US’”)
-              - ask a clarification question if needed (e.g., “Do you mean US-based clients, or clients in a specific state?”)
-           3) Provide followups that the user can click/type.
+         Required signatures (adjust filenames to your repo, keep semantics):
+         ```py
+         # app/core/ai_search_service.py
+         class AISearchService:
+             def search_metadata(self, query: str, *, top_k: int = 20) -> list[dict]:
+                 ...
+         ```
 
-         CASE E — Errors (tool failure, SQL errors, missing env vars)
-         - user_message: brief apology + one simple next step (retry / rephrase / check setup).
-         - Put full technical detail in safe_notes_for_logs only.
-         - needs_clarification should be false unless you truly need user input.
+         ```py
+         # app/core/orchestrator.py (or wherever routing occurs)
+         class Orchestrator:
+             def handle_metadata_lookup(self, user_text: str) -> "QueryResult":
+                 ...
+         ```
 
-      4) Add STYLE RULES to the prompt
-         - Use short paragraphs.
-         - Prefer bullets for lists.
-         - Never mention internal file paths.
-         - Never expose secrets or env var values.
-         - If you must mention a table name, format it consistently (backticks are OK), but avoid overusing.
+      3) User-friendly response formatting (metadata results)
+         - If results found:
+           - Provide a short summary (1–3 sentences).
+           - Group results by table/view.
+           - Show up to top 30 rows (or top_k).
+           - Include: schema, table/view, column, security label, short description.
+         - If no results found:
+           - Ask 1 clarifying question such as:
+             "Do you want PII/confidential columns across all tables, or for a specific table/view (e.g., v_dlv_dep_prty_clr)?"
 
-      DELIVERABLES (NO CODE)
-      - Produce the updated prompt text(s) as markdown blocks:
-        1) “System/Assistant Prompt (User-Facing)”
-        2) “Planner Prompt (Tool Decision) — if exists”
-        3) “Response JSON Schema”
-      - Also include a short checklist for manual testing (3–5 tests) that I will run after applying the prompt changes.
+      4) Safety / UX
+         - Do NOT show raw QueryResult(sql=..., rows=...) in user chat.
+         - Only show technical details behind a debug flag (DEBUG=true), and even then in a separate channel/section.
 
-      ACCEPTANCE CRITERIA
-      - “Deposit count by day?” produces a helpful clarification instead of technical details.
-      - “What tables are available?” lists the 4 tables without SQL/latency.
-      - “show me 10 rows from v_dlv_dep_prty_clr” shows a user-friendly preview (no SQL shown).
-      - Any technical diagnostics appear ONLY in Activity Log / safe_notes_for_logs.
+      5) Fix the existing failing synthetic-SQL approach (if still used anywhere)
+         - If you must keep any synthetic SQL generation for internal debug, rename reserved identifiers:
+           use schema_name, table_name, column_name instead of Schema/Table/Column.
+           But the preferred fix is: do not execute synthetic SQL at all.
 
-  - label: Frontend rendering alignment
-    agent: github-copilot
+      Implementation checklist
+      - Update planner prompt + decision parsing.
+      - Update orchestrator routing:
+        - metadata_lookup => ai_search_service.search_metadata() => QueryResult(rows=..., columns=..., assistant_message=...)
+        - sql_query => existing SQL flow
+      - Ensure errors from AI Search are surfaced as friendly messages:
+        "I couldn't reach the metadata service right now. Please try again."
+
+      Verification (run locally)
+      - CLI:
+        `.venv/bin/python -m app.main_cli "show me the columns that have PII information"`
+        Expected: assistant returns a list/table of confidential columns (NOT “No results found”).
+      - Also test:
+        `.venv/bin/python -m app.main_cli "PII columns in v_dlv_dep_prty_clr"`
+        Expected: focused list for that table/view.
+
+  - label: test
+    agent: unit-tester
     prompt: |
-      CONTEXT
-      - The UI shows chat bubbles + an Activity Log stream.
-      - The agent will now return a structured response:
-        user_message, followups, needs_clarification, clarification_questions, safe_notes_for_logs.
+      Add backend tests to lock in the PII/metadata routing behavior.
 
-      TASK (NO CODE UNLESS ASKED)
-      - Verify the UI uses ONLY user_message in the Assistant chat bubble.
-      - Activity Log should display:
-        - streamed events emitted by backend
-        - safe_notes_for_logs (if present) as “developer note”
-      - Followups should render as clickable chips/buttons (optional) or as a short list.
-      - Clarification questions should be displayed as a small “I need one detail” section.
+      Add/Update Tests (pytest)
+      1) Planner intent classification
+         - Input: "show me the columns that have PII information"
+         - Expected: decision.intent == "metadata_lookup"
+                     decision.needs_ai_search is True
+                     decision.needs_sqlite is False
 
-      ACCEPTANCE CRITERIA
-      - Chat bubble never shows SQL, execution time, sanitization, or tool names.
-      - Activity Log can show technical steps.
+      2) Orchestrator metadata path does NOT execute SQLite
+         - Use a fake/mocked AISearchService returning sample metadata rows, e.g.:
+           [{"schema":"aczrrdw","table":"v_dlv_dep_prty_clr","column":"CUST_EMAIL_ADDR","security":"Confidential","description":"Customer Email Address"}]
+         - Assert:
+           - QueryResult.rows is not empty
+           - QueryResult.error is None/"" (no SQLite syntax error)
+           - QueryResult.sql is None OR begins with "-- metadata lookup"
+           - The SQL execution function was NOT called (mock/spies)
 
-other info:
-  - If you find an existing prompt file (e.g., app/prompts/*.md or similar), update it in-place.
-  - If prompts are embedded in Python, extract them into a dedicated prompt file only if low-risk.
-  - Keep changes minimal and testable; do not refactor unrelated parts.
+      3) Empty AI Search result => clarifying question
+         - AISearchService returns []
+         - assistant_message asks for a specific table/view OR clarifies scope.
+
+      4) Regression test: reserved identifier bug
+         - Ensure the metadata path never builds SQL that contains `SELECT ... Table ...` executed against SQLite.
+         - (If you keep debug SQL, it must not be executed.)
+
+      Commands
+      - `.venv/bin/pytest -q`
+
+      Acceptance criteria
+      - All tests pass.
+      - PII question triggers AI Search and returns a helpful answer.
+      - No raw QueryResult repr leaks into user-facing messages.
+
+---
+
+# Extra notes for Copilot (do not ignore)
+
+## What “PII” means in this project
+- Your metadata index uses a `Security` label (e.g., `Confidential`).
+- For the purpose of this UI, treat “PII columns” as:
+  - Security == Confidential
+  - OR description/business name contains common PII cues (email, phone, address, name, SIN/SSN, DOB, etc.)
+  - Prefer returning what you have (don’t guess unseen PII).
+
+## UI follow-up (later)
+- Once backend is fixed, the Streamlit UI should display:
+  - a clean assistant message (no technical fields)
+  - a grid/table of the metadata rows
+  - optional “Show technical details” expander when DEBUG=true
