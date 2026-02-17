@@ -266,4 +266,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    index_name = os.getenv("INDEX_NAME", "meta_data_field")
+    vector_dim = int(os.getenv("VECTOR_DIM", "1536"))
+
+    final_index_name = ensure_index_vector_enabled(index_client, index_name, vector_dim)
+    search_client = SearchClient(endpoint=endpoint, index_name=final_index_name, credential=cred)
+
+    print(f"Using index: {final_index_name}")
+
