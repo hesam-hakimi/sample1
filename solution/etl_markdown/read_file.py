@@ -2,316 +2,347 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import hashlib
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional
 
 from dotenv import load_dotenv
 
-from azure.identity import ManagedIdentityCredential, DefaultAzureCredential
+from azure.core.exceptions import ResourceNotFoundError, HttpResponseError
+from azure.identity import DefaultAzureCredential, ManagedIdentityCredential, get_bearer_token_provider
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
-from azure.search.documents.models import VectorizedQuery
+from azure.search.documents.indexes.models import (
+    SearchIndex,
+    SearchField,
+    SearchFieldDataType,
+    SearchableField,
+    SimpleField,
+    VectorSearch,
+    HnswAlgorithmConfiguration,
+    VectorSearchProfile,
+)
 
-from embedding_utils import get_embedding, chat_completion
-
-load_dotenv(override=True)
-
-DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
-
-
-# ----------------------------
-# Azure Search clients
-# ----------------------------
-def _get_search_endpoint() -> str:
-    # support either full endpoint or account name
-    endpoint = os.getenv("SEARCH_ENDPOINT", "").strip()
-    if endpoint:
-        return endpoint
-    acct = os.getenv("AISEARCH_ACCOUNT", "").strip() or os.getenv("AISEARCH_SERVICE", "").strip()
-    if not acct:
-        raise RuntimeError("Missing SEARCH_ENDPOINT or AISEARCH_ACCOUNT in .env")
-    return f"https://{acct}.search.windows.net"
+# OpenAI (Azure)
+from openai import AzureOpenAI
 
 
-def _get_index_name() -> str:
-    return (os.getenv("INDEX_NAME", "").strip() or "meta_data_field_v3")
+# ---------------------------
+# Helpers
+# ---------------------------
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-def _get_credential():
-    # Prefer user-assigned MSI if CLIENT_ID provided
-    client_id = os.getenv("CLIENT_ID", "").strip()
+def make_safe_key(raw_id: str) -> str:
+    """
+    Azure Search doc key can only contain [A-Za-z0-9_-=] and must be stable.
+    Use sha256 hex (safe, short, deterministic).
+    """
+    return hashlib.sha256(raw_id.encode("utf-8")).hexdigest()
+
+
+def get_search_credential():
+    """
+    Prefer API key if provided; otherwise MSI/AAD.
+    """
+    api_key = os.getenv("AZURE_SEARCH_API_KEY", "").strip()
+    if api_key:
+        return api_key  # SearchClient accepts AzureKeyCredential too, but key string works via AzureKeyCredential path below
+    client_id = os.getenv("AZURE_CLIENT_ID", "").strip()
     if client_id:
         return ManagedIdentityCredential(client_id=client_id)
     return DefaultAzureCredential(exclude_interactive_browser_credential=False)
 
 
-def get_search_clients() -> Tuple[SearchClient, SearchIndexClient]:
-    endpoint = _get_search_endpoint()
-    index_name = _get_index_name()
-    cred = _get_credential()
-    search_client = SearchClient(endpoint=endpoint, index_name=index_name, credential=cred)
-    index_client = SearchIndexClient(endpoint=endpoint, credential=cred)
-    return search_client, index_client
+def get_search_clients(endpoint: str, index_name: str):
+    cred = get_search_credential()
 
-
-def _get_index_field_names(index_client: SearchIndexClient, index_name: str) -> List[str]:
-    idx = index_client.get_index(index_name)
-    return [f.name for f in idx.fields]  # type: ignore[attr-defined]
-
-
-def _safe_select_fields(existing: List[str], desired: List[str]) -> List[str]:
-    s = set(existing)
-    return [f for f in desired if f in s]
-
-
-# ----------------------------
-# Metadata retrieval + formatting
-# ----------------------------
-def retrieve_metadata_markdown(
-    question: str,
-    top_k: int = 25,
-    search_client: Optional[SearchClient] = None,
-    index_client: Optional[SearchIndexClient] = None,
-) -> Tuple[str, List[Dict[str, Any]]]:
-    """
-    Runs a hybrid search (keyword + vector) against the metadata index and returns:
-    - markdown schema context
-    - raw hits (dicts)
-    """
-    if not search_client or not index_client:
-        search_client, index_client = get_search_clients()
-
-    index_name = _get_index_name()
-    existing_fields = _get_index_field_names(index_client, index_name)
-
-    # Pick fields that exist (NO hardcoding)
-    desired = [
-        "schema_name",
-        "table_name",
-        "column_name",
-        "business_name",
-        "business_description",
-        "data_type",
-        "allowed_values",
-        "notes",
-        "pii",
-        "pci",
-        "is_key",
-        "is_filter_hint",
-        "security_classification_candidate",
-    ]
-    select_fields = _safe_select_fields(existing_fields, desired)
-
-    # Vector query (field name may differ: support common names)
-    vector_field_candidates = ["content_vector", "description_vector", "vector", "embedding"]
-    vector_field = next((f for f in vector_field_candidates if f in existing_fields), None)
-    if not vector_field:
-        raise RuntimeError(
-            f"No vector field found in index '{index_name}'. "
-            f"Tried {vector_field_candidates}. Existing fields: {existing_fields}"
+    # If using key, wrap with AzureKeyCredential
+    if isinstance(cred, str):
+        from azure.core.credentials import AzureKeyCredential
+        key_cred = AzureKeyCredential(cred)
+        return (
+            SearchIndexClient(endpoint=endpoint, credential=key_cred),
+            SearchClient(endpoint=endpoint, index_name=index_name, credential=key_cred),
         )
 
-    q_vec = get_embedding(question)
-    vq = VectorizedQuery(vector=q_vec, k_nearest_neighbors=top_k, fields=vector_field)
-
-    results = search_client.search(
-        search_text=question,                 # hybrid
-        vector_queries=[vq],
-        top=top_k,
-        select=select_fields if select_fields else None,
+    return (
+        SearchIndexClient(endpoint=endpoint, credential=cred),
+        SearchClient(endpoint=endpoint, index_name=index_name, credential=cred),
     )
 
-    hits: List[Dict[str, Any]] = []
-    for r in results:
-        # r behaves like dict
-        hits.append(dict(r))
 
-    # If nothing found, return empty context
-    if not hits:
-        return "", []
+def get_aoai_client() -> AzureOpenAI:
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21").strip()
+    api_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
 
-    # Group by schema.table
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
-    for h in hits:
-        schema = (h.get("schema_name") or "").strip()
-        table = (h.get("table_name") or "").strip()
-        key = f"{schema}.{table}".strip(".") or "UNKNOWN_TABLE"
-        grouped.setdefault(key, []).append(h)
+    if not endpoint:
+        raise RuntimeError("AZURE_OPENAI_ENDPOINT is missing")
 
-    lines: List[str] = []
-    lines.append("## Retrieved Metadata (Top Matches)")
-    lines.append("Use ONLY the following tables/columns. Do NOT invent names.\n")
+    if api_key:
+        return AzureOpenAI(azure_endpoint=endpoint, api_key=api_key, api_version=api_version)
 
-    # Build concise but rich schema context
-    for table_key, rows in list(grouped.items())[:12]:
-        lines.append(f"### Table: `{table_key}`")
-        # Prefer table-level business description if present in any row
-        table_desc = ""
-        for rr in rows:
-            bd = (rr.get("business_description") or "").strip()
-            if bd:
-                table_desc = bd
-                break
-        if table_desc:
-            lines.append(f"- Business description: {table_desc}")
+    # AAD/MSI auth
+    client_id = os.getenv("AZURE_CLIENT_ID", "").strip()
+    if client_id:
+        cred = ManagedIdentityCredential(client_id=client_id)
+    else:
+        cred = DefaultAzureCredential(exclude_interactive_browser_credential=False)
 
-        # Columns
-        lines.append("- Columns:")
-        seen_cols = set()
-        for rr in rows:
-            col = (rr.get("column_name") or "").strip()
-            if not col or col in seen_cols:
+    token_provider = get_bearer_token_provider(cred, "https://cognitiveservices.azure.com/.default")
+    return AzureOpenAI(azure_endpoint=endpoint, azure_ad_token_provider=token_provider, api_version=api_version)
+
+
+def embed_text(client: AzureOpenAI, text: str, vector_dim: int) -> List[float]:
+    dep = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "").strip()
+    if not dep:
+        raise RuntimeError("AZURE_OPENAI_EMBEDDING_DEPLOYMENT is missing")
+
+    # text-embedding-3-* supports `dimensions`. If your deployment doesn’t, we fallback.
+    try:
+        resp = client.embeddings.create(model=dep, input=text, dimensions=vector_dim)
+    except TypeError:
+        resp = client.embeddings.create(model=dep, input=text)
+
+    vec = resp.data[0].embedding
+    if len(vec) != vector_dim:
+        raise RuntimeError(
+            f"Embedding length mismatch. Got {len(vec)} but VECTOR_DIM={vector_dim}. "
+            f"Fix by setting VECTOR_DIM to {len(vec)} OR requesting embeddings with the same dimensions."
+        )
+    return vec
+
+
+def drop_index_if_exists(index_client: SearchIndexClient, index_name: str) -> None:
+    try:
+        index_client.delete_index(index_name)
+        print(f"✅ Dropped index: {index_name}")
+    except ResourceNotFoundError:
+        print(f"ℹ️ Index not found (skip drop): {index_name}")
+
+
+def drop_v2_indexes(index_client: SearchIndexClient) -> None:
+    """
+    Drops common v2 names so you don't fight "id cannot be changed" updates.
+    """
+    candidates = [
+        "meta_data_field_v2",
+        "meta_data_table_v2",
+        "meta_data_vector_v2",
+        "meta_data_field",
+        "meta_data_table",
+    ]
+    for name in candidates:
+        drop_index_if_exists(index_client, name)
+
+
+def build_unified_index(index_name: str, vector_dim: int) -> SearchIndex:
+    fields = [
+        SimpleField(name="id", type=SearchFieldDataType.String, key=True, filterable=True),
+        SimpleField(name="raw_id", type=SearchFieldDataType.String, filterable=True),
+        SimpleField(name="doc_type", type=SearchFieldDataType.String, filterable=True, facetable=True),
+
+        # table/field identifiers
+        SimpleField(name="schema_name", type=SearchFieldDataType.String, filterable=True, facetable=True),
+        SimpleField(name="table_name", type=SearchFieldDataType.String, filterable=True, facetable=True),
+        SimpleField(name="column_name", type=SearchFieldDataType.String, filterable=True, facetable=True),
+
+        # business metadata
+        SearchableField(name="business_name", type=SearchFieldDataType.String),
+        SearchableField(name="business_description", type=SearchFieldDataType.String),
+        SimpleField(name="data_type", type=SearchFieldDataType.String, filterable=True),
+
+        SimpleField(name="pii", type=SearchFieldDataType.Boolean, filterable=True),
+        SimpleField(name="pci", type=SearchFieldDataType.Boolean, filterable=True),
+        SimpleField(name="is_key", type=SearchFieldDataType.Boolean, filterable=True),
+
+        # relationship fields
+        SimpleField(name="from_schema", type=SearchFieldDataType.String, filterable=True),
+        SimpleField(name="from_table", type=SearchFieldDataType.String, filterable=True),
+        SimpleField(name="to_schema", type=SearchFieldDataType.String, filterable=True),
+        SimpleField(name="to_table", type=SearchFieldDataType.String, filterable=True),
+        SimpleField(name="join_type", type=SearchFieldDataType.String, filterable=True),
+        SearchableField(name="join_keys", type=SearchFieldDataType.String),
+        SimpleField(name="cardinality", type=SearchFieldDataType.String, filterable=True),
+        SimpleField(name="active", type=SearchFieldDataType.Boolean, filterable=True),
+
+        # main text used for search + embeddings
+        SearchableField(name="content", type=SearchFieldDataType.String),
+
+        SearchField(
+            name="content_vector",
+            type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+            searchable=True,
+            vector_search_dimensions=vector_dim,
+            vector_search_profile_name="vprofile",
+        ),
+    ]
+
+    vector_search = VectorSearch(
+        algorithms=[HnswAlgorithmConfiguration(name="hnsw")],
+        profiles=[VectorSearchProfile(name="vprofile", algorithm_configuration_name="hnsw")],
+    )
+
+    return SearchIndex(name=index_name, fields=fields, vector_search=vector_search)
+
+
+def read_jsonl(path: str) -> Iterable[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
                 continue
-            seen_cols.add(col)
-            dtype = (rr.get("data_type") or "").strip()
-            bn = (rr.get("business_name") or "").strip()
-            pii = rr.get("pii")
-            pci = rr.get("pci")
-            is_key = rr.get("is_key")
-            hints = []
-            if pii is True:
-                hints.append("PII")
-            if pci is True:
-                hints.append("PCI")
-            if is_key is True:
-                hints.append("KEY")
-            hint_txt = f" [{' / '.join(hints)}]" if hints else ""
-            label = f"`{col}`"
-            meta = " · ".join([x for x in [dtype, bn] if x])
-            if meta:
-                lines.append(f"  - {label}{hint_txt} — {meta}")
-            else:
-                lines.append(f"  - {label}{hint_txt}")
-
-        lines.append("")  # blank line
-
-    return "\n".join(lines).strip(), hits
+            yield json.loads(line)
 
 
-# ----------------------------
-# LLM: SQL or Clarify (STRICT JSON)
-# ----------------------------
-def generate_sql_or_clarify(question: str, engine_dialect: str = "sqlite") -> Dict[str, Any]:
-    """
-    Returns:
-      {"action":"sql","sql":"..."} OR {"action":"clarify","question":"..."}
-    """
-    schema_md, hits = retrieve_metadata_markdown(question)
+def normalize_table_doc(raw: Dict[str, Any]) -> Dict[str, Any]:
+    schema = raw.get("schema_name") or ""
+    table = raw.get("table_name") or ""
+    raw_id = raw.get("id") or f"table.{schema}.{table}"
+    content = raw.get("content") or ""
 
-    # If retrieval is weak, force clarification instead of hallucinating
-    if not schema_md or len(hits) < 3:
-        return {
-            "action": "clarify",
-            "question": (
-                "I couldn’t find enough matching metadata in Azure AI Search. "
-                "Which schema/table should I use (or what business area is this about)?"
-            ),
-        }
+    return {
+        "raw_id": str(raw_id),
+        "doc_type": "table",
+        "schema_name": schema,
+        "table_name": table,
+        "column_name": None,
+        "business_name": raw.get("table_business_name") or "",
+        "business_description": raw.get("table_business_description") or "",
+        "data_type": None,
+        "pii": False,
+        "pci": False,
+        "is_key": False,
+        "from_schema": None,
+        "from_table": None,
+        "to_schema": None,
+        "to_table": None,
+        "join_type": None,
+        "join_keys": None,
+        "cardinality": None,
+        "active": None,
+        "content": content,
+    }
 
-    prompt = f"""
-You are a data analyst who generates SQL for the user's question.
 
-You MUST return STRICT JSON ONLY (no markdown, no code fences).
-Choose exactly one action:
+def normalize_relationship_doc(raw: Dict[str, Any]) -> Dict[str, Any]:
+    raw_id = raw.get("id") or ""
+    content = raw.get("content") or ""
+    return {
+        "raw_id": str(raw_id),
+        "doc_type": "relationship",
+        "schema_name": None,
+        "table_name": None,
+        "column_name": None,
+        "business_name": "",
+        "business_description": raw.get("relationship_description") or "",
+        "data_type": None,
+        "pii": False,
+        "pci": False,
+        "is_key": False,
+        "from_schema": raw.get("from_schema"),
+        "from_table": raw.get("from_table"),
+        "to_schema": raw.get("to_schema"),
+        "to_table": raw.get("to_table"),
+        "join_type": raw.get("join_type"),
+        "join_keys": raw.get("join_keys"),
+        "cardinality": raw.get("cardinality"),
+        "active": bool(raw.get("active", True)),
+        "content": content,
+    }
 
-1) If you have enough info to write correct SQL using ONLY provided tables/columns:
-   {{"action":"sql","sql":"<SQL here>"}}
 
-2) If the question is ambiguous or missing table/schema details:
-   {{"action":"clarify","question":"<ask 1-2 short clarifying questions>"}}
+def upload_docs(search_client: SearchClient, docs: List[Dict[str, Any]], batch_size: int = 200) -> None:
+    from azure.search.documents.models import IndexDocumentsBatch
 
-Rules:
-- SQL dialect: {engine_dialect}
-- Use ONLY tables and columns that appear in the metadata below.
-- Do NOT invent table/column names.
-- If you need a table name, ask to clarify (action=clarify).
-- Return JSON only.
+    total = 0
+    for i in range(0, len(docs), batch_size):
+        batch = docs[i : i + batch_size]
+        b = IndexDocumentsBatch()
+        b.add_upload_actions(batch)
+        result = search_client.index_documents(batch=b)
 
-METADATA:
-{schema_md}
+        failed = [r for r in result if not r.succeeded]
+        if failed:
+            # print first few failures
+            print("❌ Some documents failed:")
+            for r in failed[:10]:
+                print(f"  key={r.key} error={r.error_message}")
+            raise RuntimeError("Upload failed. See errors above.")
+        total += len(batch)
+        print(f"✅ Uploaded {total}/{len(docs)}")
 
-USER QUESTION:
-{question}
-""".strip()
 
-    raw = chat_completion(prompt, temperature=0.0)
+def main() -> None:
+    load_dotenv()
 
-    # Robust JSON parse
-    obj: Dict[str, Any]
+    endpoint = os.getenv("AZURE_SEARCH_ENDPOINT", "").strip()
+    index_name = os.getenv("AZURE_SEARCH_INDEX_NAME", "amcb_metadata_v3").strip()
+    vector_dim = int(os.getenv("VECTOR_DIM", "1024").strip())
+
+    table_path = os.getenv("TABLE_DOCS_PATH", "./json_metadata/table_docs.jsonl").strip()
+    rel_path = os.getenv("RELATIONSHIP_DOCS_PATH", "./json_metadata/relationship_docs.jsonl").strip()
+
+    recreate = _bool_env("RECREATE_INDEX", default=True)
+
+    if not endpoint:
+        raise RuntimeError("AZURE_SEARCH_ENDPOINT is missing")
+
+    index_client, search_client = get_search_clients(endpoint, index_name)
+    aoai_client = get_aoai_client()
+
+    # 1) Drop v2 indexes (so you stop fighting schema updates)
+    drop_v2_indexes(index_client)
+
+    # 2) Recreate target index
+    if recreate:
+        drop_index_if_exists(index_client, index_name)
+
+    index = build_unified_index(index_name, vector_dim)
     try:
-        obj = json.loads(raw)
-    except Exception:
-        # fallback: treat as sql if it looks like sql; else clarification
-        low = raw.strip().lower()
-        if low.startswith("select") or low.startswith("with"):
-            obj = {"action": "sql", "sql": raw.strip()}
+        index_client.create_index(index)
+        print(f"✅ Created index: {index_name}")
+    except HttpResponseError as e:
+        # If already exists and recreate=false, this is OK
+        if "already exists" in str(e).lower():
+            print(f"ℹ️ Index already exists: {index_name}")
         else:
-            obj = {"action": "clarify", "question": raw.strip() or "Can you clarify your request?"}
+            raise
 
-    action = (obj.get("action") or "").strip().lower()
-    if action not in ("sql", "clarify"):
-        # defensive default
-        return {"action": "clarify", "question": "Can you clarify what you need (which table/schema)?", "raw": raw}
+    # 3) Read + normalize
+    docs: List[Dict[str, Any]] = []
 
-    if action == "sql":
-        sql = (obj.get("sql") or "").strip()
-        # remove accidental fences
-        sql = sql.strip("`").strip()
-        if sql.lower().startswith("sql"):
-            sql = sql[3:].strip()
-        return {"action": "sql", "sql": sql, "schema_md": schema_md}
+    print(f"📥 Reading tables: {table_path}")
+    for raw in read_jsonl(table_path):
+        doc = normalize_table_doc(raw)
+        doc["id"] = make_safe_key(doc["raw_id"])
+        docs.append(doc)
 
-    q = (obj.get("question") or "").strip()
-    return {"action": "clarify", "question": q or "Can you clarify your request?", "schema_md": schema_md}
+    print(f"📥 Reading relationships: {rel_path}")
+    for raw in read_jsonl(rel_path):
+        doc = normalize_relationship_doc(raw)
+        doc["id"] = make_safe_key(doc["raw_id"])
+        docs.append(doc)
+
+    # 4) Embed content
+    print("🧠 Creating embeddings...")
+    for idx, d in enumerate(docs, start=1):
+        d["content_vector"] = embed_text(aoai_client, d.get("content", "") or "", vector_dim)
+        if idx % 200 == 0:
+            print(f"  embedded {idx}/{len(docs)}")
+
+    # 5) Upload
+    print("🚀 Uploading docs...")
+    upload_docs(search_client, docs, batch_size=200)
+
+    print("🎉 Done.")
 
 
-def ask_llm_to_fix_sql(
-    question: str,
-    prev_sql: str,
-    error_msg: str,
-    engine_dialect: str = "sqlite",
-) -> Dict[str, Any]:
-    """
-    Same strict JSON contract as generate_sql_or_clarify.
-    """
-    schema_md, _ = retrieve_metadata_markdown(question)
-
-    prompt = f"""
-You generated SQL that failed execution.
-
-Return STRICT JSON ONLY (no markdown, no code fences):
-- If you can fix it: {{"action":"sql","sql":"<corrected SQL>"}}
-- If you need clarification: {{"action":"clarify","question":"<ask short clarifying question(s)>"}}
-
-Rules:
-- Dialect: {engine_dialect}
-- Use ONLY tables/columns from METADATA.
-- Do NOT invent names.
-
-USER QUESTION:
-{question}
-
-FAILED SQL:
-{prev_sql}
-
-ERROR:
-{error_msg}
-
-METADATA:
-{schema_md}
-""".strip()
-
-    raw = chat_completion(prompt, temperature=0.0)
-
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        low = raw.strip().lower()
-        if low.startswith("select") or low.startswith("with"):
-            obj = {"action": "sql", "sql": raw.strip()}
-        else:
-            obj = {"action": "clarify", "question": raw.strip()}
-
-    action = (obj.get("action") or "").strip().lower()
-    if action == "sql":
-        return {"action": "sql", "sql": (obj.get("sql") or "").strip()}
-    return {"action": "clarify", "question": (obj.get("question") or "Can you clarify?").strip()}
+if __name__ == "__main__":
+    main()
