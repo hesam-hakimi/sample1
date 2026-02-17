@@ -1,39 +1,19 @@
-# Azure AI Search: Drop `v2`, Recreate with Correct Vector Dim, and Upload Clean Docs
+# Parametric `main()` (no CLI args) — Drop v2, Create target index with correct vector dim, Upload docs
 
-This markdown gives you copy-paste code to:
+Copy-paste this as your `create_meta_data_vector_index.py`.
 
-1) **Drop** the `meta_data_field_v2` index  
-2) **Create** a fresh index with the **correct vector dimension** (auto-detected from your embedding function)  
-3) **Upload** documents with:
-   - a **safe** `id` (Base64 URL-safe)
-   - optional `raw_id` for debugging
-   - `content` + `content_vector` for **hybrid retrieval**
-
----
-
-## 0) What this fixes
-
-### ✅ Fix #1 — Vector dimension mismatch
-Your index was created with **1536**, but your embedding function returns **1024**.
-This code **auto-detects** the dimension (`len(get_embedding("x"))`) and creates the index correctly.
-
-### ✅ Fix #2 — Invalid document key
-Your previous `id` had dots (`.`). This code encodes the key into **URL-safe Base64**.
-
-### ✅ Fix #3 — Uploading fields not in index
-If you upload `raw_id`, the index must define it. This code defines it.
+✅ No `argparse`  
+✅ `main()` is parametric: `main(input_path=..., target_index=..., drop_v2=True, drop_target=False)`  
+✅ Auto-detects embedding dimension (fixes 1536 vs 1024 mismatch)  
+✅ Safe `id` (fixes invalid key with dots)  
+✅ Index includes `raw_id` so upload won’t fail
 
 ---
-
-## 1) Copy-paste: Drop index + Create index + Upload docs
-
-> Put this in your `create_meta_data_vector_index.py` (or replace the main parts with this).
 
 ```python
 import os
 import json
 import base64
-import argparse
 from typing import Any, Dict, List, Iterable, Optional
 
 from dotenv import load_dotenv
@@ -55,20 +35,14 @@ from azure.search.documents.indexes.models import (
 )
 
 # ---- Your existing embedding helper ----
-# Must return a python list[float]
+# Must return list[float]
 from embedding_utils import get_embedding
 
 
 # ----------------------------
-# Credentials / Clients
+# Credentials / Endpoint
 # ----------------------------
 def get_credential():
-    """
-    Prefer:
-      - API key if AISEARCH_API_KEY is set
-      - Managed Identity if CLIENT_ID is set
-      - else DefaultAzureCredential (good for local dev)
-    """
     api_key = os.getenv("AISEARCH_API_KEY")
     if api_key:
         return AzureKeyCredential(api_key)
@@ -81,14 +55,14 @@ def get_credential():
 
 
 def get_endpoint() -> str:
-    aisearch_account = os.getenv("AISEARCH_ACCOUNT")
-    if not aisearch_account:
+    acct = os.getenv("AISEARCH_ACCOUNT")
+    if not acct:
         raise ValueError("Missing AISEARCH_ACCOUNT in .env")
-    return f"https://{aisearch_account}.search.windows.net"
+    return f"https://{acct}.search.windows.net"
 
 
 # ----------------------------
-# Utils
+# Helpers
 # ----------------------------
 def chunked(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, Any]]]:
     for i in range(0, len(items), size):
@@ -114,22 +88,20 @@ def safe_bool(v: Any) -> Optional[bool]:
 def make_safe_key(raw_key: str) -> str:
     """
     Azure AI Search key rules: letters/digits/_/-/= only.
-    URL-safe Base64 yields A-Z a-z 0-9 _ - and may include '=' padding (allowed).
+    URL-safe base64 yields A-Z a-z 0-9 _ - and may include '=' padding (allowed).
     """
-    b = raw_key.encode("utf-8")
-    return base64.urlsafe_b64encode(b).decode("ascii")
+    return base64.urlsafe_b64encode(raw_key.encode("utf-8")).decode("ascii")
 
 
 def build_content(doc: Dict[str, Any]) -> str:
     """
-    Make a strong text field for hybrid retrieval (keyword + semantic).
+    Strong hybrid text: helps keyword + vector retrieval.
     """
     parts = []
 
     schema = doc.get("schema_name") or ""
     table = doc.get("table_name") or ""
     column = doc.get("column_name") or ""
-
     if schema or table or column:
         parts.append(f"schema={schema} table={table} column={column}".strip())
 
@@ -179,16 +151,11 @@ def normalize_doc(raw: Dict[str, Any], idx: int) -> Dict[str, Any]:
     column = raw.get("column_name") or ""
 
     raw_id = raw.get("id") or f"field.{schema}.{table}.{column}".strip(".") or f"row_{idx}"
-    safe_id = make_safe_key(str(raw_id))
 
     doc = {
-        # ✅ required key (safe)
-        "id": safe_id,
+        "id": make_safe_key(str(raw_id)),   # safe key for Azure Search
+        "raw_id": str(raw_id),              # debug / trace
 
-        # ✅ optional debug: keep original identifier
-        "raw_id": str(raw_id),
-
-        # ✅ structured fields
         "schema_name": schema or None,
         "table_name": table or None,
         "column_name": column or None,
@@ -211,8 +178,6 @@ def normalize_doc(raw: Dict[str, Any], idx: int) -> Dict[str, Any]:
 
     content = build_content(doc)
     doc["content"] = content
-
-    # ✅ embedding with correct dimension (auto-detected when index is created)
     doc["content_vector"] = get_embedding(content)
 
     return doc
@@ -228,22 +193,19 @@ def load_jsonl(path: str) -> List[Dict[str, Any]]:
     return out
 
 
-# ----------------------------
-# Index management
-# ----------------------------
 def detect_vector_dim() -> int:
     v = get_embedding("dimension check")
     if not isinstance(v, list) or not v:
-        raise ValueError("get_embedding() did not return a non-empty list[float].")
+        raise ValueError("get_embedding() must return a non-empty list[float].")
     dim = len(v)
     print(f"[INFO] Detected embedding dimension: {dim}")
     return dim
 
 
+# ----------------------------
+# Index management
+# ----------------------------
 def drop_index_if_exists(index_client: SearchIndexClient, index_name: str) -> None:
-    """
-    Drop (delete) an Azure AI Search index if it exists.
-    """
     try:
         index_client.get_index(index_name)
         index_client.delete_index(index_name)
@@ -303,59 +265,63 @@ def create_index(index_client: SearchIndexClient, index_name: str, vector_dim: i
 
 
 # ----------------------------
-# Main
+# Parametric main (NO ARGS)
 # ----------------------------
-def main():
+def main(
+    input_path: str,
+    target_index: str = "meta_data_field_v3",
+    drop_v2: bool = True,
+    drop_target: bool = False,
+    upload_batch: int = 500,
+):
+    """
+    Parameters:
+      input_path   : path to metadata JSONL
+      target_index : index to create and upload into
+      drop_v2      : if True, delete 'meta_data_field_v2' first
+      drop_target  : if True, delete target_index before creating it
+      upload_batch : upload batch size
+    """
     load_dotenv(override=True)
 
     endpoint = get_endpoint()
     cred = get_credential()
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Path to metadata JSONL")
-    parser.add_argument("--drop_v2", action="store_true", help="Drop meta_data_field_v2 before creating target index")
-    args = parser.parse_args()
-
-    # If you want to drop v2 specifically:
-    drop_v2_name = "meta_data_field_v2"
-
-    # Your target index name (new recommended)
-    index_name = os.getenv("INDEX_NAME", "meta_data_field_v3")
-
-    upload_batch = int(os.getenv("UPLOAD_BATCH", "500"))
-
     index_client = SearchIndexClient(endpoint=endpoint, credential=cred)
 
-    # 1) Drop v2 (optional)
-    if args.drop_v2:
-        drop_index_if_exists(index_client, drop_v2_name)
+    if drop_v2:
+        drop_index_if_exists(index_client, "meta_data_field_v2")
 
-    # 2) Create fresh target index with correct vector dim
+    if drop_target:
+        drop_index_if_exists(index_client, target_index)
+
     vector_dim = detect_vector_dim()
+    create_index(index_client, target_index, vector_dim)
 
-    # If target index exists and schema may conflict, you can drop it too (optional):
-    # drop_index_if_exists(index_client, index_name)
-
-    create_index(index_client, index_name, vector_dim)
-
-    # 3) Upload docs
-    raw_docs = load_jsonl(args.input)
+    raw_docs = load_jsonl(input_path)
     normalized = [normalize_doc(r, i) for i, r in enumerate(raw_docs)]
 
-    # sanity check
     if normalized:
         print("[CHECK] content_vector length =", len(normalized[0]["content_vector"]))
 
-    search_client = SearchClient(endpoint=endpoint, index_name=index_name, credential=cred)
+    search_client = SearchClient(endpoint=endpoint, index_name=target_index, credential=cred)
 
     total = 0
     for batch in chunked(normalized, upload_batch):
-        res = search_client.upload_documents(batch)
+        search_client.upload_documents(batch)
         total += len(batch)
         print(f"[OK] Uploaded {total}/{len(normalized)}")
 
     print("[DONE] Index + upload complete.")
+    print(f"[DONE] Target index: {target_index}")
 
 
 if __name__ == "__main__":
-    main()
+    # ✅ change these two lines only
+    main(
+        input_path="metadata.jsonl",
+        target_index=os.getenv("INDEX_NAME", "meta_data_field_v3"),
+        drop_v2=True,
+        drop_target=False,
+        upload_batch=int(os.getenv("UPLOAD_BATCH", "500")),
+    )
