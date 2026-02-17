@@ -1,29 +1,4 @@
-# create_metadata_vector_index.py
-"""
-One-time (or occasional) admin script:
-1) Creates/updates a vector-enabled Azure AI Search index for FIELD-level metadata.
-2) Uploads documents after building a strong `content` string + `content_vector` embedding.
-
-Run:
-  python create_metadata_vector_index.py --input metadata.jsonl
-
-Input format (JSONL): one JSON object per line. Recommended keys:
-  schema_name, table_name, column_name, business_name, business_description,
-  data_type, allowed_values, notes, pii, pci, is_key, is_filter_hint, mal_code, security_classification_candidate
-"""
-
-import os
-import json
-import argparse
-from typing import Dict, List, Iterable, Any, Optional
-
-from dotenv import load_dotenv
-
-from azure.identity import ManagedIdentityCredential, DefaultAzureCredential
-from azure.core.credentials import AzureKeyCredential
-
-from azure.search.documents import SearchClient
-from azure.search.documents.indexes import SearchIndexClient
+from azure.core.exceptions import ResourceNotFoundError, HttpResponseError
 from azure.search.documents.indexes.models import (
     SearchIndex,
     SimpleField,
@@ -34,243 +9,135 @@ from azure.search.documents.indexes.models import (
     VectorSearchProfile,
 )
 
-# ---- Your existing embedding helper ----
-# Must expose: get_embedding(text: str) -> List[float]
-from embedding_utils import get_embedding  # <- keep your current implementation
+def _has_field(index: SearchIndex, name: str) -> bool:
+    return any(f.name == name for f in (index.fields or []))
 
-
-def get_credential():
-    """
-    Prefer MSI (User-Assigned) in Azure; fall back to DefaultAzureCredential for local dev.
-    If you use API key instead, set AISEARCH_API_KEY in .env
-    """
-    api_key = os.getenv("AISEARCH_API_KEY")
-    if api_key:
-        return AzureKeyCredential(api_key)
-
-    client_id = os.getenv("CLIENT_ID")  # user-assigned managed identity client id
-    if client_id:
-        return ManagedIdentityCredential(client_id=client_id)
-
-    return DefaultAzureCredential(exclude_interactive_browser_credential=False)
-
-
-def chunked(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, Any]]]:
-    for i in range(0, len(items), size):
-        yield items[i : i + size]
-
-
-def safe_bool(v: Any) -> Optional[bool]:
-    if v is None:
-        return None
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, str):
-        s = v.strip().lower()
-        if s in {"true", "1", "yes", "y"}:
-            return True
-        if s in {"false", "0", "no", "n"}:
-            return False
-    if isinstance(v, (int, float)):
-        return bool(v)
+def _get_field(index: SearchIndex, name: str):
+    for f in (index.fields or []):
+        if f.name == name:
+            return f
     return None
 
+def _ensure_vector_config(index: SearchIndex):
+    # Ensure vector_search exists and has our algo/profile
+    if index.vector_search is None:
+        index.vector_search = VectorSearch(
+            algorithms=[HnswAlgorithmConfiguration(name="hnsw")],
+            profiles=[VectorSearchProfile(name="vector-profile", algorithm_configuration_name="hnsw")],
+        )
+        return
 
-def build_content(doc: Dict[str, Any]) -> str:
+    # Add algorithm if missing
+    algos = index.vector_search.algorithms or []
+    if not any(a.name == "hnsw" for a in algos):
+        algos.append(HnswAlgorithmConfiguration(name="hnsw"))
+    index.vector_search.algorithms = algos
+
+    # Add profile if missing
+    profiles = index.vector_search.profiles or []
+    if not any(p.name == "vector-profile" for p in profiles):
+        profiles.append(VectorSearchProfile(name="vector-profile", algorithm_configuration_name="hnsw"))
+    index.vector_search.profiles = profiles
+
+def ensure_index_vector_enabled(index_client, index_name: str, vector_dim: int) -> str:
     """
-    The SINGLE most important thing: build a strong search string (keyword + semantic).
+    - If index doesn't exist: create it fresh (vector-enabled).
+    - If index exists: ONLY add missing fields/config (no changes to existing fields).
+    - If upgrade is not possible: create a new index name automatically.
+    Returns the index name that should be used.
     """
-    parts = []
+    try:
+        idx = index_client.get_index(index_name)
 
-    schema = doc.get("schema_name") or ""
-    table = doc.get("table_name") or ""
-    column = doc.get("column_name") or ""
+        # 1) Ensure keyword field exists (add only if missing)
+        if not _has_field(idx, "content"):
+            idx.fields.append(
+                SearchField(name="content", type=SearchFieldDataType.String, searchable=True)
+            )
 
-    if schema or table or column:
-        parts.append(f"schema={schema} table={table} column={column}".strip())
+        # 2) Ensure vector field exists (add only if missing)
+        if _has_field(idx, "content_vector"):
+            # If it exists, make sure dimensions match. If not, cannot change -> new index needed.
+            f = _get_field(idx, "content_vector")
+            existing_dim = getattr(f, "vector_search_dimensions", None)
+            if existing_dim is not None and int(existing_dim) != int(vector_dim):
+                raise HttpResponseError(
+                    message=f"content_vector exists with dimensions={existing_dim}, cannot change to {vector_dim}"
+                )
+        else:
+            idx.fields.append(
+                SearchField(
+                    name="content_vector",
+                    type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                    searchable=True,
+                    vector_search_dimensions=vector_dim,
+                    vector_search_profile_name="vector-profile",
+                )
+            )
 
-    # business meaning
-    bn = doc.get("business_name") or ""
-    bd = doc.get("business_description") or ""
-    if bn:
-        parts.append(f"business_name={bn}")
-    if bd:
-        parts.append(f"business_description={bd}")
+        # 3) Ensure vector search config exists
+        _ensure_vector_config(idx)
 
-    # technical metadata
-    dt = doc.get("data_type") or ""
-    av = doc.get("allowed_values") or ""
-    notes = doc.get("notes") or ""
-    if dt:
-        parts.append(f"data_type={dt}")
-    if av:
-        parts.append(f"allowed_values={av}")
-    if notes:
-        parts.append(f"notes={notes}")
+        # 4) Update index WITHOUT redefining existing fields like 'id'
+        index_client.create_or_update_index(idx)
+        print(f"[OK] Upgraded index in place: {index_name}")
+        return index_name
 
-    # tags as plain text so keyword search works too
-    pii = safe_bool(doc.get("pii"))
-    pci = safe_bool(doc.get("pci"))
-    is_key = safe_bool(doc.get("is_key"))
-    is_filter_hint = safe_bool(doc.get("is_filter_hint"))
-    tags = []
-    if pii is not None:
-        tags.append(f"pii={str(pii).lower()}")
-    if pci is not None:
-        tags.append(f"pci={str(pci).lower()}")
-    if is_key is not None:
-        tags.append(f"is_key={str(is_key).lower()}")
-    if is_filter_hint is not None:
-        tags.append(f"is_filter_hint={str(is_filter_hint).lower()}")
-    if tags:
-        parts.append("tags: " + " ".join(tags))
+    except ResourceNotFoundError:
+        # Create fresh index
+        fields = [
+            SimpleField(name="id", type=SearchFieldDataType.String, key=True, filterable=True),
 
-    # optional compliance/security
-    sc = doc.get("security_classification_candidate") or ""
-    if sc:
-        parts.append(f"security_classification_candidate={sc}")
+            SearchField(name="content", type=SearchFieldDataType.String, searchable=True),
 
-    return "\n".join([p for p in parts if p]).strip()
+            SearchField(
+                name="content_vector",
+                type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                searchable=True,
+                vector_search_dimensions=vector_dim,
+                vector_search_profile_name="vector-profile",
+            ),
 
+            # You can add more fields here if you want on a NEW index.
+            # (But do not try to "change" existing ones on an old index.)
+        ]
 
-def normalize_doc(raw: Dict[str, Any], idx: int) -> Dict[str, Any]:
-    # Stable, deterministic id if not provided
-    schema = raw.get("schema_name") or ""
-    table = raw.get("table_name") or ""
-    column = raw.get("column_name") or ""
-    rid = raw.get("id") or f"{schema}.{table}.{column}".strip(".") or f"row_{idx}"
+        vector_search = VectorSearch(
+            algorithms=[HnswAlgorithmConfiguration(name="hnsw")],
+            profiles=[VectorSearchProfile(name="vector-profile", algorithm_configuration_name="hnsw")],
+        )
 
-    doc = {
-        "id": str(rid),
+        new_index = SearchIndex(name=index_name, fields=fields, vector_search=vector_search)
+        index_client.create_or_update_index(new_index)
+        print(f"[OK] Created new index: {index_name}")
+        return index_name
 
-        "schema_name": schema or None,
-        "table_name": table or None,
-        "column_name": column or None,
+    except HttpResponseError as e:
+        msg = str(e)
+        # If upgrade fails (immutable fields), create a new versioned index
+        if "cannot be changed" in msg.lower() or "OperationNotAllowed" in msg:
+            fallback = f"{index_name}_v2"
+            print(f"[WARN] Cannot upgrade '{index_name}'. Creating '{fallback}' instead.")
 
-        "business_name": raw.get("business_name") or None,
-        "business_description": raw.get("business_description") or None,
+            fields = [
+                SimpleField(name="id", type=SearchFieldDataType.String, key=True, filterable=True),
+                SearchField(name="content", type=SearchFieldDataType.String, searchable=True),
+                SearchField(
+                    name="content_vector",
+                    type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                    searchable=True,
+                    vector_search_dimensions=vector_dim,
+                    vector_search_profile_name="vector-profile",
+                ),
+            ]
 
-        "data_type": raw.get("data_type") or None,
-        "allowed_values": raw.get("allowed_values") or None,
-        "notes": raw.get("notes") or None,
+            vector_search = VectorSearch(
+                algorithms=[HnswAlgorithmConfiguration(name="hnsw")],
+                profiles=[VectorSearchProfile(name="vector-profile", algorithm_configuration_name="hnsw")],
+            )
 
-        "mal_code": raw.get("mal_code") or None,
-        "security_classification_candidate": raw.get("security_classification_candidate") or None,
+            new_index = SearchIndex(name=fallback, fields=fields, vector_search=vector_search)
+            index_client.create_or_update_index(new_index)
+            return fallback
 
-        "pii": safe_bool(raw.get("pii")),
-        "pci": safe_bool(raw.get("pci")),
-        "is_key": safe_bool(raw.get("is_key")),
-        "is_filter_hint": safe_bool(raw.get("is_filter_hint")),
-    }
-
-    content = build_content(doc)
-    doc["content"] = content
-    doc["content_vector"] = get_embedding(content)
-    return doc
-
-
-def create_or_update_index(index_client: SearchIndexClient, index_name: str, vector_dim: int) -> None:
-    fields = [
-        SimpleField(name="id", type=SearchFieldDataType.String, key=True, filterable=True, sortable=False),
-
-        # Hybrid retrieval anchor (keyword)
-        SearchField(name="content", type=SearchFieldDataType.String, searchable=True),
-
-        # Vector field (semantic)
-        SearchField(
-            name="content_vector",
-            type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
-            searchable=True,
-            vector_search_dimensions=vector_dim,
-            vector_search_profile_name="vector-profile",
-        ),
-
-        # Structured metadata for select/filter/formatting
-        SearchField(name="schema_name", type=SearchFieldDataType.String, filterable=True, facetable=True, sortable=True),
-        SearchField(name="table_name", type=SearchFieldDataType.String, filterable=True, facetable=True, sortable=True),
-        SearchField(name="column_name", type=SearchFieldDataType.String, filterable=True, facetable=True, sortable=True),
-
-        SearchField(name="business_name", type=SearchFieldDataType.String, searchable=True),
-        SearchField(name="business_description", type=SearchFieldDataType.String, searchable=True),
-
-        SearchField(name="data_type", type=SearchFieldDataType.String, filterable=True, facetable=True),
-        SearchField(name="allowed_values", type=SearchFieldDataType.String, searchable=True),
-        SearchField(name="notes", type=SearchFieldDataType.String, searchable=True),
-
-        SearchField(name="mal_code", type=SearchFieldDataType.String, filterable=True),
-        SearchField(name="security_classification_candidate", type=SearchFieldDataType.String, filterable=True),
-
-        SimpleField(name="pii", type=SearchFieldDataType.Boolean, filterable=True, facetable=True),
-        SimpleField(name="pci", type=SearchFieldDataType.Boolean, filterable=True, facetable=True),
-        SimpleField(name="is_key", type=SearchFieldDataType.Boolean, filterable=True, facetable=True),
-        SimpleField(name="is_filter_hint", type=SearchFieldDataType.Boolean, filterable=True, facetable=True),
-    ]
-
-    vector_search = VectorSearch(
-        algorithms=[HnswAlgorithmConfiguration(name="hnsw")],
-        profiles=[VectorSearchProfile(name="vector-profile", algorithm_configuration_name="hnsw")],
-    )
-
-    index = SearchIndex(name=index_name, fields=fields, vector_search=vector_search)
-    index_client.create_or_update_index(index)
-
-
-def load_jsonl(path: str) -> List[Dict[str, Any]]:
-    docs = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            docs.append(json.loads(line))
-    return docs
-
-
-def main():
-    load_dotenv(override=True)
-
-    aisearch_account = os.getenv("AISEARCH_ACCOUNT")
-    index_name = os.getenv("INDEX_NAME", "meta_data_field_v2")
-    vector_dim = int(os.getenv("VECTOR_DIM", "1536"))  # must match your embedding model
-    batch_size = int(os.getenv("UPLOAD_BATCH", "500"))
-
-    if not aisearch_account:
-        raise ValueError("Missing AISEARCH_ACCOUNT in .env")
-
-    endpoint = f"https://{aisearch_account}.search.windows.net"
-    cred = get_credential()
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Path to metadata JSONL")
-    args = parser.parse_args()
-
-    raw = load_jsonl(args.input)
-    normalized = [normalize_doc(r, i) for i, r in enumerate(raw)]
-
-    index_client = SearchIndexClient(endpoint=endpoint, credential=cred)
-    create_or_update_index(index_client, index_name=index_name, vector_dim=vector_dim)
-
-    search_client = SearchClient(endpoint=endpoint, index_name=index_name, credential=cred)
-
-    # upload in batches
-    total = 0
-    for batch in chunked(normalized, batch_size):
-        res = search_client.upload_documents(batch)
-        # res is a list of IndexingResult
-        total += len(batch)
-        print(f"Uploaded {total}/{len(normalized)}")
-
-    print("Done.")
-    print(f"Index: {index_name}")
-    print(f"Endpoint: {endpoint}")
-
-
-if __name__ == "__main__":
-    index_name = os.getenv("INDEX_NAME", "meta_data_field")
-    vector_dim = int(os.getenv("VECTOR_DIM", "1536"))
-
-    final_index_name = ensure_index_vector_enabled(index_client, index_name, vector_dim)
-    search_client = SearchClient(endpoint=endpoint, index_name=final_index_name, credential=cred)
-
-    print(f"Using index: {final_index_name}")
-
+        raise
