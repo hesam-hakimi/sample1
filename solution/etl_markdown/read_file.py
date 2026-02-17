@@ -358,4 +358,41 @@ def main() -> None:
         print(f"✅ Created/Updated index: {index_name}")
     except HttpResponseError as e:
         raise RuntimeError(
-            f"Index create/update failed (common cause: trying to change existing 'id' fi
+            f"Index create/update failed (common cause: trying to change existing 'id' field). "
+            f"Set FORCE_RECREATE_INDEX=true and rerun. Error: {e}"
+        )
+
+    search_client = get_data_client(index_name)
+
+    # Read docs
+    docs: List[Dict[str, Any]] = []
+    print(f"📄 Reading tables: {table_path}")
+    for raw in read_json_objects(table_path):
+        docs.append(normalize_table_doc(raw))
+
+    print(f"📄 Reading relationships: {rel_path}")
+    for raw in read_json_objects(rel_path):
+        docs.append(normalize_relationship_doc(raw))
+
+    if not docs:
+        raise RuntimeError("No documents loaded. Check your TABLE_DOCS_PATH / REL_DOCS_PATH content.")
+
+    # Embed content
+    print("🧠 Creating embeddings...")
+    for i, d in enumerate(docs, start=1):
+        text = d.get("content") or ""
+        vec = embed_once(aoai, text)
+        if len(vec) != vector_dim:
+            raise RuntimeError(f"Embedding dim mismatch at doc raw_id={d.get('raw_id')}: got {len(vec)} expected {vector_dim}")
+        d["content_vector"] = vec
+        if i % 200 == 0:
+            print(f"   ...embedded {i}/{len(docs)}")
+
+    # Upload
+    print("🚀 Uploading documents to Azure AI Search...")
+    upload_docs(search_client, docs, batch_size=batch_size)
+    print("✅ Done.")
+
+
+if __name__ == "__main__":
+    main()
