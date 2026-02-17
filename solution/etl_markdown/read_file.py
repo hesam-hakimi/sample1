@@ -1,38 +1,109 @@
-# create_meta_data_vector_index.py (only the parts that change)
+from __future__ import annotations
 
+import ast
+import base64
+import json
 import os
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
+from azure.search.documents.indexes.models import (
+    HnswAlgorithmConfiguration,
+    SearchField,
+    SearchFieldDataType,
+    SearchIndex,
+    SimpleField,
+    VectorSearch,
+    VectorSearchProfile,
+)
 from openai import AzureOpenAI
 
-from auth_utils import get_msi_credential, get_aoai_token_provider
+from auth_utils import get_aoai_token_provider, get_msi_credential
 
 
+# -----------------------------
+# Env helpers
+# -----------------------------
 def _env(name: str, default: str = "", required: bool = False) -> str:
-    v = os.getenv(name, default).strip()
+    v = (os.getenv(name, default) or "").strip()
     if required and not v:
         raise RuntimeError(f"Missing required env var: {name}")
     return v
 
 
-def get_index_client() -> SearchIndexClient:
-    return SearchIndexClient(
-        endpoint=_env("AZURE_SEARCH_ENDPOINT", required=True),
-        credential=get_msi_credential(),
-    )
+def _env_bool(name: str, default: str = "false") -> bool:
+    return _env(name, default).lower() in ("1", "true", "yes", "y")
 
 
-def get_data_client() -> SearchClient:
-    return SearchClient(
-        endpoint=_env("AZURE_SEARCH_ENDPOINT", required=True),
-        index_name=_env("AZURE_SEARCH_INDEX_NAME", "meta_data_field_v3"),
-        credential=get_msi_credential(),
-    )
+# -----------------------------
+# Safe key for Azure Search doc key
+# -----------------------------
+def make_safe_key(raw_key: str) -> str:
+    """
+    Azure Search key rules are strict. Dots/spaces/etc fail.
+    Use deterministic URL-safe base64 (no padding).
+    """
+    b = raw_key.encode("utf-8", errors="ignore")
+    s = base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+    # keep it under 1024 chars just in case
+    return s[:1024]
 
 
-def get_aoai_client() -> AzureOpenAI:
-    return AzureOpenAI(
-        azure_endpoint=_env("AZURE_OPENAI_ENDPOINT", required=True),
-        api_version=_env("AZURE_OPENAI_API_VERSION", "2024-06-01"),
-        azure_ad_token_provider=get_aoai_token_provider(),  # ✅ MSI token
-    )
+# -----------------------------
+# Robust JSON reader
+# Supports:
+#  - JSONL (one object per line)
+#  - JSON array file
+#  - "almost JSON" lines (python dict) via ast.literal_eval
+# -----------------------------
+def read_json_objects(path: str) -> Iterable[Dict[str, Any]]:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    text = p.read_text(encoding="utf-8", errors="ignore").strip()
+    if not text:
+        return
+
+    # Try JSON array first
+    if text.startswith("["):
+        try:
+            arr = json.loads(text)
+            if isinstance(arr, list):
+                for obj in arr:
+                    if isinstance(obj, dict):
+                        yield obj
+                return
+        except Exception:
+            pass
+
+    # Else treat as JSONL / line-based
+    for i, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        # best: proper JSON
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                yield obj
+            continue
+        except json.JSONDecodeError:
+            pass
+
+        # fallback: python dict syntax (single quotes, True/False, etc.)
+        try:
+            obj2 = ast.literal_eval(line)
+            if isinstance(obj2, dict):
+                yield obj2
+                continue
+        except Exception:
+            pass
+
+        # If we
