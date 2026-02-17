@@ -303,4 +303,181 @@ Return JSON only.
 
 # ---------------------------
 # Output handling
-# ------
+# ---------------------------
+
+def _parse_llm_json(text: str) -> Dict[str, Any]:
+    s = text.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s).strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        m = re.search(r"\{.*\}", s, flags=re.S)
+        if not m:
+            raise
+        return json.loads(m.group(0))
+
+
+def _format_clarification(obj: Dict[str, Any]) -> str:
+    clarification = (obj.get("clarification") or "").strip()
+    suggestions = obj.get("suggestions") or []
+
+    lines = ["I need more information to generate the correct SQL.\n"]
+    if clarification:
+        lines.append(clarification)
+        lines.append("")
+
+    if suggestions:
+        lines.append("Suggested options (pick one or more):")
+        for s in suggestions[:8]:
+            table = s.get("table", "")
+            cols = s.get("columns") or []
+            reason = s.get("reason", "")
+            cols_txt = ", ".join(cols) if cols else "(columns not specified)"
+            lines.append(f"- **{table}** — columns: {cols_txt}" + (f" — {reason}" if reason else ""))
+
+    return "\n".join(lines).strip()
+
+
+def _normalize_sql(sql: str) -> str:
+    s = (sql or "").strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s).strip()
+    return s.rstrip(";").strip()
+
+
+def _strip_schema_for_sqlite(sql: str) -> str:
+    # FROM schema.table -> FROM table
+    sql = re.sub(r"(\bFROM\s+)([A-Za-z_]\w*)\.([A-Za-z_]\w*)", r"\1\3", sql, flags=re.I)
+    # JOIN schema.table -> JOIN table
+    sql = re.sub(r"(\bJOIN\s+)([A-Za-z_]\w*)\.([A-Za-z_]\w*)", r"\1\3", sql, flags=re.I)
+    return sql
+
+
+# ---------------------------
+# Main API used by UI
+# ---------------------------
+
+def ask_question(question: str, search_client: SearchClient) -> str:
+    q = (question or "").strip()
+    if not q:
+        return "I need more information to generate the correct SQL. Please enter a question."
+
+    hits = search_metadata(q, search_client, top_k=14)
+    metadata_ctx = build_metadata_context(hits, max_chars=9000)
+    relationship_ctx = build_metadata_context(hits, max_chars=4500)
+
+    keyword = "naics" if "naics" in q.lower() else ""
+    suggestion_candidates = build_suggestions_from_hits(hits, keyword=keyword, limit=8) if keyword else []
+
+    client = get_openai_client()
+    model_name = get_openai_model_name()
+
+    prompt = _sql_generation_prompt(
+        question=q,
+        db_dialect=DB_DIALECT,
+        metadata_context=metadata_ctx or "(empty)",
+        relationship_context=relationship_ctx or "(empty)",
+        suggestion_candidates=suggestion_candidates,
+    )
+
+    resp = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+    )
+    raw_text = (resp.choices[0].message.content or "").strip()
+
+    obj = _parse_llm_json(raw_text)
+    obj_type = (obj.get("type") or "").strip().lower()
+
+    if obj_type == "clarification":
+        return _format_clarification(obj)
+
+    sql = _normalize_sql(obj.get("sql") or "")
+    if not sql:
+        return _format_clarification(
+            {"clarification": "Please clarify your request.", "suggestions": suggestion_candidates[:8]}
+        )
+
+    if DB_DIALECT == "sqlite":
+        sql = _strip_schema_for_sqlite(sql)
+
+    return sql
+
+
+def ask_llm_to_fix_sql(question: str, prev_sql: str, error_msg: str, search_client: SearchClient) -> str:
+    q = (question or "").strip()
+    prev = (prev_sql or "").strip()
+    err = (error_msg or "").strip()
+
+    hits = search_metadata(q, search_client, top_k=14)
+    metadata_ctx = build_metadata_context(hits, max_chars=9000)
+    relationship_ctx = build_metadata_context(hits, max_chars=4500)
+
+    keyword = "naics" if "naics" in q.lower() else ""
+    suggestion_candidates = build_suggestions_from_hits(hits, keyword=keyword, limit=8) if keyword else []
+
+    client = get_openai_client()
+    model_name = get_openai_model_name()
+
+    prompt = _sql_fix_prompt(
+        question=q,
+        prev_sql=prev,
+        error_msg=err,
+        db_dialect=DB_DIALECT,
+        metadata_context=metadata_ctx or "(empty)",
+        relationship_context=relationship_ctx or "(empty)",
+        suggestion_candidates=suggestion_candidates,
+    )
+
+    resp = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+    )
+    raw_text = (resp.choices[0].message.content or "").strip()
+
+    obj = _parse_llm_json(raw_text)
+    obj_type = (obj.get("type") or "").strip().lower()
+
+    if obj_type == "clarification":
+        return _format_clarification(obj)
+
+    sql = _normalize_sql(obj.get("sql") or "")
+    if DB_DIALECT == "sqlite":
+        sql = _strip_schema_for_sqlite(sql)
+    return sql
+
+
+# ---------------------------
+# Backward-compatible function names (so imports won't break)
+# ---------------------------
+
+def llm_generate_sql(question: str, search_client: Optional[SearchClient] = None, *args, **kwargs) -> str:
+    """
+    Compatibility wrapper.
+    Many repos call: llm_generate_sql(question, search_client)
+    """
+    if search_client is None:
+        search_client = setup_azure_search()
+    return ask_question(question, search_client)
+
+
+def llm_fix_sql(
+    question: str,
+    prev_sql: str,
+    error_msg: str,
+    search_client: Optional[SearchClient] = None,
+    *args,
+    **kwargs,
+) -> str:
+    """
+    Compatibility wrapper.
+    Your code imports this name: from ai_utils import llm_fix_sql
+    """
+    if search_client is None:
+        search_client = setup_azure_search()
+    return ask_llm_to_fix_sql(question, prev_sql, error_msg, search_client)
