@@ -1,44 +1,38 @@
-# auth_utils.py
-from __future__ import annotations
+# create_meta_data_vector_index.py (only the parts that change)
 
 import os
-from typing import Callable
+from azure.search.documents import SearchClient
+from azure.search.documents.indexes import SearchIndexClient
+from openai import AzureOpenAI
 
-from azure.identity import ManagedIdentityCredential
-
-# Newer azure-identity versions include this helper
-try:
-    from azure.identity import get_bearer_token_provider  # type: ignore
-except Exception:  # pragma: no cover
-    get_bearer_token_provider = None
+from auth_utils import get_msi_credential, get_aoai_token_provider
 
 
-def get_msi_credential() -> ManagedIdentityCredential:
-    """
-    MSI-only credential:
-    - Never opens a browser
-    - Never uses az login
-    - Never uses VS Code token cache
-    """
-    client_id = (os.getenv("AZURE_CLIENT_ID") or os.getenv("MANAGED_IDENTITY_CLIENT_ID") or "").strip()
-    if client_id:
-        return ManagedIdentityCredential(client_id=client_id)
-    return ManagedIdentityCredential()  # system-assigned MI
+def _env(name: str, default: str = "", required: bool = False) -> str:
+    v = os.getenv(name, default).strip()
+    if required and not v:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return v
 
 
-def get_aoai_token_provider() -> Callable[[], str]:
-    """
-    Token provider compatible with OpenAI Python SDK AzureOpenAI(..., azure_ad_token_provider=...).
-    Uses MSI to get token for Cognitive Services.
-    """
-    cred = get_msi_credential()
-    scope = "https://cognitiveservices.azure.com/.default"
+def get_index_client() -> SearchIndexClient:
+    return SearchIndexClient(
+        endpoint=_env("AZURE_SEARCH_ENDPOINT", required=True),
+        credential=get_msi_credential(),
+    )
 
-    if get_bearer_token_provider is not None:
-        return get_bearer_token_provider(cred, scope)
 
-    # Fallback for older environments
-    def _provider() -> str:
-        return cred.get_token(scope).token
+def get_data_client() -> SearchClient:
+    return SearchClient(
+        endpoint=_env("AZURE_SEARCH_ENDPOINT", required=True),
+        index_name=_env("AZURE_SEARCH_INDEX_NAME", "meta_data_field_v3"),
+        credential=get_msi_credential(),
+    )
 
-    return _provider
+
+def get_aoai_client() -> AzureOpenAI:
+    return AzureOpenAI(
+        azure_endpoint=_env("AZURE_OPENAI_ENDPOINT", required=True),
+        api_version=_env("AZURE_OPENAI_API_VERSION", "2024-06-01"),
+        azure_ad_token_provider=get_aoai_token_provider(),  # ✅ MSI token
+    )
