@@ -1,392 +1,386 @@
 from __future__ import annotations
 
-import base64
 import json
 import os
-from pathlib import Path
-from typing import Any, Dict, Tuple
+import re
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
-import gradio as gr
-import pandas as pd
-from sqlalchemy.engine import Engine
+from azure.identity import ManagedIdentityCredential, get_bearer_token_provider
 from azure.search.documents import SearchClient
-
-# dotenv (keep it here as requested)
-from dotenv import load_dotenv
-
-load_dotenv()
-
-DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() == "true"
-
-from ai_utils import ask_question  # keep existing import
-
-# Prefer using a DB helper that returns a DataFrame for grid view:
-try:
-    from db_utils import execute_sql_df  # type: ignore
-except Exception:
-    execute_sql_df = None  # fallback used if not available
+from azure.search.documents.models import VectorizedQuery
+from openai import AzureOpenAI
 
 
-def _file_to_data_uri(path: Path) -> str:
-    """Embed an image so it reliably displays without static file routing."""
-    if not path.exists():
-        return ""
-    ext = path.suffix.lower()
-    if ext in [".jpg", ".jpeg"]:
-        mime = "image/jpeg"
-    elif ext == ".svg":
-        mime = "image/svg+xml"
-    else:
-        mime = "image/png"
-    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{b64}"
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+
+COG_SCOPE = "https://cognitiveservices.azure.com/.default"
 
 
-def _fallback_execute_sql_df(sql: str, engine: Engine, max_rows: int = 500) -> Tuple[pd.DataFrame, str]:
+def _now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_msi_credential() -> ManagedIdentityCredential:
     """
-    Fallback if db_utils.execute_sql_df doesn't exist.
-    NOTE: This is a best-effort preview limiter for common engines.
+    MSI-only credential:
+    - no DefaultAzureCredential
+    - no az login
+    - no interactive browser prompt
     """
-    from sqlalchemy import text
-    import re
-
-    def apply_preview_limit(s: str) -> str:
-        s2 = s.strip().rstrip(";")
-        low = s2.lower()
-        is_select = low.startswith("select")
-        is_cte = low.startswith("with")
-        if not (is_select or is_cte):
-            return s2
-
-        dialect = getattr(engine.dialect, "name", "").lower()
-
-        if dialect == "sqlite":
-            if re.search(r"\blimit\b", low):
-                return s2
-            return f"{s2} LIMIT {max_rows}"
-
-        # Azure SQL / SQL Server
-        if dialect == "mssql" and is_select and (" top " not in low[:60]):
-            m = re.match(r"^\s*select\s+(distinct\s+)?", s2, flags=re.I)
-            if m:
-                distinct = m.group(1) or ""
-                rest = s2[m.end() :]
-                return f"SELECT {distinct}TOP ({max_rows}) {rest}"
-
-        return s2
-
-    sql_limited = apply_preview_limit(sql)
-
-    with engine.begin() as conn:
-        low = sql.strip().lower()
-        if DEBUG_MODE:
-            print(f"DEBUG: Executing SQL: {sql_limited}")
-
-        if low.startswith("select") or low.startswith("with"):
-            df = pd.read_sql_query(text(sql_limited), conn)
-            status = f"✅ Returned {len(df)} rows (showing up to {max_rows})" if len(df) >= max_rows else f"✅ Returned {len(df)} rows"
-            if DEBUG_MODE:
-                print(f"DEBUG: Query result: {df.head()} (showing up to {max_rows})")
-            return df, status
-
-        res = conn.execute(text(sql))
-        if DEBUG_MODE:
-            print(f"DEBUG: Statement executed. Rows affected: {res.rowcount}")
-        return pd.DataFrame(), f"✅ Statement executed. Rows affected: {res.rowcount}"
+    client_id = os.getenv("AZURE_MSI_CLIENT_ID", "").strip() or None
+    return ManagedIdentityCredential(client_id=client_id)
 
 
-# ---------------------------
-# ✅ FIX: accept str OR dict from ask_question()
-# ---------------------------
-def _coerce_llm_result_to_dict(result: Any) -> Dict[str, Any]:
-    """
-    Accepts:
-      - dict (already structured)
-      - str SQL
-      - str JSON (e.g. {"sql": "..."} OR "SELECT ...")
-    Returns a dict with at least one of: sql / clarification / error.
-    """
-    if isinstance(result, dict):
-        return result
-
-    if isinstance(result, str):
-        s = result.strip()
-
-        # Try parse JSON
-        try:
-            obj = json.loads(s)
-            if isinstance(obj, dict):
-                return obj
-            if isinstance(obj, str):
-                return {"sql": obj.strip()}
-        except Exception:
-            pass
-
-        # Plain text fallback
-        low = s.lower()
-        if low.startswith("i need") and "clarif" in low:
-            return {"clarification": s}
-        return {"sql": s}
-
-    return {"sql": str(result)}
+def get_search_client() -> SearchClient:
+    endpoint = os.getenv("AZURE_SEARCH_ENDPOINT", "").strip()
+    index_name = os.getenv("AZURE_SEARCH_INDEX_NAME", "meta_data_field_v3").strip()
+    if not endpoint:
+        raise RuntimeError("AZURE_SEARCH_ENDPOINT is missing in .env")
+    cred = get_msi_credential()
+    return SearchClient(endpoint=endpoint, index_name=index_name, credential=cred)
 
 
-def _extract_sql_and_clarification(payload: Dict[str, Any]) -> Tuple[str, str]:
-    sql_query = (
-        payload.get("sql")
-        or payload.get("sql_query")
-        or payload.get("query")
-        or payload.get("generated_sql")
-        or ""
-    )
-    clarification = (
-        payload.get("clarification")
-        or payload.get("clarify")
-        or payload.get("needs_clarification")
-        or payload.get("message")
-        or ""
+def get_aoai_client() -> AzureOpenAI:
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21").strip()
+    if not endpoint:
+        raise RuntimeError("AZURE_OPENAI_ENDPOINT is missing in .env")
+
+    cred = get_msi_credential()
+    token_provider = get_bearer_token_provider(cred, COG_SCOPE)
+
+    return AzureOpenAI(
+        azure_endpoint=endpoint,
+        api_version=api_version,
+        azure_ad_token_provider=token_provider,
     )
 
-    # Normalize to strings
-    if not isinstance(sql_query, str):
-        sql_query = str(sql_query)
-    if not isinstance(clarification, str):
-        clarification = str(clarification)
 
-    return sql_query.strip(), clarification.strip()
+def get_chat_deployment() -> str:
+    dep = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "").strip()
+    if not dep:
+        raise RuntimeError("AZURE_OPENAI_CHAT_DEPLOYMENT is missing in .env")
+    return dep
 
 
-def _ask_llm_to_fix_sql(question: str, prev_sql: str, error_msg: str, search_client: SearchClient) -> str:
-    # keep your existing approach: use ai_utils' OpenAI client/model helpers
-    from ai_utils import get_openai_client, get_openai_model_name
+def get_embed_deployment() -> str:
+    dep = os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT", "").strip()
+    if not dep:
+        raise RuntimeError("AZURE_OPENAI_EMBED_DEPLOYMENT is missing in .env")
+    return dep
 
-    client = get_openai_client()
-    model_name = get_openai_model_name()
 
-    prompt = f"""
-You are a SQL expert. The following SQL query failed to execute for the user's question.
-Please correct the SQL based on the error message.
+def embed_text(text: str) -> List[float]:
+    """
+    Returns embedding vector. MSI-only.
+    If the deployment is wrong, raises with a clear message.
+    """
+    client = get_aoai_client()
+    dep = get_embed_deployment()
+    try:
+        resp = client.embeddings.create(model=dep, input=text)
+        return list(resp.data[0].embedding)
+    except Exception as e:
+        raise RuntimeError(
+            "Embedding call failed. Check AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_EMBED_DEPLOYMENT.\n"
+            f"Original error: {e}"
+        )
 
-User question:
-{question}
 
-Previous SQL:
-{prev_sql}
+def _safe_json_loads(s: str) -> Dict[str, Any]:
+    """
+    LLM sometimes returns JSON wrapped in text. Extract the first {...} block.
+    """
+    s = s.strip()
+    if s.startswith("{") and s.endswith("}"):
+        return json.loads(s)
 
-Error message:
-{error_msg}
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+    if not m:
+        raise ValueError(f"LLM did not return JSON. Got: {s[:300]}")
+    return json.loads(m.group(0))
 
-Return ONLY the corrected SQL (no explanations, no markdown).
-""".strip()
 
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[{"role": "user", "content": prompt}],
+def _dialect_name(engine) -> str:
+    return getattr(getattr(engine, "dialect", None), "name", "").lower()
+
+
+def strip_schema_prefixes_for_sqlite(sql: str, known_schemas: Optional[List[str]] = None) -> str:
+    """
+    SQLite does not support schema.table unless schema is an attached database.
+    Remove schema qualifiers only in FROM/JOIN targets.
+    """
+    if not sql:
+        return sql
+    schemas = {s.lower() for s in (known_schemas or []) if s}
+    # If we don't know schemas, still remove common patterns like rrdw_dlv.<table> in FROM/JOIN.
+    common_like = {"dbo", "public", "rrdw_dlv", "rrdw", "amcb", "default"}
+    schemas = schemas.union(common_like)
+
+    def repl(m: re.Match) -> str:
+        kw = m.group(1)
+        sch = m.group(2)
+        tbl = m.group(3)
+        if sch.lower() in schemas:
+            return f"{kw} {tbl}"
+        return m.group(0)
+
+    pattern = re.compile(r"\b(FROM|JOIN)\s+([A-Za-z_][\w]*)\.([A-Za-z_][\w]*)\b", re.IGNORECASE)
+    return pattern.sub(repl, sql)
+
+
+@dataclass
+class SearchHit:
+    doc_type: str
+    schema_name: str
+    table_name: str
+    field_name: str
+    content: str
+    from_table: str
+    to_table: str
+    join_keys: str
+    relationship_description: str
+
+
+def _hit_from_doc(doc: Dict[str, Any]) -> SearchHit:
+    return SearchHit(
+        doc_type=str(doc.get("doc_type", "") or ""),
+        schema_name=str(doc.get("schema_name", "") or ""),
+        table_name=str(doc.get("table_name", "") or ""),
+        field_name=str(doc.get("field_name", "") or ""),
+        content=str(doc.get("content", "") or ""),
+        from_table=str(doc.get("from_table", "") or ""),
+        to_table=str(doc.get("to_table", "") or ""),
+        join_keys=str(doc.get("join_keys", "") or ""),
+        relationship_description=str(doc.get("relationship_description", "") or ""),
     )
 
-    sql_query = response.choices[0].message.content.strip()
 
-    # Remove code block markers if present
-    if sql_query.startswith("```"):
-        sql_query = sql_query.lstrip("`")
-        if sql_query.lower().startswith("sql"):
-            sql_query = sql_query[3:]
-        sql_query = sql_query.rstrip("`").strip()
+def search_metadata(question: str, search_client: SearchClient, top_k: int = 8) -> Tuple[List[SearchHit], List[str]]:
+    """
+    Hybrid retrieval: text search + vector search.
+    If embeddings fail, falls back to text-only.
+    """
+    logs: List[str] = []
+    logs.append(f"[{_now()}] Searching Azure AI Search metadata...")
 
-    return sql_query.strip()
+    select_fields = [
+        "doc_type",
+        "schema_name",
+        "table_name",
+        "field_name",
+        "content",
+        "from_table",
+        "to_table",
+        "join_keys",
+        "relationship_description",
+    ]
+
+    vector_queries = None
+    try:
+        qvec = embed_text(question)
+        vector_queries = [
+            VectorizedQuery(vector=qvec, k_nearest_neighbors=top_k, fields="content_vector")
+        ]
+        logs.append(f"[{_now()}] Vector search enabled (dim={len(qvec)}).")
+    except Exception as e:
+        logs.append(f"[{_now()}] Vector search disabled (embedding failed): {e}")
+
+    results = search_client.search(
+        search_text=question,
+        top=top_k,
+        select=select_fields,
+        vector_queries=vector_queries,
+    )
+
+    hits: List[SearchHit] = []
+    for r in results:
+        hits.append(_hit_from_doc(dict(r)))
+
+    logs.append(f"[{_now()}] Retrieved {len(hits)} metadata hits.")
+    return hits, logs
 
 
-def _run_text2sql(
+def _format_context(hits: List[SearchHit], dialect: str) -> Tuple[str, List[str], List[str]]:
+    """
+    Build a compact context for the LLM.
+    Also returns: known_schemas, candidate_tables
+    """
+    known_schemas = sorted({h.schema_name for h in hits if h.schema_name})
+    candidate_tables = sorted({h.table_name for h in hits if h.table_name})
+
+    # Separate by type for readability
+    tables = [h for h in hits if h.doc_type == "table"]
+    fields = [h for h in hits if h.doc_type == "field"]
+    rels = [h for h in hits if h.doc_type == "relationship"]
+
+    def clip(s: str, n: int = 900) -> str:
+        s = (s or "").strip()
+        return s if len(s) <= n else s[:n] + "..."
+
+    parts: List[str] = []
+    parts.append(f"SQL_DIALECT={dialect}\n")
+
+    parts.append("## TABLE DOCS (high level)\n")
+    for h in tables[:12]:
+        parts.append(f"- schema={h.schema_name} table={h.table_name}\n{clip(h.content)}\n")
+
+    parts.append("## FIELD DOCS (columns)\n")
+    # Important: columns are the truth source for what exists
+    for h in fields[:60]:
+        parts.append(f"- table={h.table_name} column={h.field_name}\n{clip(h.content, 350)}\n")
+
+    parts.append("## RELATIONSHIP DOCS (joins)\n")
+    for h in rels[:30]:
+        parts.append(
+            f"- {h.from_table} -> {h.to_table} | keys: {h.join_keys}\n{clip(h.relationship_description, 350)}\n"
+        )
+
+    return "\n".join(parts), known_schemas, candidate_tables
+
+
+def ask_question(question: str, search_client: SearchClient, engine) -> Tuple[Dict[str, Any], List[str], List[str]]:
+    """
+    Returns:
+      - llm_json: {"type":"sql","sql":"..."} OR {"type":"clarification","questions":[...]}
+      - logs
+      - known_schemas (for sqlite stripping)
+    """
+    dialect = _dialect_name(engine)
+    hits, logs = search_metadata(question, search_client, top_k=10)
+
+    # If we got table hits but not enough field hits, we do a second pass to fetch more fields for those tables
+    candidate_tables = sorted({h.table_name for h in hits if h.table_name})
+    if candidate_tables:
+        # try to fetch more field docs for these tables
+        filter_expr = " or ".join([f"(doc_type eq 'field' and table_name eq '{t}')" for t in candidate_tables[:5]])
+        if filter_expr:
+            try:
+                more = search_client.search(
+                    search_text="*",
+                    top=80,
+                    filter=filter_expr,
+                    select=["doc_type", "schema_name", "table_name", "field_name", "content"],
+                )
+                for r in more:
+                    hits.append(_hit_from_doc(dict(r)))
+                logs.append(f"[{_now()}] Expanded field docs for candidate tables.")
+            except Exception as e:
+                logs.append(f"[{_now()}] Field expansion failed (non-fatal): {e}")
+
+    context, known_schemas, _ = _format_context(hits, dialect)
+
+    # Strong rules to stop hallucinations (RRDW_AS_OF_DATE problem)
+    system = (
+        "You are a production Text-to-SQL assistant.\n"
+        "Return STRICT JSON only (no markdown, no extra text).\n"
+        "Allowed outputs:\n"
+        "1) {\"type\":\"sql\",\"sql\":\"...\",\"notes\":\"...\"}\n"
+        "2) {\"type\":\"clarification\",\"questions\":[\"...\",\"...\"],\"notes\":\"...\"}\n\n"
+        "Rules:\n"
+        "- Use ONLY columns that appear in FIELD DOCS.\n"
+        "- If the question needs a date column but none exists in FIELD DOCS, return type=clarification.\n"
+        "- Prefer joins ONLY when RELATIONSHIP DOCS provide join keys.\n"
+        "- If SQL_DIALECT=sqlite: DO NOT prefix tables with schema (no schema.table).\n"
+        "- Keep SQL minimal and executable.\n"
+    )
+
+    user = (
+        f"User question:\n{question}\n\n"
+        f"Metadata context:\n{context}\n\n"
+        "Now produce the JSON response."
+    )
+
+    client = get_aoai_client()
+    chat_dep = get_chat_deployment()
+
+    logs.append(f"[{_now()}] Sending request to LLM (chat deployment={chat_dep}).")
+    resp = client.chat.completions.create(
+        model=chat_dep,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.0,
+    )
+    raw = resp.choices[0].message.content or ""
+    logs.append(f"[{_now()}] LLM responded.")
+
+    try:
+        data = _safe_json_loads(raw)
+    except Exception as e:
+        logs.append(f"[{_now()}] JSON parse failed: {e}")
+        data = {
+            "type": "clarification",
+            "questions": [
+                "I could not parse the model output as JSON. Can you re-run after verifying the chat deployment returns JSON?"
+            ],
+            "notes": raw[:500],
+        }
+
+    # Post-process for sqlite schema stripping
+    if data.get("type") == "sql" and isinstance(data.get("sql"), str) and dialect == "sqlite":
+        data["sql"] = strip_schema_prefixes_for_sqlite(data["sql"], known_schemas=known_schemas)
+
+    return data, logs, known_schemas
+
+
+def ask_llm_to_fix_sql(
     question: str,
-    do_execute: bool,
-    max_rows: int,
-    engine: Engine,
+    prev_sql: str,
+    error_msg: str,
     search_client: SearchClient,
-) -> Any:
+    engine,
+    known_schemas: Optional[List[str]] = None,
+) -> Tuple[Dict[str, Any], List[str]]:
     """
-    Returns a generator yielding (generated_sql, result_df, status_markdown, progress_log) step-by-step.
+    Fixer also returns JSON. Enforces sqlite no-schema rule again.
     """
-    import datetime
+    logs: List[str] = []
+    dialect = _dialect_name(engine)
 
-    def now() -> str:
-        return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Bring back some metadata again for grounding
+    hits, s_logs = search_metadata(question, search_client, top_k=8)
+    logs.extend(s_logs)
+    context, known_schemas2, _ = _format_context(hits, dialect)
+    known = known_schemas or known_schemas2
 
-    q = (question or "").strip()
-    if not q:
-        yield "", pd.DataFrame(), "⚠️ Please enter a question.", ""
-        return
+    system = (
+        "You are a SQL expert. Return STRICT JSON only.\n"
+        "Output:\n"
+        " - {\"type\":\"sql\",\"sql\":\"...\",\"notes\":\"...\"}\n"
+        " - OR {\"type\":\"clarification\",\"questions\":[...],\"notes\":\"...\"}\n\n"
+        "Rules:\n"
+        "- Fix the SQL to resolve the error.\n"
+        "- Use ONLY columns present in FIELD DOCS.\n"
+        "- If the error indicates missing table/column, ask clarification instead of guessing.\n"
+        "- If SQL_DIALECT=sqlite: DO NOT use schema.table.\n"
+    )
 
-    progress_log = []
-    if DEBUG_MODE:
-        print(f"DEBUG: _run_text2sql called with question: {question}")
+    user = (
+        f"User question:\n{question}\n\n"
+        f"Previous SQL:\n{prev_sql}\n\n"
+        f"Error message:\n{error_msg}\n\n"
+        f"Metadata context:\n{context}\n\n"
+        "Return JSON now."
+    )
 
-    progress_log.append(f"[{now()}] Searching Azure AI Search metadata...")
-    yield "", pd.DataFrame(), "⏳ Searching metadata...", "\n".join(progress_log)
+    client = get_aoai_client()
+    chat_dep = get_chat_deployment()
+    logs.append(f"[{_now()}] Sending SQL-fix request to LLM.")
+    resp = client.chat.completions.create(
+        model=chat_dep,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.0,
+    )
+    raw = resp.choices[0].message.content or ""
+    logs.append(f"[{_now()}] LLM returned SQL-fix response.")
 
-    progress_log.append(f"[{now()}] Sending request to LLM for SQL generation...")
-    yield "", pd.DataFrame(), "⏳ Generating SQL...", "\n".join(progress_log)
+    data = _safe_json_loads(raw)
 
-    # ✅ FIXED: handle str/dict from ask_question without .get() crash
-    raw = ask_question(q, search_client)
-    payload = _coerce_llm_result_to_dict(raw)
-    sql_query, clarification = _extract_sql_and_clarification(payload)
+    if data.get("type") == "sql" and isinstance(data.get("sql"), str) and dialect == "sqlite":
+        data["sql"] = strip_schema_prefixes_for_sqlite(data["sql"], known_schemas=known)
 
-    progress_log.append(f"[{now()}] LLM returned response.")
-    clarification_msg = "I need more information to generate the correct SQL. Please clarify your request."
-
-    # If LLM asks for clarification (either explicit field OR classic text)
-    if clarification or sql_query.lower().startswith("i need more information"):
-        msg = clarification or clarification_msg
-        yield "", pd.DataFrame(), f"⚠️ {msg}", "\n".join(progress_log)
-        return
-
-    progress_log.append(f"[{now()}] SQL generated.")
-    yield sql_query, pd.DataFrame(), "✅ SQL generated.", "\n".join(progress_log)
-
-    if not do_execute:
-        progress_log.append(f"[{now()}] Waiting for user to execute SQL.")
-        yield sql_query, pd.DataFrame(), "✅ SQL generated. Turn on **Execute SQL** to run it.", "\n".join(progress_log)
-        return
-
-    last_error = None
-    for attempt in range(1, 6):
-        progress_log.append(f"[{now()}] Executing SQL (Attempt {attempt})...")
-        yield sql_query, pd.DataFrame(), f"⏳ Executing SQL (Attempt {attempt})...", "\n".join(progress_log)
-
-        try:
-            if execute_sql_df is not None:
-                df, status = execute_sql_df(sql_query, engine, max_rows=max_rows)  # type: ignore[misc]
-                progress_log.append(f"[{now()}] SQL executed successfully.")
-                yield sql_query, df, status, "\n".join(progress_log)
-                return
-
-            df, status = _fallback_execute_sql_df(sql_query, engine, max_rows=max_rows)
-            progress_log.append(f"[{now()}] SQL executed successfully.")
-            yield sql_query, df, status, "\n".join(progress_log)
-            return
-
-        except Exception as e:
-            last_error = str(e)
-            progress_log.append(f"[{now()}] SQL execution failed: {last_error}")
-            yield sql_query, pd.DataFrame(), f"❌ SQL execution failed: {last_error}", "\n".join(progress_log)
-
-            if attempt == 2:
-                break
-
-            progress_log.append(f"[{now()}] Sending error and query back to LLM for correction...")
-            yield sql_query, pd.DataFrame(), "⏳ Asking LLM to fix SQL...", "\n".join(progress_log)
-
-            sql_query = _ask_llm_to_fix_sql(q, sql_query, last_error, search_client)
-
-            # If fix attempt produced a clarification message
-            if sql_query.strip().lower().startswith("i need more information"):
-                yield "", pd.DataFrame(), f"⚠️ {clarification_msg}", "\n".join(progress_log)
-                return
-
-            progress_log.append(f"[{now()}] LLM returned corrected SQL.")
-            yield sql_query, pd.DataFrame(), "✅ LLM returned corrected SQL.", "\n".join(progress_log)
-
-    progress_log.append(f"[{now()}] All attempts failed.")
-    yield sql_query, pd.DataFrame(), f"❌ SQL execution error after 2 attempts: {last_error}", "\n".join(progress_log)
-
-
-def launch_ui(engine: Engine, search_client: SearchClient):
-    """
-    Entry point used by your main.py
-    """
-    # --- Logo (put your logo here) ---
-    # Recommended: <same folder as ui.py>/ICON/td_logo.png
-    assets_dir = Path(__file__).resolve().parent / "ICON"
-    logo_path = assets_dir / "td_logo.png"
-    logo_src = _file_to_data_uri(logo_path)
-
-    # --- Theme ---
-    theme = gr.themes.Soft(primary_hue="green", secondary_hue="green", neutral_hue="gray")
-
-    # --- Modern CSS loaded from external file ---
-    css_path = Path(__file__).resolve().parent / "td_style.css"
-    css = css_path.read_text(encoding="utf-8") if css_path.exists() else ""
-
-    header_html = f"""
-<div class="td-page">
-  <div class="td-header">
-    <div class="td-logo">
-      {f"<img src='{logo_src}' alt='TD Logo' />" if logo_src else "<div style='font-weight:900;color:#0B7E3E;'>TD</div>"}
-    </div>
-    <div>
-      <h1 class="td-title">AMCB TEXT2SQL</h1>
-      <p class="td-subtitle">Ask a question in natural language. The system searches metadata, generates SQL, and (optionally) executes it.</p>
-    </div>
-  </div>
-</div>
-""".strip()
-
-    def run_text2sql_wrapper(q, ex, mr):
-        yield from _run_text2sql(q, ex, int(mr), engine, search_client)
-
-    with gr.Blocks(theme=theme, css=css, title="AMCB TEXT2SQL") as demo:
-        gr.HTML(header_html)
-
-        with gr.Group(elem_classes=["td-page"]):
-            with gr.Row(equal_height=True):
-                # LEFT: input card
-                with gr.Column(scale=4):
-                    with gr.Group(elem_classes=["td-card"]):
-                        question = gr.Textbox(
-                            label="Ask your question",
-                            placeholder="Example: Show top 10 accounts by total balance for last month",
-                            lines=3,
-                            elem_classes=["td-question-label"],
-                        )
-
-                        do_execute = gr.Checkbox(label="Execute SQL", value=True)
-                        max_rows = gr.Slider(
-                            minimum=50,
-                            maximum=5000,
-                            value=500,
-                            step=50,
-                            label="Max rows (preview)",
-                        )
-
-                        with gr.Row():
-                            run_btn = gr.Button("Run", variant="primary")
-                            clear_btn = gr.Button("Clear", variant="secondary")
-
-                        show_log = gr.Checkbox(label="Show Log", value=True)
-
-                # RIGHT: outputs card
-                with gr.Column(scale=6):
-                    with gr.Group(elem_classes=["td-card"]):
-                        status_md = gr.Markdown()
-                        with gr.Tabs():
-                            with gr.Tab("SQL"):
-                                sql_out = gr.Code(label="Generated SQL", language="sql")
-                            with gr.Tab("Result"):
-                                result_grid = gr.Dataframe(label="SQL Result", interactive=False, wrap=True)
-
-                        progress_md = gr.Markdown(label="Progress Log", visible=True)
-
-        def toggle_log(log_text, show):
-            return log_text if show else ""
-
-        run_btn.click(
-            fn=run_text2sql_wrapper,
-            inputs=[question, do_execute, max_rows],
-            outputs=[sql_out, result_grid, status_md, progress_md],
-            show_progress=True,
-            queue=True,
-        )
-
-        show_log.change(
-            fn=toggle_log,
-            inputs=[progress_md, show_log],
-            outputs=progress_md,
-        )
-
-        clear_btn.click(
-            fn=lambda: ("", pd.DataFrame(), "", ""),
-            inputs=None,
-            outputs=[question, result_grid, status_md, progress_md],
-        )
-
-    demo.launch(server_name="0.0.0.0", server_port=7870, show_error=True, debug=True, inbrowser=True)
+    return data, logs
