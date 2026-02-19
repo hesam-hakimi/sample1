@@ -1,0 +1,2 @@
+export const INDEX_LIMIT_DEFAULT = 2_000_000;
+export const ITEM_LIMIT_DEFAULT = 1_000_000;
