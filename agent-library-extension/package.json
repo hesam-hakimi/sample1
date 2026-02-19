@@ -1,0 +1,80 @@
+{
+  "name": "agent-library-importer",
+  "displayName": "Agent Library Importer",
+  "description": "Import Copilot agents/prompts/instructions from a shared GitHub library.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:agentLibrary.refreshIndex",
+    "onView:agentLibrary.libraryView"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "agentLibrary.configureSource", "title": "Agent Library: Configure Source Repo" },
+      { "command": "agentLibrary.refreshIndex", "title": "Agent Library: Refresh Library" },
+      { "command": "agentLibrary.search", "title": "Agent Library: Search" },
+      { "command": "agentLibrary.previewItem", "title": "Agent Library: Preview Item" },
+      { "command": "agentLibrary.installItems", "title": "Agent Library: Install Selected" },
+      { "command": "agentLibrary.openReceipt", "title": "Agent Library: Open Receipt" }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agentLibrary.container",
+          "title": "Agent Library",
+          "icon": "media/agentLibrary.svg"
+        }
+      ]
+    },
+    "views": {
+      "agentLibrary.container": [
+        { "id": "agentLibrary.libraryView", "name": "Library" },
+        { "id": "agentLibrary.installedView", "name": "Installed" }
+      ]
+    },
+    "configuration": {
+      "title": "Agent Library",
+      "properties": {
+        "agentLibrary.sourceRepo": { "type": "string", "default": "YOUR_ORG/GitHub-agents" },
+        "agentLibrary.ref": { "type": "string", "default": "main" },
+        "agentLibrary.indexPath": { "type": "string", "default": "index.json" },
+        "agentLibrary.allowedRepos": { "type": "array", "default": [], "items": { "type": "string" } },
+        "agentLibrary.install.conflictStrategy": { "type": "string", "enum": ["prompt", "skip", "overwrite"], "default": "prompt" },
+        "agentLibrary.network.maxConcurrentDownloads": { "type": "number", "default": 4 },
+        "agentLibrary.security.maxIndexBytes": { "type": "number", "default": 2000000 },
+        "agentLibrary.security.maxItemBytes": { "type": "number", "default": 1000000 }
+      }
+    },
+    "menus": {
+      "view/item/context": [
+        { "command": "agentLibrary.previewItem", "when": "view == agentLibrary.libraryView" },
+        { "command": "agentLibrary.installItems", "when": "view == agentLibrary.libraryView && isWorkspaceTrusted" }
+      ]
+    }
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Browsing metadata is supported, installation requires a trusted workspace."
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "test": "npm run compile && node ./out/test/unit/runUnit.js"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^20.11.30",
+    "mocha": "^10.3.0",
+    "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "vscode-uri": "^3.0.8"
+  }
+}
