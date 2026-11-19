@@ -1,41 +1,26 @@
-In the current Windows VS Code workspace, add a new `/jira-probe pat-check`
-command to the existing Jira skill. Implement it now. The existing skill
-already supports local, public, server-info, and OAuth login. Preserve
-those commands.
+Add `/jira-probe project-check` to the existing jira-probe skill and run
+one live, read-only check for the ASKTD project. The existing pat-check
+already confirmed authentication against our internal Jira.
 
-Update these two files:
-- .github/skills/jira-probe/SKILL.md
-- .github/skills/jira-probe/scripts/jira_probe.py
+Update SKILL.md and scripts/jira_probe.py. Reuse the working pat-check
+logic for JIRA_TOKEN, verified TLS, timeout, and redirect refusal.
+Preserve the existing commands. Do not open or print .env in chat.
 
-The purpose of pat-check is to verify that my Personal Access Token works
-with our internal Jira. I will put the token in the workspace-root `.env`
-file under the exact key `JIRA_TOKEN`. I will manage that file myself.
+For project-check, make exactly one live request:
+GET https://track.td.com/rest/api/2/project/ASKTD
 
-1. Use Python 3 and the standard library. At runtime, locate the root
-   `.env` relative to the script location and read only `JIRA_TOKEN`.
-   Split the assignment on the first `=` so the token value stays intact.
-   If the file, key, or value is missing, print a clear error, exit with
-   a nonzero code, and make no network request.
+Exit 0 only if Jira returns HTTP 200 with a JSON project object whose
+`key` is exactly `ASKTD`. On success, print only:
+{"project_visible": true, "project_key": "ASKTD", "http_status": 200}
 
-2. Make one read-only GET request to:
-   https://track.td.com/rest/api/2/myself
-   Send `Authorization: Bearer <JIRA_TOKEN>` and `Accept: application/json`.
-   Keep TLS verification enabled, set a timeout, and do not follow redirects.
+On failure, exit nonzero and print only project_visible=false, the actual
+HTTP status (null if no response arrived), and a short error category.
+For HTTP 404, use `not_found_or_not_visible`. Never print the token,
+headers, or raw response body.
 
-3. Report success only for HTTP 200 with a JSON user object containing a
-   non-empty identity field such as `name` or `key`. A 200 HTML sign-in
-   page must count as failure. Print only the HTTP status, a boolean
-   `authenticated_user_confirmed`, and a short error category on failure.
-   Never print the token, headers, response body, or user identity.
+Test the success and failure paths with mocked responses first. Then run
+the project-check script once against internal Jira and show the actual
+live output separately from the mock results. Do not rerun pat-check,
+query issues, or create or modify anything in Jira. Do not stage or commit.
 
-4. During implementation, leave my real `.env` untouched and do not open
-   it. Test with a temporary `.env`, a dummy token, and mocked responses.
-   Cover a valid Jira response, HTTP 401, a 200 HTML sign-in page, and
-   a missing token. Verify from Git metadata that the root `.env` is
-   ignored and untracked. Flag any issue without staging or committing.
-
-5. Update SKILL.md so `/jira-probe pat-check` invokes the new command.
-   Report the tests you actually ran. Leave the live test for me and
-   finish by showing this exact Windows command:
-
-   py -3 ".github\skills\jira-probe\scripts\jira_probe.py" pat-check
+Finish with the slash command I can use to repeat the check in Copilot.
