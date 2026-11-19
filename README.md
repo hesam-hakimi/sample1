@@ -1,4 +1,4 @@
-# AMCB TEXT2SQL (MSI-only)
+#TEXT2SQL (MSI-only)
 
 This package contains a working, **MSI-only** (no API keys, no `az login`) Text-to-SQL demo:
 - Gradio UI (modern TD-like style)
