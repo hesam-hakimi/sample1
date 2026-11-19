@@ -1,85 +1,67 @@
-AskTD planning import into Jira
+# Find why the planning baseline hash differs (read-only)
 
-Goal
+The validator reports `Planning baseline hash differs: register_semantics` although every count matches. Find out what departs from the reviewed package.
 
-Put the AskTD / askAlpha delivery plan into the Jira project ASKTD (https://track.td.com/projects/ASKTD) through the Jira MCP: the 15 Plans as containers, the planning keys as issues under them, and a board that shows them. The plan is the planning package already copied into this workspace; start at ASKTD_NEW_SESSION_PROMPT.md.
+This task is read-only. Change no package file, validator, hash, git state or Jira record, and repair nothing. Put any helper script outside `feature/` and run Python with `-X utf8 -B`.
 
-This is a one-time import of planning records. Creating an issue does not start, approve or accept any implementation work.
+1. For each path under `files` below, hash the file's bytes with SHA-256 after converting CRLF to LF, and compare the first 12 hex characters. Report matching, differing and missing files.
 
-The package says tracker synchronization is paused and carries tracker_sync_authorized: false. This message lifts that pause for this Jira import only. Leave the package as it is: its flags stay false, tracker_id stays null, and the mapping to Jira lives in your own ledger.
+2. Import the validator unmodified and load `feature/task/TASK_DELIVERY_REGISTER.json` with its `unique_object_pairs` hook. Compute `canonical_sha256` for every top-level value and for every record in `tasks` (by its `key`). Compare the first 12 hex characters with `register_top_level` and `register_tasks`, and list every differing, missing and extra name. Also report the `source_revision` and `register_semantics` values pinned in the validator; the reviewed validator pins `3feaddccd2d9...` and `39da44d2bf18...`.
 
-Limits
+3. For each part that differs, look for the cause:
+   - fields that sibling records do not have;
+   - values that mention `ASKTD-`, Jira, tracker or ledger data;
+   - damaged characters: U+FFFD, `â€`, `Ã`, or `?` where a dash, arrow or section sign belongs;
+   - the file's modified time compared with the other package files;
+   - if the folder is tracked, `git status --short` and `git diff --stat` for it (read-only git commands only).
 
-	•	No application work: no code changes, application tests, dependency installs, flags, secrets or deployments.
-	•	No git command that changes state (add, commit, stash, reset, clean, checkout, push). The workspace holds paused, uncommitted Task 2 work that must stay exactly as it is.
-	•	The planning package is read-only. Never clear a validation failure by editing the package, the validator or its hashes.
-	•	In Jira: no administration (workflows, schemes, permissions, fields, automation). Never delete, close or transition an issue, and never overwrite text, assignee, status or parent that a person set.
-	•	New issues are unassigned, stay in the initial backlog status, and get no estimates, dates or sprints.
-	•	Keep the origin of the planning documents out of Jira and out of your reports: no source-system names, URLs or host names. Cite documents by filename, version and section. Links to the target Jira issues and board are expected in the ledger and the final report.
+4. Tell me in a few lines which file departs from the reviewed pair, where, and the most likely cause.
 
-1. Check the package, then read it
+Reviewed fingerprints:
 
-From the folder that contains feature/, run the documentation checks (these are not application tests):
-
-python -X utf8 -B feature/validation/validate_workflow_traceability.py
-python -X utf8 -B -m unittest discover -s feature/validation -p "test_*.py"
-
-Expect exit code 0, all tests passing, and a validator report of 12 review rows, 53 tasks, 46 outputs, 15 plans, 25 dependencies, 16 checks and 7 architecture decisions. If anything differs, stop and tell me.
-
-Then follow the reading list in ASKTD_NEW_SESSION_PROMPT.md on the local files; its instruction to fetch documents from a remote source does not apply. The register alone is about 450 KB, so query the package with small scripts instead of loading it into the conversation, and parse JSON with the validator's unique_object_pairs hook so duplicate keys are rejected.
-
-TASK_DELIVERY_REGISTER.json is the source of record for the 53 planning keys, the 46 output keys and DEP01–DEP25; ASKTD_PLAN_AND_LINEAGE_REFERENCE.md defines the 15 Plans. Each document states its version in its header.
-
-2. Learn the real Jira project (read-only)
-
-Find out rather than assume: issue types and how they nest, required fields, what I may create, edit and link, the initial status, whether issues can be unassigned, the text format descriptions need, and which Epics, Features, issues and boards already exist.
-
-3. Plan the import, then wait for my approval
-
-What becomes an issue:
-
-	•	Each Plan P01–P15: one container at the level directly above Story/Task in this project (Epic or Feature, not both). If the project has a further level above that, propose how to use it instead of deciding silently.
-	•	Each planning key: one Story or Task under its Plan. Keys stay separate even where they touch the same area (Task 2 and MIG-04; Connections and CONN-01–05); don't merge them or move scope between them. An alias is the same item (FND-01 is Task 3). FND-03 has no Plan: create it without a parent if the project allows that; if a parent is mandatory, mark it blocked until the Plan is decided.
-	•	Nothing else. Outputs, DEP records, review rows, DM/DW checks, architecture-decision outlines and open decisions are referenced inside issues.
-
-Before creating anything, search Jira (open and closed, every page) for existing equivalents of the Plans and keys, matching on scope rather than title. Adopt an issue only if its scope, type and parent fit your mapping. Record a conflict, and leave the issues alone, when two keys point to one issue, several issues match one key, or adopting would change a parent that a person set. Where a key the register marks as an alias or candidate has no match in Jira, create it and state that reconciliation with existing application work is still pending. Keys the register marks as outlines or conditional also get an issue, clearly marked as an outline rather than ready work, with its release or condition.
-
-Render issue text by script from the register rather than retyping it. Records do not all carry the same fields, so render what each one has. Each issue must stand on its own and include:
-
-	•	planning key, title, scope, exclusions and deliverables;
-	•	Plan and primary outputs (outputs), with contributing outputs (contributes) listed separately;
-	•	release contribution and any condition;
-	•	dependencies, as described below;
-	•	acceptance criteria and required evidence;
-	•	DM/DW checks from the task's own lists (deposit_migration_checks, durable_workflow_checks), never inferred from its review rows: a row's checks do not apply to every task in that row;
-	•	review rows by key and title, as references only, and open decisions only where the register connects them to this key;
-	•	source document, version and section.
-
-Keep the register's evidence classes apart exactly as recorded (documented requirement, dated implementation report, verified acceptance, unknown) and never upgrade one. Leave out proposed person placeholders.
-
-Dependencies keep the typed, activity-level meaning the package gives them (H, C, G, O). Write all 155 task dependency records into their consuming issues with kind, input, activity, condition and recorded satisfaction. None is recorded as unmet, so expect zero "blocks" links ("not established" is not unmet). The 65 records that name a producing task form 62 distinct pairs: link each pair once with the neutral "relates to" type unless the link already exists. DEP01–DEP25 have their own fields: show each on the consuming Plans' containers with its ID, required_output, consuming_activity, kind_and_scope and status as recorded, adding nothing (no producer, no satisfaction, no single kind where the record is mixed or conditional).
-
-Every issue you create or adopt gets the shared label asktd-planning and a stable marker in its description, lower-case and without spaces: asktd-planning:plan:p05, asktd-planning:task:run-01, asktd-planning:task:task-2. Markers never change when documents change. On an adopted issue, add only the label and one clearly delimited "AskTD planning" section; if that would conflict with what is already there, record a conflict and leave the issue alone.
-
-Save the plan as asktd-jira-import/manifest.json, outside the package: the hierarchy you found, the mapping you chose, and every intended operation (containers, issues, links, any board or filter) with its disposition (create, adopt, no change, conflict or blocked), reason and payload. Then show me a short summary: hierarchy and mapping; counts per disposition for the 68 planning identities (15 Plans and 53 keys), plus link and board operations; anything conflicting or blocked; one complete Plan payload and one complete child payload. Wait for my go-ahead. Under these limits a created issue cannot be taken back, so this is the one checkpoint; after it, run to the end without asking again.
-
-4. Apply
-
-Start with the first approved Plan and one of its children, whatever their dispositions. Read them back and confirm that type and parent are right, the description renders properly, and a search by label and marker finds them. If the pair fails, stop all further writes and tell me. Otherwise continue, containers first, one Plan at a time, re-reading any existing issue just before you edit it.
-
-Log each write in asktd-jira-import/ledger.json before you send it, and add the observed result (Jira key, link, read-back) afterwards; the ledger also records the versions and hashes of the package files you used. If the ledger already exists when you start, continue from it instead of starting over. If a create times out or its outcome is unclear, look for the issue by its full marker, and among issues you created in the last few minutes, before trying again. If you still cannot tell, do not retry that create; report it.
-
-5. Board
-
-The imported issues must be visible on a board. Use the project's existing board if it already shows them. Otherwise create a Kanban board on the filter project = ASKTD AND labels = "asktd-planning" ORDER BY Rank ASC if the MCP and my permissions allow it; if they don't, give me that JQL and the manual steps. Don't change the configuration of a board other people use.
-
-6. Finish
-
-Read back everything you created or changed (type, parent, marker, status, assignee, links) and report from that read-back, not from what you intended:
-
-	•	all 53 planning keys with disposition and Jira link, plus the 15 Plan containers and the board;
-	•	counts of created, adopted, unchanged, conflicting, blocked, failed and uncertain operations;
-	•	what Jira or the MCP could not do, listed as pending rather than done;
-	•	the decisions you still need from me.
-
-Then stop. Don't start implementation or set up recurring synchronization.
+```json
+{
+  "files": {
+    "feature/task/TASK_DELIVERY_REGISTER.json": "9cf375d59ad3",
+    "feature/validation/validate_workflow_traceability.py": "084406756a7d",
+    "feature/validation/test_workflow_traceability.py": "c880b02c188b",
+    "feature/PACKAGE_MANIFEST.json": "30bc515be51a",
+    "feature/task/TASK_DELIVERY_DETAILS.md": "8415cc52d088",
+    "feature/task/TASK_DELIVERY_REGISTER.md": "94ef0915ea4a",
+    "feature/shared/ASKTD_PRODUCTION_WORKFLOW_DECISION_REVIEW.md": "975cad59171b",
+    "feature/shared/ASKTD_PLAN_AND_LINEAGE_REFERENCE.md": "e08934ba89ff",
+    "feature/shared/AskTD_Delivery_Plans_and_Dependencies.md": "4b123f0b62a3",
+    "feature/shared/ASKTD_NEW_SESSION_PROMPT.md": "9b6ec17680ef",
+    "feature/shared/ASKTD_SESSION_HANDOFF.md": "ab00def7fb51"
+  },
+  "register_top_level": {
+    "schema_version": "a51162aeeb05", "revision": "be9ee1cca338", "date": "3af512824d0e",
+    "source_documentation_commit": "5e2be654beb3", "authority": "c6679ea985d9", "implementation_authorized": "fcbcf165908d",
+    "tracker_sync_authorized": "fcbcf165908d", "canonical_plan_count": "e629fa6598d7", "canonical_outputs": "45bbf5c111ca",
+    "portfolio_dependencies": "3db482c1cfd7", "count_interpretation": "7fbfb0777a09", "scope_evidence": "ddbc1ae2e1cf",
+    "tasks": "3b8da9a2e864", "decisions": "a2ed30e9447c", "q1_package_crosswalk": "562526651150",
+    "release_dates": "74234e98afe7", "effort_estimates": "74234e98afe7", "output_accounting": "60ad1b629964",
+    "product_audit_mapping": "e162967dc8c1", "source_review": "1b8954fb2917", "master_delta_mapping": "1561c95875cb",
+    "reference_control_mapping": "4b1d30b3db44", "registry_requirement_mapping": "5207eb350048", "continuity_requirement_mapping": "e565c4e61069",
+    "release_gate_mapping": "d3a029ca6621", "registry_native_inventory": "74c00e0de095", "additional_reference_review": "e3b44391eb3c",
+    "canonical_portfolio_dependency_count": "b7a56873cd77", "portfolio_dependency_register": "022642118573", "review_feedback": "195b16932008",
+    "deposit_recipe_migration": "3ad0354d43ec", "durable_workflow": "dcc6a6bbd62e", "production_workflow_review": "1397e530ca2c"
+  },
+  "register_tasks": {
+    "Task 2": "ca219312746d", "FND-03": "8e6af3dbf0da", "Task 3": "6b40fbc8ecb8", "FND-02": "d67faac51716",
+    "Task 1": "018eda47f1e6", "Connections": "11db30e7aa19", "R1-A": "3da3b441b7c8", "R1-B": "0b07193d17c8",
+    "REL-01": "81c8af1a2125", "ACCESS-01": "1e8933671d0e", "R1-D": "3802a916c789", "R1-E": "1565aa970adc",
+    "POLICY-01": "e82302103a8e", "METHOD-01": "43f22dc4cc27", "RUN-01": "856f04d18a84", "ROUTE-01": "b1262c80a6fd",
+    "ANALYSIS-01": "b670879e2d80", "R1-H": "361474dfed6e", "MODEL-01": "f75e9b947a76", "METER-01": "913457a3a401",
+    "OPS-01": "5740657636e6", "R1-K": "887a749f4ded", "R1-L": "8a47243bed29", "ADOPT-01": "ad2223a35149",
+    "MIG-01": "3b7de712b4c5", "MIG-02": "4d686e55c572", "MIG-03": "35eda75b1832", "MIG-04": "540cb78e744c",
+    "MIG-05": "f5c674349036", "MIG-06": "e76ebe7bfb17", "MIG-07": "153f106ebafa", "MIG-08": "7db4115e4df8",
+    "CONN-01": "6cb51dae76f1", "CONN-02": "58bbf6a0cd6e", "CONN-03": "e880ddf8a99f", "CONN-04": "530aa1f47eb6",
+    "CONN-05": "2b3f36d725d6", "SAVE-01": "9f4a01aae43a", "HISTORY-01": "d3c56fee7177", "PREF-01": "e755c9219990",
+    "TEMPLATE-01": "520f00bf9313", "TEMPLATE-02": "8188d38fdc49", "SHOWBACK-01": "1031ab312ea6", "BUDGET-01": "1de70ea84218",
+    "REUSE-01": "d86135da62ed", "SCHEDULE-01": "c310326582c7", "SCHEDULE-02": "8badc8498cb6", "SUGGEST-01": "728da4dc085a",
+    "IMPROVE-01": "4e696453e768", "REPORT-01": "bc3ddd32cd6c", "EXPORT-01": "15ce2cd486d5", "EXPAND-01": "df18804af9e6",
+    "EXPAND-02": "b15b9499e6bf"
+  }
+}
+```
