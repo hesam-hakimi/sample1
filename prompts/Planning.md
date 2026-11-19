@@ -1,13 +1,11 @@
-Add `/jira-probe permission-check` to the existing skill. Reuse the
-working PAT and HTTPS request logic from project-check.
+Prepare a read-only preview of one issue from the existing AskTD planning
+package. Start at ASKTD_NEW_SESSION_PROMPT.md and select the first planning
+record in the package’s documented import order. Show its planning key
+and source file so I can trace it back.
 
-Run one read-only GET request to:
-https://track.td.com/rest/api/2/mypermissions?projectKey=ASKTD
+Use Jira’s read-only create metadata for project ASKTD to identify the
+available issue type and its required fields. Show the proposed issue
+type, summary, parent if applicable, and each required field alongside
+its proposed value. Mark missing values or unresolved mappings explicitly.
 
-Read only `permissions.CREATE_ISSUES.havePermission` from the response.
-Report the HTTP status, project key, and `can_create_issues` as true
-or false. If the request fails or the field is missing, report it as
-unknown. HTTP 200 alone does not establish permission.
-
-Do not print the token or raw response, and do not create or modify
-anything in Jira. Show the actual live result.
+Do not create a test issue or modify Jira, the planning package, or Git.
