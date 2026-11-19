@@ -1,15 +1,22 @@
-Revise the ASKTD Jira pilot to use this intended hierarchy:
+Use the existing jira-probe PAT connection for one live pilot in project ASKTD. I authorize creating up to three real planning records, in this order:
 
-- One Feature named “AskTD” for the entire planning backlog.
-- One Epic under that Feature for each Plan, P01 through P15.
-- User Stories under their accountable Plan Epic.
+1. Feature: AskTD
+2. Epic: P01 – Deposits pilot scope and reference answers
+3. Story: R1-A – Agree pilot scope and independent reference answers
 
-Validate one representative chain using read-only Jira requests:
-AskTD (Feature) → P01 (Epic) → R1-A (Story).
+Use the canonical planning package for the English descriptions and acceptance criteria. Check required create fields for all three types before the first write. If a required business value is missing, tell me which value is needed.
 
-1. Confirm the exact Jira issue type names in ASKTD. Check the Epic and Story metadata separately. Identify the field on the Epic that can point to the Feature, and the field on the Story that can point to the Epic. The earlier field check was for Task.
-2. For each relationship, report the field name, field ID, and what evidence shows it accepts the intended parent type. Distinguish a field available during creation from one that requires a later edit. If the available evidence is insufficient, say exactly what remains unverified. A generic issue link does not establish hierarchy.
-3. Check whether the AskTD Feature or either pilot record already exists. If R1-A already exists as a Task, report its key and current parent so we can decide how to reuse it.
-4. Show the proposed three records in one table with their type, English summary, and intended parent. Use the canonical planning titles for P01 and R1-A.
+Give each record a stable marker in its description:
+- asktd-planning:programme:AskTD
+- asktd-planning:plan:P01
+- asktd-planning:task:R1-A
 
-Keep this run read-only. Do not create, convert, or reparent any issue. Report in Persian whether this exact three-level structure is supported and what, if anything, still needs confirmation.
+Before creating each record, check for an existing match in ASKTD, including closed issues. Reuse a verified match with the correct type, scope, and parent. Stop on a conflicting or ambiguous match.
+
+Create or reuse the Feature and read back its actual Jira key. Create the P01 Epic with that key in Parent Link (customfield_19601). Read the Epic back and verify that its stored Parent Link resolves to that exact Feature. If Jira rejects the parent, returns an empty field, or stores a different parent, stop there. Report the actual result and the keys already created. Do not create an unparented Epic as a fallback or substitute a generic issue link.
+
+Only after the first relationship is verified, create R1-A as a Story with the actual P01 Epic key in Epic Link (customfield_10006). Read the Story back and verify its stored Epic Link.
+
+If a write times out, search for its marker and reconcile the result before any retry. Keep new issues unassigned. Leave the planning package and Git unchanged. Stop after this one chain.
+
+ For each record, show its clickable Jira URL, whether it was created or reused, and the parent key actually read back. Identify any step that remains unverified.
